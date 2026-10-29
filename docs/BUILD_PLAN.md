@@ -4,11 +4,11 @@
 
 Humans play Jenga; the robot handles setup. Build alternating layers of three blocks from a prepared pickup area. Record each placement as a reusable experiment. Full tower construction is the stretch goal; cleanup of a scattered pile is deferred.
 
-User clarified: JengaDB is the GitHub organization. Viam organization is believed to be named hackathon (exact name and sfhack15 membership unverified). A MongoDB Atlas organization is not currently present/visible to the user; organizer-provided Atlas access remains outstanding. Selected repository: https://github.com/JengaDB/jengadb. Connector reports push access. The starter and coding-agent harness live on branch codex/offline-starter; consult its GitHub PR for publication and review status. No account, machine or cloud changes have been made.
+JengaDB is the GitHub organization and selected repository: https://github.com/JengaDB/jengadb. The coding-agent harness is merged into main via PR #1. Viam organization is believed to be hackathon; exact membership remains unverified. Atlas management access is verified for project JengaDB and cluster jengadb; database connectivity remains pending. The user reports Linear workspace Skymoondev; task migration is pending. See [integration status](INTEGRATIONS.md) for evidence and next steps. No machine or Atlas configuration changes have been made.
 
 ## Current baseline
 
-Completed: local Python mock logger, 20 deterministic attempts, HTML report, 18 passing tests and preparation documentation.
+Completed: local Python mock logger, 20 deterministic attempts, HTML report, 26 passing tests, the team agent harness and preparation documentation; GitHub CI passed on Python 3.11 and 3.12.
 Not implemented: live episode recorder, replay viewer, camera integration, segmentation wrapper, physical placement logic, configured local MongoDB/Atlas integration. Existing optional adapters are not verified against real services.
 
 ## Owners (proposed)
@@ -23,7 +23,7 @@ Only the designated operator/executor issues motion. Parallel work uses saved ob
 
 ### 0. Confirm the actual setup
 
-Use GitHub repository JengaDB/jengadb; confirm the assigned machine under the Viam hackathon organization, and organizer-provided Atlas access/test database when available. Read-only inspect exact arm/gripper/camera models, frame graph and obstacle geometry. Identify the NUC's available CPU/RAM/disk and installed Viam version. Mentor approves pickup and build zones and validates gripper clearance. Obtain a robot-camera RGB/depth snapshot and verify camera-to-arm transforms. Use actual block dimensions, not dimensions inferred from a photograph.
+Use GitHub repository JengaDB/jengadb; confirm the assigned machine under the Viam hackathon organization, and the designated test database within the verified Atlas project JengaDB. Read-only inspect exact arm/gripper/camera models, frame graph and obstacle geometry. Identify the NUC's available CPU/RAM/disk and installed Viam version. Mentor approves pickup and build zones and validates gripper clearance. Obtain a robot-camera RGB/depth snapshot and verify camera-to-arm transforms. Use actual block dimensions, not dimensions inferred from a photograph.
 
 Exit: known machine and components, designated operator, documented frames/units, approved work area and one usable observation. Account membership alone is not permission to modify a shared machine.
 
@@ -78,4 +78,4 @@ Deferred: full scattered-pile cleanup, autonomous Jenga gameplay, training a new
 
 ## Immediate next work
 
-Use JengaDB/jengadb and confirm authorized Viam resources; inspect configuration read-only. Ask the MongoDB mentor for the event-provided Atlas organization/project or invitation before provisioning anything. Build the local episode recorder/viewer while hardware and perception owners validate their inputs. Prepare proposed configuration changes as a reviewable diff before applying them to shared equipment. No deployment, database writes, hosted-image uploads or motion are implied by this planning document.
+Use JengaDB/jengadb and confirm authorized Viam resources; inspect configuration read-only. Recheck the existing jengadb cluster, configure the designated database connection and validate a bounded ping before synthetic upload tests (DATA-02). Atlas management authentication already succeeded; do not recreate the project or cluster. Build the local episode recorder/viewer while hardware and perception owners validate their inputs. Prepare proposed configuration changes as a reviewable diff before applying them to shared equipment. No deployment, database writes, hosted-image uploads or motion are implied by this planning document.

@@ -11,7 +11,7 @@ Persist before/after artifact references, immutable events and distinct planned/
 src/robot_hackathon/episodes.py, src/robot_hackathon/replay.py, tests/test_episodes.py
 
 ## Dependencies
-Read docs/CONTRACTS.md. Work against mock interfaces when another track is unavailable. Coordinate shared CLI/schema changes with the affected owner.
+Read docs/CONTRACTS.md and docs/INTEGRATIONS.md. Atlas management access is verified, but the application database connection is pending under DATA-02; this does not block offline recorder work. Work against mock interfaces when another track is unavailable. Coordinate shared CLI/schema changes with the affected owner.
 
 ## Handoff
 Changes: none yet.
