@@ -15,9 +15,10 @@ Evidence as of 29 October 2026. Adapters are tested against sanitized real respo
 
 - Endpoint: `POST https://ai.mongodb.com/v1/multimodalembeddings`, bearer key from `MONGO_DB_MODELS_ENDPOINT_KEY` (alias `VOYAGE_API_KEY`); host from `MONGO_DB_MODELS_ENDPOINT_URL`.
 - Model `voyage-multimodal-3.5`, default 1024 dimensions, `input_type: document` for stored candidates (queries would use `query`).
-- Request: `{"inputs":[{"content":[{"type":"text","text":...},{"type":"image_base64","image_base64":...}]}],"model":...,"input_type":"document"}`.
+- Default input is the **context crop image only** (`encoder_version voyage-multimodal-3.5/img-v2`); the geometry description is stored as `description_text` metadata and does not enter the vector. The fused text+image variant remains available (`input_parts=("text","image")`, `ctx-v2`) and gets its own `encoder_version`/index filter value, so the two are never mixed.
+- Request: `{"inputs":[{"content":[{"type":"text","text":...},{"type":"image_base64","image_base64":"data:image/png;base64,..."}]}],"model":...,"input_type":"document"}`. The image value must be a data URL; bare base64 returns HTTP 400 (verified on a real crop, 29 Oct 2026).
 - Response: `{"object":"list","data":[{"object":"embedding","embedding":[...1024 floats],"index":0}],"model":...,"usage":{text_tokens,image_pixels,video_pixels,total_tokens}}`.
-- Verification run: `run.py rgbd-verify-embedding --allow-cloud` (text-only) returned `voyage-multimodal-3.5`, 1024 dims. Fixture `fixtures/providers/voyage/response.json` (embedding truncated). The image path uses the same request shape and is exercised on the first real candidate.
+- Verification run: `run.py rgbd-verify-embedding --allow-cloud` (text-only) returned `voyage-multimodal-3.5`, 1024 dims. Fixture `fixtures/providers/voyage/response.json` (embedding truncated). Image path verified on a real 160x122 context crop: 1024 dims, 89 tokens.
 - Reference: https://www.mongodb.com/docs/voyageai/models/multimodal-embeddings/
 
 ## Replicate — not used

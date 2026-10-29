@@ -17,12 +17,13 @@ PIPELINE_CODE_VERSION = "rgbd-pipeline-v1"
 
 
 def effective_config(seg_provider, exposure_params, cutout_cfg, emb_provider, calibration_sha256, calibration_version,
-                     registry_current_version):
+                     registry_current_version, description_template="geom-v1"):
     return {"pipeline_code_version": PIPELINE_CODE_VERSION,
             "segmentation": seg_provider.effective_settings(),
             "exposure": exposure_params.effective_settings(),
             "cutouts": cutout_cfg,
             "embedding": emb_provider.effective_settings(),
+            "description": {"template_id": description_template, "template_sha256": embeddings.template_sha256(description_template)},
             "calibration": {"version": calibration_version, "content_sha256": calibration_sha256,
                             "registry_current_version": registry_current_version}}
 
@@ -76,8 +77,10 @@ def load_checkpoint(path, base_dir, stage, version, inputs):
 # ---------------------------------------------------------------- pipeline
 
 class Pipeline:
-    def __init__(self, data_dir, mode, seg_provider, emb_provider, exposure_params=None, cutout_cfg=None):
+    def __init__(self, data_dir, mode, seg_provider, emb_provider, exposure_params=None, cutout_cfg=None,
+                 description_template="geom-v1"):
         self.data_dir, self.mode = Path(data_dir), mode
+        self.description_template = description_template
         self.store = rgbd.ObservationStore(data_dir, mode)
         self.registry = rgbd.CalibrationRegistry(data_dir, mode)
         self.seg, self.emb = seg_provider, emb_provider
@@ -87,7 +90,7 @@ class Pipeline:
     def identity(self, obs):
         cal_sha = self.registry.content_sha256(obs["setup_id"], obs["calibration_version"])
         cfg = effective_config(self.seg, self.exposure_params, self.cutout_cfg, self.emb, cal_sha, obs["calibration_version"],
-                               self.registry.current(obs["setup_id"]))
+                               self.registry.current(obs["setup_id"]), self.description_template)
         return cfg, processing_version(cfg)
 
     # -- stage 1: segmentation (shared across processing versions)
@@ -176,22 +179,23 @@ class Pipeline:
         emb_dir = proc / "embeddings"
         emb_dir.mkdir(exist_ok=True)
         candidates = []
-        template_id = self.emb.effective_settings()["text_template_id"]
+        template_id = self.description_template
         for m, res, cut in zip(masks, results, cut_ckpt["payload"]["items"]):
             cid = candidate_id(observation_id, version, m["mask_index"])
             fields = {"setup_id": obs["setup_id"], "exposure": res["exposure"], "depth_stats": res["depth_stats"],
                       "crop_transform": cut["crop_transform"], "registration_verified": registration_verified}
             text = embeddings.geometry_text(fields, template_id)
             context_png = (proc / cut["files"]["context_png"]["path"]).read_bytes()
-            inputs = {"cutouts_checkpoint_sha256": cut_sha, "text_sha256": rgbd.sha256_bytes(text.encode()),
-                      "context_sha256": cut["files"]["context_png"]["sha256"]}
+            inputs = {"cutouts_checkpoint_sha256": cut_sha, "context_sha256": cut["files"]["context_png"]["sha256"]}
+            if getattr(self.emb, "uses_text", True):
+                inputs["text_sha256"] = rgbd.sha256_bytes(text.encode())
             e_ckpt = load_checkpoint(emb_dir / f"{cid}.json", proc, "embedding", version, inputs)
             if e_ckpt is None:
                 vector = self.emb.embed(text, context_png)
                 if len(vector) != self.emb.dimension:
                     raise StageError("Embedding dimension mismatch")
                 e_ckpt = write_checkpoint(emb_dir / f"{cid}.json", proc, "embedding", version, inputs, [],
-                                          {"candidate_id": cid, "vector": vector, "text": text})
+                                          {"candidate_id": cid, "vector": vector, "text": text if getattr(self.emb, "uses_text", True) else None})
             candidates.append({
                 "schema_version": 1, "candidate_id": cid, "observation_id": observation_id, "episode_id": obs["episode_id"],
                 "mode": obs["mode"], "setup_id": obs["setup_id"], "phase": "pick", "mask_index": m["mask_index"],
@@ -203,7 +207,8 @@ class Pipeline:
                                  "segmentation_key": seg_key},
                 "cutout_version": cut["cutout_version"], "encoder_version": self.emb.encoder_version,
                 "embedding_dimension": self.emb.dimension, "embedding_ref": str((emb_dir / f"{cid}.json").relative_to(proc)),
-                "embedding_text": text, "files": cut["files"], "processing_version": version,
+                "description_text": text, "description_template": template_id,
+                "embedding_input_parts": list(cfg["embedding"].get("input_parts", ["text", "image"])), "files": cut["files"], "processing_version": version,
                 "processing_dir": str(proc.relative_to(self.data_dir)), "calibration_version": obs["calibration_version"],
                 "created_at": e_ckpt["written_at"]})
         atomic_write(proc / "candidates.json", rgbd.canonical_json(candidates))

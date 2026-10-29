@@ -1,7 +1,8 @@
 """Candidate context embeddings: Voyage multimodal-3.5 via the MongoDB AI endpoint.
 
-Providers expose effective_settings() (model, dimension, input_type, text template id + content hash,
-image preprocessing) which feeds the processing identity. encoder_version is a human-readable label.
+Default is an IMAGE-ONLY vector of the context crop; the geometry description is stored as plain metadata
+(`description_text`) and never enters the vector. Providers expose effective_settings() (model, dimension,
+input_type, input parts, image preprocessing) which feeds the processing identity. encoder_version is a label.
 """
 import base64
 import hashlib
@@ -35,9 +36,13 @@ def template_sha256(template_id):
 
 
 class EmbeddingProvider:
-    """Interface: effective_settings() feeds the processing identity; embed(text, image_png) -> list[float]."""
+    """Interface: effective_settings() feeds the processing identity; embed(text, image_png) -> list[float].
+
+    uses_text tells the pipeline whether the text influences the vector (so checkpoints only depend on it if so).
+    """
     encoder_version = "abstract"
     dimension = 1024
+    uses_text = True
 
     def effective_settings(self):
         raise NotImplementedError
@@ -47,19 +52,25 @@ class EmbeddingProvider:
 
 
 class VoyageMultimodalProvider(EmbeddingProvider):
-    encoder_version = "voyage-multimodal-3.5/ctx-v1"
+    """Image-only by default (`input_parts=("image",)`): the vector answers "what looks like this"; geometry is
+    filtered/ranked from structured fields. `input_parts=("text","image")` gives the fused variant instead."""
 
-    def __init__(self, config, allow_cloud=False, model="voyage-multimodal-3.5", dimension=1024, template_id="geom-v1",
+    def __init__(self, config, allow_cloud=False, model="voyage-multimodal-3.5", dimension=1024, input_parts=("image",),
                  resize_max_px=1024, opener=None):
         self.config, self.allow_cloud, self.model, self.dimension = config, allow_cloud, model, dimension
-        self.template_id, self.resize_max_px = template_id, resize_max_px
+        self.input_parts = tuple(input_parts)
+        if not self.input_parts or any(p not in ("text", "image") for p in self.input_parts):
+            raise ValueError("input_parts must be a non-empty subset of text/image")
+        self.uses_text = "text" in self.input_parts
+        self.encoder_version = f"{model}/{'img' if not self.uses_text else 'ctx'}-v2"
+        self.resize_max_px = resize_max_px
         self.opener = opener or urllib.request.urlopen
         self.calls = 0
 
     def effective_settings(self):
         return {"provider": "voyage", "model": self.model, "dimension": self.dimension, "input_type": "document",
-                "text_template_id": self.template_id, "text_template_sha256": template_sha256(self.template_id),
-                "image_preprocessing": {"resize_max_px": self.resize_max_px, "format": "png"}}
+                "input_parts": list(self.input_parts),
+                "image_preprocessing": {"resize_max_px": self.resize_max_px, "format": "png", "encoding": "data_url"}}
 
     def _prepare_image(self, image_png):
         array, _ = rgbd.decode_png(image_png)
@@ -97,8 +108,13 @@ class VoyageMultimodalProvider(EmbeddingProvider):
 
     def embed(self, text, image_png):
         self._gate()
-        content = [{"type": "text", "text": text},
-                   {"type": "image_base64", "image_base64": base64.b64encode(self._prepare_image(image_png)).decode()}]
+        # The endpoint requires a data URL, not bare base64 (verified 29 Oct 2026: bare base64 -> HTTP 400).
+        content = []
+        if self.uses_text:
+            content.append({"type": "text", "text": text})
+        if "image" in self.input_parts:
+            content.append({"type": "image_base64",
+                            "image_base64": "data:image/png;base64," + base64.b64encode(self._prepare_image(image_png)).decode()})
         return parse_voyage_response(self._post(content), self.dimension)
 
     def verify(self, text="JengaDB endpoint verification"):

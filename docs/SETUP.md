@@ -91,8 +91,10 @@ Requires `pip install -e '.[rgbd,viam,mongo]'`. All records are written under `d
 | `rgbd-status [--orphans --allow-cloud]` | Stage validity, per-artifact local status, acks; `--orphans` lists upload attempts past the age bound |
 | `rgbd-gallery` | HTML review page of cutouts with exposure status and reasons |
 | `rgbd-index --allow-cloud --confirm-write [--status]` | Unique indexes plus the `candidate_context_v1` vector index (1024-d cosine, filtered) |
-| `rgbd-flush --allow-cloud --confirm-write [--clean-orphans]` | Media -> observation -> artifact_sync -> candidates, idempotent with separate acks |
+| `rgbd-flush --observation ID\|--all --allow-cloud --confirm-write [--clean-orphans]` | Upload only the named captures: media -> observation -> artifact_sync -> candidates, idempotent with separate acks |
+| `rgbd-delete --observation ID` | Remove a never-uploaded capture and its candidates locally; refused once any part was acknowledged by Atlas |
 | `rgbd-search --candidate ID --allow-cloud` | `$vectorSearch` with phase/setup/encoder filters using a local candidate's vector |
+| `rgbd-ui --allow-cloud [--port 8765]` | Local web UI (127.0.0.1 only): live RGB/depth preview, capture, calibration verdict, process, candidate review, flush. Needs `pip install -e '.[web]'` |
 
 Order for a new setup: record calibration, capture, overlay-inspect, re-record calibration as `verified` only if the overlay supports it, process, review the gallery, index once, flush. Exposure is `unknown` for every candidate until alignment is verified and the observation's calibration version is the registry's current one. Pickability is never set here.
 

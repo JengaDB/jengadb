@@ -10,8 +10,8 @@ from urllib.parse import urlsplit
 from .media import MediaUploader
 
 VECTOR_INDEX = "candidate_context_v1"
-VECTOR_FILTERS = ("phase", "exposure.status", "setup_id", "mode", "encoder_version", "processing_version",
-                  "segmentation.model_version", "calibration_version")
+VECTOR_FILTERS = ("phase", "exposure.status", "pickability_label.status", "pickable", "setup_id", "mode", "encoder_version",
+                  "processing_version", "segmentation.model_version", "calibration_version")
 
 
 def _target(uri, database, *collections):
@@ -111,10 +111,16 @@ class RgbdMongoStore:
     def ensure_vector_index(self, dimension=1024):
         from pymongo.operations import SearchIndexModel
         existing = {i["name"]: i for i in self.candidates.list_search_indexes()}
-        if VECTOR_INDEX in existing:
-            return {"created": False, **self.index_status()}
         fields = [{"type": "vector", "path": "embedding", "numDimensions": dimension, "similarity": "cosine"}]
         fields += [{"type": "filter", "path": p} for p in VECTOR_FILTERS]
+        if VECTOR_INDEX in existing:
+            current = existing[VECTOR_INDEX].get("latestDefinition", {}).get("fields", [])
+            have = {(f.get("type"), f.get("path")) for f in current}
+            want = {(f["type"], f["path"]) for f in fields}
+            if want - have:
+                self.candidates.update_search_index(VECTOR_INDEX, {"fields": fields})
+                return {"created": False, "updated": True, "added_filters": sorted(p for t, p in want - have), **self.index_status()}
+            return {"created": False, "updated": False, **self.index_status()}
         self.candidates.create_search_index(SearchIndexModel(definition={"fields": fields}, name=VECTOR_INDEX, type="vectorSearch"))
         return {"created": True, **self.index_status()}
 
