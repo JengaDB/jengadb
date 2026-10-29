@@ -11,7 +11,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED = ('AGENTS.md', 'CLAUDE.md', 'START_HERE.md', 'docs/BUILD_PLAN.md',
-            'docs/EXPERIMENT_MEMORY.md', 'docs/CONTRACTS.md', 'docs/HARNESS_DECISION.md')
+            'docs/EXPERIMENT_MEMORY.md', 'docs/CONTRACTS.md', 'docs/HARNESS_DECISION.md',
+            'docs/INTEGRATIONS.md')
 
 
 def load_board(root=ROOT):
@@ -53,7 +54,7 @@ def context_errors(root=ROOT):
 
 
 def starter(task):
-    return (f"Read AGENTS.md, START_HERE.md, docs/CONTRACTS.md and {task['card']}.\n"
+    return (f"Read AGENTS.md, START_HERE.md, docs/INTEGRATIONS.md, docs/CONTRACTS.md and {task['card']}.\n"
             f"Help me implement {task['id']}: {task['title']}. My role is {task['role']}.\n"
             "Inspect existing work first. Use a separate branch and preserve other work. "
             "Build the smallest offline slice that meets the task's acceptance criteria. "

@@ -39,7 +39,7 @@ No package installation is required for these commands. `fcntl` locking makes th
 
 ## Configuration and optional integrations
 
-Defaults: `MODE=mock`, `ENABLE_MOTION=false`, `ALLOW_CLOUD=false`. Invalid booleans fail; enabling motion always fails. Configuration is read from environment variables. **`.env.example` documents names only; `.env` is not automatically loaded.** No real configuration or credentials were collected during preparation.
+Defaults: `MODE=mock`, `ENABLE_MOTION=false`, `ALLOW_CLOUD=false`. Invalid booleans fail; enabling motion always fails. Configuration is read from environment variables. **`.env.example` documents names only; `.env` is not automatically loaded.** Atlas service-account authentication was verified separately; it is not configured in the application. See [integration status](INTEGRATIONS.md). The runtime database adapter needs MONGODB_URI, not the Atlas management client ID/secret. No credentials are stored in this repository.
 
 SDKs have not been installed or resolved. No lockfile is supplied because resolution has not occurred. Optional dependency declarations are provisional, and live integration remains untested. Once installation is approved, the intended local-only setup is:
 
@@ -76,7 +76,7 @@ ALLOW_CLOUD=true .venv/bin/python run.py mongo-index --allow-cloud --confirm-wri
 ALLOW_CLOUD=true .venv/bin/python run.py flush --allow-cloud --confirm-write
 ```
 
-The flags express the operator's opt-in; they are not an access-control system. Use a scoped credential. TLS validation remains enabled. Connection, selection, socket, and operation timeouts are bounded. Ping does not establish write permission. No cloud commands were run during preparation.
+The flags express the operator's opt-in; they are not an access-control system. Use a scoped credential. TLS validation remains enabled. Connection, selection, socket, and operation timeouts are bounded. Ping does not establish write permission. No application database commands have been run. The separate Atlas management check authenticated and listed projects/clusters; it did not ping or write to the database.
 
 ## Durability and schema
 

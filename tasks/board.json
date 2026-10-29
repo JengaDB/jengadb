@@ -19,5 +19,12 @@
     "title": "Read-only machine discovery",
     "status": "ready",
     "card": "tasks/HARDWARE-01.md"
+  },
+  {
+    "id": "DATA-02",
+    "role": "data",
+    "title": "Connect the existing Atlas database",
+    "status": "ready",
+    "card": "tasks/DATA-02.md"
   }
 ]

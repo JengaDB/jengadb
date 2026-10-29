@@ -1,7 +1,7 @@
 # JengaDB agent guide
 
 ## Start here
-Read START_HERE.md, tasks/board.json, and the selected task card in tasks/. Read docs/BUILD_PLAN.md for product context and docs/EXPERIMENT_MEMORY.md for data design. Inspect git status before editing. Preserve existing work.
+Read START_HERE.md, docs/INTEGRATIONS.md, tasks/board.json, and the selected task card in tasks/. Read docs/BUILD_PLAN.md for product context and docs/EXPERIMENT_MEMORY.md for data design. Inspect git status before editing. Preserve existing work.
 
 Goal: humans play Jenga; the robot builds alternating layers. First physical milestone: two layers, six blocks. Current implemented baseline is a mock attempt logger; the live episode recorder and integrations remain tasks, not completed features.
 

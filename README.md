@@ -22,12 +22,13 @@ Open `reports/mock.html` in a browser. These fixtures illustrate storage and rep
 
 Episode recorder and replay viewer, authorized camera/telemetry integration, supervised placement, and optional MongoDB upload. Live robot and database integrations remain untested. Physical actions are not implemented.
 
+- [Verified integration status and connection steps](docs/INTEGRATIONS.md)
 - [Build plan and ownership](docs/BUILD_PLAN.md)
 - [Experiment memory design](docs/EXPERIMENT_MEMORY.md)
 - [Setup and optional integration commands](docs/SETUP.md)
 - [Onsite runbook](docs/RUNBOOK.md)
 
-GitHub organization: JengaDB. Viam organization: believed to be hackathon; assigned resources need verification. Organizer-provided MongoDB Atlas access remains outstanding.
+GitHub organization: JengaDB. Viam organization: believed to be hackathon; assigned resources need verification. Atlas management access to project JengaDB and cluster jengadb is verified; application database connectivity remains pending. Linear workspace Skymoondev was reported by the user; task migration has not been performed.
 
 ## Work with coding agents
 
