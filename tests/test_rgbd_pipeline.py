@@ -388,6 +388,43 @@ class IdentityAndCheckpointTests(unittest.TestCase):
         make_pipeline(self.dir, seg2).process("obs_test")
         self.assertEqual(seg2.calls, 1)
 
+    def test_embedding_cache_across_observations_keeps_ids_and_existing_sync(self):
+        seg, emb = StubSegmenter(), StubEmbedder()
+        first = make_pipeline(self.dir, seg, emb).process("obs_test")
+        make_observation(self.dir, obs_id="obs_other", register=False)
+        # New Pipeline instance simulates reopening the local cache. Observation
+        # identity remains distinct even when the embedding inputs are identical.
+        second = make_pipeline(self.dir, seg, emb).process("obs_other")
+        self.assertEqual((seg.calls, emb.calls), (2, 3))
+        self.assertTrue({c["candidate_id"] for c in first["candidates"]}.isdisjoint(
+            {c["candidate_id"] for c in second["candidates"]}))
+        for a, b in zip(first["candidates"], second["candidates"]):
+            self.assertEqual(pipeline.load_embedding(self.dir, a), pipeline.load_embedding(self.dir, b))
+        store = candidate_store.CandidateLocalStore(self.dir, "mock")
+        store.put_many(first["candidates"] + second["candidates"])
+        remote = MemoryRemote()
+        remote.fail_once.add("candidate_after")
+        failed = candidate_store.sync(self.dir, "mock", remote)
+        self.assertEqual(failed["error"], "TimeoutError")
+        retried = candidate_store.sync(self.dir, "mock", remote)
+        self.assertIsNone(retried["error"])
+        self.assertEqual(retried["pending_candidates"], 0)
+        self.assertEqual((len(remote.observations), len(remote.candidates)), (2, 6))
+        self.assertEqual(len(store.read()), 6)
+        repeated = candidate_store.sync(self.dir, "mock", remote)
+        self.assertEqual((repeated["media_uploaded"], repeated["observations_sent"], repeated["candidates_sent"]), (0, 0, 0))
+        self.assertEqual(emb.calls, 3)
+
+    def test_embedding_cache_reuses_inputs_across_processing_versions(self):
+        emb = StubEmbedder()
+        first = make_pipeline(self.dir, emb=emb).process("obs_test")
+        # This bookkeeping flag changes the overall processing identity, but
+        # does not change the geometry text or image sent to the embedder.
+        second = make_pipeline(self.dir, emb=emb, params=exposure.ExposureParams(
+            block_dimensions_verified=True)).process("obs_test")
+        self.assertNotEqual(first["processing_version"], second["processing_version"])
+        self.assertEqual(emb.calls, 3)
+
     def test_tampered_checkpoint_is_recomputed(self):
         seg, emb = StubSegmenter(), StubEmbedder()
         first = make_pipeline(self.dir, seg, emb).process("obs_test")

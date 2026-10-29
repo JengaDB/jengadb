@@ -12,6 +12,8 @@ import shutil
 from pathlib import Path
 from .local_store import atomic_write
 from . import rgbd, segmentation, exposure, cutouts, embeddings
+from .cached_embedding import CachedEmbeddingProvider
+from .result_cache import ResultCache
 
 PIPELINE_CODE_VERSION = "rgbd-pipeline-v1"
 
@@ -80,7 +82,9 @@ class Pipeline:
         self.data_dir, self.mode = Path(data_dir), mode
         self.store = rgbd.ObservationStore(data_dir, mode)
         self.registry = rgbd.CalibrationRegistry(data_dir, mode)
-        self.seg, self.emb = seg_provider, emb_provider
+        self.seg = seg_provider
+        self.emb = CachedEmbeddingProvider(
+            emb_provider, ResultCache(self.data_dir / mode / "provider-cache" / "results.sqlite3"))
         self.exposure_params = exposure_params or exposure.ExposureParams()
         self.cutout_cfg = cutout_cfg or cutouts.cutout_settings()
 
