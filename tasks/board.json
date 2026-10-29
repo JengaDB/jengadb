@@ -26,5 +26,15 @@
     "title": "Connect the existing Atlas database",
     "status": "ready",
     "card": "tasks/DATA-02.md"
+  },
+  {
+    "id": "SKY-66",
+    "role": "data",
+    "title": "RGB-D records, candidate embeddings and Atlas indexes",
+    "status": "in_progress",
+    "card": "tasks/SKY-66.md",
+    "owner": "Kris",
+    "evidence": "Offline pipeline + tests; Atlas indexes READY; scratch flush round trip verified; SAM 3.1 and Voyage endpoints verified; local Viam capture pending",
+    "updated_at": "2026-10-29T22:45:00+00:00"
   }
 ]
