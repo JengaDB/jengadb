@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robot-hackathon"
+version = "0.1.0"
+description = "Offline robot attempt logger with opt-in integration boundaries"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+viam = ["viam-sdk"]
+mongo = ["pymongo>=4,<5"]
+
+[project.scripts]
+robot-hackathon = "robot_hackathon.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

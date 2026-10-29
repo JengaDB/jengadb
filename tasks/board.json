@@ -1,0 +1,23 @@
+[
+  {
+    "id": "DATA-01",
+    "role": "data",
+    "title": "Episode recorder and replay",
+    "status": "ready",
+    "card": "tasks/DATA-01.md"
+  },
+  {
+    "id": "VISION-01",
+    "role": "vision",
+    "title": "Snapshot perception boundary",
+    "status": "ready",
+    "card": "tasks/VISION-01.md"
+  },
+  {
+    "id": "HARDWARE-01",
+    "role": "hardware",
+    "title": "Read-only machine discovery",
+    "status": "ready",
+    "card": "tasks/HARDWARE-01.md"
+  }
+]
