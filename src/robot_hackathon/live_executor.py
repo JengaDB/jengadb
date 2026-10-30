@@ -25,8 +25,12 @@ SAFE_Z_MM = 150.0                 # gripper origin height that is clear of flat 
 TIP_ABOVE_GRIPPER_FRAME_MM = 0.5  # from Sam's touch-off: 171.5 (flange at contact) - 172 (gripper frame below flange)
 PLACE_DROP_MM = 1.0
 PICK_LIFT_MM = 100.0
+CLAW_THICKNESS_MM = 8.0           # Sam's; closed claws are two claws thick
+PUSH_START_GAP_MM = 5.0           # gap between the closed claws and the last block before the push starts
+PUSH_TIPS_MM = 5.0                # claw tips above the table while pushing
+PUSH_EXTRA_MM = 8.0               # shove past the point where the gaps have closed
 MOVE_TIMEOUT_S = 120.0
-STEPS = ("status", "home", "hover", "descend", "grab", "lift", "to-slot", "release", "retreat", "abort-up", "open")
+STEPS = ("status", "home", "hover", "descend", "grab", "lift", "to-slot", "release", "retreat", "abort-up", "open", "push")
 
 
 def _now():
@@ -142,7 +146,7 @@ def load_decision(path):
     return decision
 
 
-async def run_step(config, data_dir, step, operator, episode_id, decision_path=None, table_z=None):
+async def run_step(config, data_dir, step, operator, episode_id, decision_path=None, table_z=None, push_distance=None):
     config.require_motion(operator)
     if step not in STEPS:
         raise ConfigError(f"Unknown step {step}; choose from {STEPS}")
@@ -187,6 +191,11 @@ async def run_step(config, data_dir, step, operator, episode_id, decision_path=N
             decision = load_decision(decision_path)
             ep.state["decision"] = decision
             ep.state["decision_file"] = str(decision_path)
+            ctx_path = Path(str(decision_path).replace("-decision.json", ".json"))
+            if ctx_path.exists():
+                placement = json.loads(ctx_path.read_text()).get("placement", {})
+                if placement.get("target"):
+                    ep.state["slots"] = placement["target"]["slots"]
             ep.state["table_z_mm"] = table_z if table_z is not None else decision["source_pose"].get("top_z_from_support_offset_mm", 0) - decision["source_pose"]["height_above_table_mm"]
             ep.save()
             bx, by, bz = decision["source_pose"]["block_top_center_mm"]
@@ -305,6 +314,51 @@ async def run_step(config, data_dir, step, operator, episode_id, decision_path=N
             ep.save()
             ep.event(step, measured=await bot.snapshot())
             return 0
+
+        if step == "push":
+            # Sam's push_together: closed claws come down just outside the last block of the row, on the side away from
+            # the first, and slide toward the first block to close the gaps left for the claws.
+            slots = [s for s in ep.state.get("slots", []) if s["layer"] == 0]
+            if len(slots) < 2:
+                raise ConfigError("No layer-0 slot plan in this episode; run hover with a decision first")
+            if ep.state.get("held"):
+                raise ConfigError("Still recorded as holding a block; release first")
+            first, last = slots[0]["block_center_mm"], slots[-1]["block_center_mm"]
+            d = math.hypot(first[0] - last[0], first[1] - last[1])
+            ux, uy = (first[0] - last[0]) / d, (first[1] - last[1]) / d
+            block_w = slots[0]["block_dimensions_mm"][1]
+            back = block_w / 2 + CLAW_THICKNESS_MM + PUSH_START_GAP_MM
+            start = (last[0] - ux * back, last[1] - uy * back)
+            gaps = sum(max(0.0, math.hypot(b["block_center_mm"][0] - a["block_center_mm"][0], b["block_center_mm"][1] - a["block_center_mm"][1]) - block_w)
+                       for a, b in zip(slots, slots[1:]))
+            distance = push_distance if push_distance is not None else gaps + PUSH_START_GAP_MM + PUSH_EXTRA_MM
+            await bot.gripper.grab()  # closed claws make a solid pusher
+            g = await bot.gripper_origin()
+            travel_z = g[2]
+            ep.event(step, phase="plan", start_xy=[round(v, 1) for v in start], direction=[round(ux, 3), round(uy, 3)], distance_mm=round(distance, 1),
+                     row_gaps_mm=round(gaps, 1), tips_above_table_mm=PUSH_TIPS_MM, before=before)
+            ok, _ = await bot.move_delta(dx=start[0] - g[0], dy=start[1] - g[1])
+            if not ok:
+                ep.event(step, phase="translate_failed")
+                return 1
+            # Push with the claws' flat outer face, which runs along the blocks' long sides when they close across them.
+            aligned, log = await bot.align_claws(wrap_90(slots[0]["long_side_deg"] + 90.0), tolerance_deg=1.5)
+            g = await bot.gripper_origin()
+            ok, _ = await bot.move_delta(dx=start[0] - g[0], dy=start[1] - g[1])  # turning may have shifted it
+            g = await bot.gripper_origin()
+            target_z = table_z + PUSH_TIPS_MM - TIP_ABOVE_GRIPPER_FRAME_MM
+            ep.event(step, phase="at_start", aligned=aligned, error_log_deg=log, measured=await bot.snapshot(), target_gripper_z=round(target_z, 1))
+            ok, _ = await bot.move_delta(dz=target_z - g[2], near_table=True)
+            if not ok:
+                ep.event(step, phase="descend_failed")
+                return 1
+            ok, target = await bot.move_delta(dx=ux * distance, dy=uy * distance, near_table=True)
+            ep.event(step, phase="pushed", accepted=ok, target_flange=target, measured=await bot.snapshot())
+            g = await bot.gripper_origin()
+            ok2, _ = await bot.move_delta(dz=travel_z - g[2], near_table=True)
+            await bot.gripper.open()
+            ep.event(step, phase="retreated_and_opened", accepted=ok2, measured=await bot.snapshot())
+            return 0 if (ok and ok2) else 1
     finally:
         await asyncio.wait_for(client.close(), timeout=5)
     raise ConfigError(f"Unhandled step {step}")

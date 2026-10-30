@@ -16,6 +16,7 @@ def main(argv=None):
     parser.add_argument("--operator", default=None, help="live-step: name of the person at the e-stop")
     parser.add_argument("--decision", default=None, help="live-step hover: agent-propose decision json to execute")
     parser.add_argument("--table-z", type=float, default=None, help="live-step: override table top z (mm, world) for the descent")
+    parser.add_argument("--push-distance", type=float, default=None, help="live-step push: override the computed slide distance (mm)")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--report", type=Path, default=None)
     parser.add_argument("--allow-cloud", action="store_true")
@@ -52,7 +53,8 @@ def main(argv=None):
             logging.disable(logging.NOTSET)
             logging.getLogger().setLevel(logging.WARNING)
             try:
-                return asyncio.run(run_step(config, args.data_dir, args.step, args.operator, args.episode, args.decision, args.table_z))
+                return asyncio.run(run_step(config, args.data_dir, args.step, args.operator, args.episode, args.decision, args.table_z,
+                                            args.push_distance))
             except ConfigError:
                 raise
             except Exception as exc:  # noqa: BLE001 - the operator needs the planner/robot error verbatim; it carries no secrets

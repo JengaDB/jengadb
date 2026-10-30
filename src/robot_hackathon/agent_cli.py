@@ -20,6 +20,7 @@ def add_arguments(parser):
     parser.add_argument("--coordinator", choices=("deterministic", "openai"), default="deterministic")
     parser.add_argument("--tower-origin", default=None, help="agent-propose: 'x,y' mm in robot_base for the tower footprint centre")
     parser.add_argument("--tower-long-side-deg", type=float, default=0.0)
+    parser.add_argument("--tower-gap", type=float, default=0.0, help="agent-propose: gap between neighbours in a layer (mm); Sam placed rows at claw+3 mm and pushed them together")
     parser.add_argument("--filled-slots", default="", help="agent-propose: comma-separated slot ids already built, e.g. L0S0,L0S1")
     parser.add_argument("--cosine-threshold", type=float, default=None, help="agent-propose: override the 0.5 default (recorded in evidence)")
     parser.add_argument("--processing-version", default=None, help="agent-propose: candidate processing version to use")
@@ -98,7 +99,8 @@ def _propose(args, config):
             remote = RgbdMongoStore(config)
             search = retrieval.AtlasReferenceSearch(remote)
         filled = [s for s in args.filled_slots.split(",") if s]
-        context = proposal.build_context(scene, policy, search, tower, filled, args.tower_long_side_deg, dry_run=args.dry_run)
+        context = proposal.build_context(scene, policy, search, tower, filled, args.tower_long_side_deg, dry_run=args.dry_run,
+                                         tower_gap_mm=args.tower_gap)
     finally:
         if remote is not None:
             remote.close()

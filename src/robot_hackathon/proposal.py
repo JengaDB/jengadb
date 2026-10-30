@@ -7,11 +7,12 @@ open placement slot. A proposal is data with evidence IDs; it is never an execut
 geometry scores are kept separate so a reviewer can compare retrieval-assisted selection with geometry alone.
 """
 import json
+import math
 from pathlib import Path
 
 from . import rgbd, retrieval
 from . import grasp_geometry as geom
-from .placement import TowerTarget, next_open_slot
+from .placement import TowerTarget, next_open_slot, footprint_clearance_mm
 
 CONTEXT_SCHEMA_VERSION = 1
 PROPOSAL_SCHEMA_VERSION = 1
@@ -88,7 +89,7 @@ def _query_record(scene, m):
 
 
 def build_context(scene, policy=None, reference_search=None, tower_origin_xy_mm=None, filled_slots=(), tower_long_side_deg=0.0,
-                  dry_run=False):
+                  dry_run=False, tower_gap_mm=0.0):
     """Deterministic planning context. Geometry and calibration are computed by code, never by the agent.
 
     dry_run=True keeps unverified-calibration reasons as flags instead of rejections so the geometry can be inspected;
@@ -116,9 +117,18 @@ def build_context(scene, policy=None, reference_search=None, tower_origin_xy_mm=
             if ss.z_in_robot_base_mm is not None:
                 table["support_surface_offset_mm"] = ss.z_in_robot_base_mm
                 table["offset_minus_fitted_mean_mm"] = ss.z_in_robot_base_mm - table["in_robot_base"]["mean_z_mm"]
+    # Blocks already standing in the tower zone are never pick candidates (Sam's tower exclusion).
+    tower_target = None
+    if tower_origin_xy_mm is not None and calib.support_surface.z_in_robot_base_mm is not None:
+        tower_target = TowerTarget(tuple(tower_origin_xy_mm), calib.support_surface, calib.block, calib.finger, tower_long_side_deg,
+                                   gap_mm=tower_gap_mm, source="context_parameter", verified=False)
+    zone_radius = footprint_clearance_mm(tower_target) if tower_target else None
     candidates = []
     for m in scene["masks"]:
         est = geom.estimate_block(m["mask"], depth, height_map, calib, m["mask_index"], m["candidate_id"], invalid_value=invalid)
+        if zone_radius is not None and est.base_point_mm is not None:
+            if math.hypot(est.base_point_mm[0] - tower_origin_xy_mm[0], est.base_point_mm[1] - tower_origin_xy_mm[1]) < zone_radius:
+                est.rejection_reasons.append("in_tower_zone")
         if plane is None:
             est.rejection_reasons.append("table_plane_unavailable")
         elif not plane.reliable:
@@ -150,9 +160,8 @@ def build_context(scene, policy=None, reference_search=None, tower_origin_xy_mm=
     ranking = sorted(eligible, key=lambda c: (c["retrieval"]["status"] != "matched", -(c["retrieval"]["best_cosine_similarity"] or -2)) + geometry_key(c))
     geometry_only = sorted(eligible, key=geometry_key)
     placement = {"status": "unavailable", "reason": "tower_origin_not_configured", "next_slot": None}
-    if tower_origin_xy_mm is not None and calib.support_surface.z_in_robot_base_mm is not None:
-        target = TowerTarget(tuple(tower_origin_xy_mm), calib.support_surface, calib.block, calib.finger, tower_long_side_deg,
-                             source="context_parameter", verified=False)
+    if tower_target is not None:
+        target = tower_target
         slot = next_open_slot(target, filled_slots)
         placement = {"status": "available" if slot else "complete", "target": target.to_dict(filled_slots), "filled": sorted(filled_slots),
                      "next_slot": slot, "reason": None if slot else "all_slots_filled"}
