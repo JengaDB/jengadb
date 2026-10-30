@@ -36,6 +36,11 @@ class Config:
     block_dimensions_mm: tuple = (75.0, 25.0, 15.0)
     block_dimensions_verified: bool = False
     media_attempt_max_age_hours: float = 24.0
+    # Offline-first proposal agent (AGENT-01). The OpenAI coordinator is optional and gated like other providers.
+    openai_key: str = field(default="", repr=False)
+    openai_base_url: str = "https://api.openai.com"
+    openai_model: str = ""
+    enable_motion: bool = False
 
     @classmethod
     def from_env(cls, env=None):
@@ -43,8 +48,9 @@ class Config:
         mode = env.get("MODE", "mock")
         if mode not in ("mock", "live"):
             raise ConfigError("MODE must be mock or live")
-        if boolean(env, "ENABLE_MOTION"):
-            raise ConfigError("Motion is not implemented; ENABLE_MOTION must remain false")
+        # Motion is only reachable through live-step, which additionally requires --operator and MODE=live.
+        # Authorized by the project owner on 29 Oct 2026 (operator at the e-stop); see docs/LIVE_SINGLE_PLACEMENT_PLAN.md.
+        enable_motion = boolean(env, "ENABLE_MOTION")
         machine_auth = env.get("MACHINE_AUTH", "apikey")
         if machine_auth not in ("apikey", "none"):
             raise ConfigError("MACHINE_AUTH must be apikey or none")
@@ -66,6 +72,9 @@ class Config:
             base = "https://" + base
         if urlsplit(base).scheme != "https" or not urlsplit(base).hostname:
             raise ConfigError("MONGO_DB_MODELS_ENDPOINT_URL must be an https host")
+        openai_base = (env.get("OPENAI_BASE_URL") or "https://api.openai.com").strip().rstrip("/")
+        if urlsplit(openai_base).scheme != "https" or not urlsplit(openai_base).hostname:
+            raise ConfigError("OPENAI_BASE_URL must be an https URL")
         return cls(mode, boolean(env, "ALLOW_CLOUD"), env.get("MACHINE_ADDRESS", ""),
                    env.get("API_KEY_ID", ""), env.get("API_KEY", ""),
                    env.get("MONGODB_URI", ""), env.get("MONGODB_DATABASE", "hackathon"),
@@ -78,7 +87,17 @@ class Config:
                    observations_collection=env.get("RGBD_OBSERVATIONS_COLLECTION", "observations"),
                    candidates_collection=env.get("RGBD_CANDIDATES_COLLECTION", "candidates"),
                    block_dimensions_mm=dims, block_dimensions_verified=boolean(env, "BLOCK_DIMENSIONS_VERIFIED"),
-                   media_attempt_max_age_hours=max_age)
+                   media_attempt_max_age_hours=max_age,
+                   openai_key=env.get("OPENAI_API_KEY", ""), openai_base_url=openai_base, openai_model=env.get("OPENAI_MODEL", ""),
+                   enable_motion=enable_motion)
+
+    def require_motion(self, operator):
+        if not self.enable_motion:
+            raise ConfigError("Motion requires ENABLE_MOTION=true, set knowingly by the operator")
+        if self.mode != "live":
+            raise ConfigError("Motion requires MODE=live")
+        if not operator or not operator.strip():
+            raise ConfigError("Motion requires --operator NAME (the person at the e-stop)")
 
     def require_cloud(self, explicit):
         if not explicit or not self.allow_cloud:
@@ -100,6 +119,10 @@ class Config:
     def require_voyage(self):
         if not self.voyage_key:
             raise ConfigError("Set VOYAGE_API_KEY or MONGO_DB_MODELS_ENDPOINT_KEY locally")
+
+    def require_openai(self):
+        if not self.openai_key:
+            raise ConfigError("Set OPENAI_API_KEY locally")
 
     def require_mongo(self):
         if not self.uri:

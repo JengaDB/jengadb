@@ -98,6 +98,19 @@ Requires `pip install -e '.[rgbd,viam,mongo]'`. All records are written under `d
 
 Order for a new setup: record calibration, capture, overlay-inspect, re-record calibration as `verified` only if the overlay supports it, process, review the gallery, index once, flush. Exposure is `unknown` for every candidate until alignment is verified and the observation's calibration version is the registry's current one. Pickability is never set here.
 
+## Offline pick-and-place proposals (AGENT-01)
+
+Builds a reviewable proposal from a saved scene; nothing moves. Synthetic presets run with no dependencies beyond `numpy`/`Pillow` and never mix with live records. Outputs: `data/<mode>/proposals/<observation>/ctx_*.json` plus `*-decision.json` (replayable without network) and an HTML report under `reports/`.
+
+| Command | Behavior |
+| --- | --- |
+| `agent-propose --synthetic separated\|blocked\|stacked` | Render/load a synthetic top-down scene (`MODE=mock`), fit the table, estimate blocks, check finger clearance, decide deterministically, write the report |
+| `agent-propose --observation ID [--references local\|none\|atlas] [--tower-origin x,y] [--filled-slots L0S0,...]` | Same on a processed capture: masks/vectors from the SKY-66 candidates, curated references from the local store (`human` labels only) or, with `--allow-cloud`, read-only Atlas `$vectorSearch` |
+| `agent-propose ... --coordinator openai --allow-cloud` | Let the OpenAI function-calling coordinator pick among eligible proposals (IDs/scores only, no images); needs `OPENAI_API_KEY`; every tool call is validated application-side |
+| `agent-calibration [--file geometry.json] [--geometry-version V]` | Record or show the operator-supplied geometry calibration for `SETUP_ID`: camera->robot_base extrinsics, signed support-surface offset, claw and block dimensions with `verified` flags |
+
+A grasp proposal requires verified registration, verified extrinsics, a verified signed support-surface offset, verified claw and block dimensions and a reliable table-plane fit; anything missing is listed as a rejection reason, never estimated. The proposal is data with `executable: false`; the live phase needs its own approved plan.
+
 Local Viam for development (second D435 on this Mac). `viam-agent` does not exist for macOS; brew is the install path. macOS RealSense support is experimental (librealsense 2.57.6 beta; D435i is the listed device, plain D435 unlisted), and firmware updates are Linux-only.
 
 ```sh

@@ -71,10 +71,18 @@ class Acceptance(unittest.TestCase):
         self.assertIsNone(summarize([self.rows[4]])[0]['rate'])
 
     def test_malformed_configuration(self):
-        for env in ({'MODE':'bad'}, {'ALLOW_CLOUD':'yes'}, {'ENABLE_MOTION':'1'}, {'ENABLE_MOTION':'true'}):
+        for env in ({'MODE':'bad'}, {'ALLOW_CLOUD':'yes'}, {'ENABLE_MOTION':'1'}):
             with self.subTest(env=env), self.assertRaises(ConfigError):
                 Config.from_env(env)
         self.assertFalse(Config.from_env({'ALLOW_CLOUD':'false'}).allow_cloud)
+        # ENABLE_MOTION alone never suffices: live-step also needs MODE=live and a named operator.
+        with self.assertRaises(ConfigError):
+            Config.from_env({'ENABLE_MOTION':'true'}).require_motion('Kris')
+        with self.assertRaises(ConfigError):
+            Config.from_env({'ENABLE_MOTION':'true', 'MODE':'live'}).require_motion('')
+        with self.assertRaises(ConfigError):
+            Config.from_env({'MODE':'live'}).require_motion('Kris')
+        Config.from_env({'ENABLE_MOTION':'true', 'MODE':'live'}).require_motion('Kris')
 
     def test_default_cloud_commands_denied(self):
         for command in ('viam-check', 'mongo-ping', 'mongo-index', 'flush'):

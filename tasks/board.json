@@ -46,5 +46,15 @@
     "owner": "Kazy",
     "evidence": "73 offline tests pass including cache reuse and existing sync retry; pipeline-owner review and live validation pending.",
     "updated_at": "2026-10-29T23:27:30.587221+00:00"
+  },
+  {
+    "id": "AGENT-01",
+    "role": "vision",
+    "title": "Offline pick-and-place proposals from saved RGB-D",
+    "status": "in_progress",
+    "card": "tasks/AGENT-01.md",
+    "owner": "Kris",
+    "evidence": "106 offline tests OK (23 new): retrieval thresholds/curation/exclusions, synthetic geometry within 1.5 mm/1 deg, blocked-fingers rejection, validator, abstentions, OpenAI tool loop with fake transport and one live OpenAI run on synthetic data (validated proposal, blocked block never chosen). Robot-camera capture read-only: 3 SAM masks, 100% plane inliers at 383 mm, strict abstention on unverified calibration, dry-run geometry_preview from both coordinators. No cloud or robot calls.",
+    "updated_at": "2026-10-30T02:30:00+00:00"
   }
 ]

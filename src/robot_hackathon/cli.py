@@ -5,23 +5,30 @@ import logging
 from pathlib import Path
 from .config import Config, ConfigError
 from .local_store import LocalStore
-from . import rgbd_cli
+from . import rgbd_cli, agent_cli
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Robot attempt logger. Offline by default; no physical actions.")
     parser.add_argument("command", nargs="?", default="mock-demo",
-                        choices=("mock-demo", "report", "viam-check", "mongo-ping", "mongo-index", "flush") + rgbd_cli.COMMANDS)
+                        choices=("mock-demo", "report", "viam-check", "mongo-ping", "mongo-index", "flush", "live-step") + rgbd_cli.COMMANDS + agent_cli.COMMANDS)
+    parser.add_argument("--step", default=None, help="live-step: one motion segment (status|home|hover|descend|grab|lift|to-slot|release|retreat|abort-up|open)")
+    parser.add_argument("--operator", default=None, help="live-step: name of the person at the e-stop")
+    parser.add_argument("--decision", default=None, help="live-step hover: agent-propose decision json to execute")
+    parser.add_argument("--table-z", type=float, default=None, help="live-step: override table top z (mm, world) for the descent")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--report", type=Path, default=None)
     parser.add_argument("--allow-cloud", action="store_true")
     parser.add_argument("--confirm-write", action="store_true", help="Use only after authorization for this test database")
     rgbd_cli.add_arguments(parser)
+    agent_cli.add_arguments(parser)
     args = parser.parse_args(argv)
     try:
         config = Config.from_env()
         if args.command in rgbd_cli.COMMANDS:
             return rgbd_cli.run(args, config)
+        if args.command in agent_cli.COMMANDS:
+            return agent_cli.run(args, config)
         if args.command in ("mock-demo", "report"):
             from .report import render
             store = LocalStore(args.data_dir, config.mode)
@@ -40,6 +47,18 @@ def main(argv=None):
             raise ConfigError("Database writes require --confirm-write after specific authorization")
         # Avoid SDK debug/error logging accidentally disclosing credentials.
         logging.disable(logging.CRITICAL)
+        if args.command == "live-step":
+            from .live_executor import run_step
+            logging.disable(logging.NOTSET)
+            logging.getLogger().setLevel(logging.WARNING)
+            try:
+                return asyncio.run(run_step(config, args.data_dir, args.step, args.operator, args.episode, args.decision, args.table_z))
+            except ConfigError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - the operator needs the planner/robot error verbatim; it carries no secrets
+                print(f"live-step {args.step} failed: {type(exc).__name__}: {exc}")
+                print("No automatic retry. Check the arm, then choose the next step (abort-up / home / repeat).")
+                return 1
         if args.command == "viam-check":
             from .viam_adapter import ViamAdapter
             print(json.dumps({"resources": asyncio.run(ViamAdapter.discover(config))}))

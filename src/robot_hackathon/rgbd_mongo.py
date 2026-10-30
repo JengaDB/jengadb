@@ -174,8 +174,12 @@ class RgbdMongoStore:
         stage = {"index": VECTOR_INDEX, "path": "embedding", "queryVector": vector, "numCandidates": num_candidates, "limit": limit}
         if filters:
             stage["filter"] = filters
-        projection = {"_id": 0, "candidate_id": 1, "observation_id": 1, "setup_id": 1, "exposure": 1, "processing_version": 1,
-                      "score": {"$meta": "vectorSearchScore"}}
+        # Curation provenance and compatibility fields travel with every hit so retrieval.shortlist can audit them;
+        # vectors and image bytes are never projected.
+        projection = {"_id": 0, "candidate_id": 1, "observation_id": 1, "episode_id": 1, "setup_id": 1, "mode": 1, "phase": 1,
+                      "exposure": 1, "processing_version": 1, "calibration_version": 1, "encoder_version": 1,
+                      "embedding_dimension": 1, "segmentation": 1, "pickability_label": 1, "pickable": 1, "review": 1,
+                      "reference_set": 1, "score": {"$meta": "vectorSearchScore"}}
         return list(self.candidates.aggregate([{"$vectorSearch": stage}, {"$project": projection}]))
 
     def close(self):
