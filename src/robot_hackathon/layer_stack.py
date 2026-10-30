@@ -29,6 +29,7 @@ CENTER_TOLERANCE_MM = 3.0         # success: new layer centre within this of the
 YAW_TOLERANCE_DEG = 3.0           # success: new layer within this of exactly 90 deg to the base
 MIN_RUNS_FOR_OFFSET = 3
 MAX_OFFSET_SPREAD_MM = 2.0        # residual standard deviation above which a constant offset is not trusted
+MIN_TIPS_FLOOR_MM = -6.0          # --tips-floor-mm may not send the claw tips further below the calibrated table than this
 EDGE_MARGIN_PX = 4                # a mask this close to the image border is cut off: its centre and angle are wrong
 # Default flange pose for the overview capture. live_executor.HOME (z 400) did not fit two layers 210 mm apart in one
 # image (Kazy, 29 Oct); z 460 did and saw x 199-546, y -128..491 mm of table (Kris, 30 Oct). Raise z or shift x/y with
@@ -113,8 +114,13 @@ def summarize_layer(blocks, block_height_mm=15.0):
     return LayerPose((cx, cy), theta, height, spacing, contact, levels.pop(), [list(p) for p in xy])
 
 
-def split_scene(blocks, tower_origin_xy, zone_radius_mm, block_height_mm=15.0):
-    """Source layer = usable blocks outside the tower zone; base = the highest complete layer inside it."""
+def split_scene(blocks, tower_origin_xy, zone_radius_mm, block_height_mm=15.0, ignored=None):
+    """Source layer = usable blocks outside the tower zone; base = the highest layer inside it.
+
+    Detections in the zone whose height falls between layer levels are tolerated when they lie *below* the top layer:
+    with alternating layers the lower layer's ends stick out beside the top one and their masks mix two depths
+    (robot-live-8 verify: 18.4 and 20.4 mm next to a 29 mm top layer). One above the top layer is a tilted or
+    edge-resting block and stops the run. `ignored`, if given, receives the tolerated detections."""
     # Flat detections (paper notes, tape) are not blocks: Kris's estimate_block flags them height_too_low as well.
     usable = [b for b in blocks if _usable(b) and b["height_above_table_mm"] >= MIN_BLOCK_HEIGHT_FRACTION * block_height_mm]
     def in_zone(b):
@@ -125,12 +131,25 @@ def split_scene(blocks, tower_origin_xy, zone_radius_mm, block_height_mm=15.0):
     for b in inside:
         lvl = layer_level(b["height_above_table_mm"], block_height_mm)
         by_level.setdefault(lvl, []).append(b)
-    if None in by_level:
-        raise LayerCheckError("a block in the tower zone is between layer heights (tilted or resting on an edge?)")
+    between = by_level.pop(None, [])
     if not by_level:
+        if between:
+            raise LayerCheckError("a block in the tower zone is between layer heights (tilted or resting on an edge?)")
         raise NoBaseLayer("no base layer in the tower zone")
     top = max(by_level)
+    top_height = min(b["height_above_table_mm"] for b in by_level[top])
+    above = [b for b in between if b["height_above_table_mm"] > top_height - HEIGHT_BAND * block_height_mm]
+    if above:
+        raise LayerCheckError("a block on top of the tower is between layer heights (tilted or resting on an edge?): " +
+                              ", ".join(f"{b['height_above_table_mm']:.1f}" for b in above) + " mm")
+    if ignored is not None:
+        ignored.extend(between)
     return outside, by_level[top]
+
+
+def tower_layers(top_layer, block_height_mm=15.0):
+    """How many layers the tower has, from the measured top layer: its height divided by one block, rounded."""
+    return int(round(top_layer.height_above_table_mm / block_height_mm))
 
 
 @dataclass
@@ -144,6 +163,8 @@ class StackPlan:
     pick_tips_above_table_mm: float   # claw tips at the pick, relative to the table
     release_tips_above_table_mm: float
     applied_offset_xy: tuple = (0.0, 0.0)
+    grip_below_top_mm: float = 0.0    # achieved grip depth (requested depth, unless the tips floor clamped it)
+    requested_grip_below_top_mm: float = 0.0
 
     def to_dict(self):
         d = asdict(self)
@@ -156,13 +177,15 @@ def plan_stack(source, base, block_height_mm=15.0, params=GraspParams(), release
     and release with the bundle's long side at 90 deg to the base layer, centred on it."""
     if source.level != 0:
         raise LayerCheckError("the hand-built layer must lie on the table")
-    grip_below_top = params.grasp_depth_mm
     target_long = wrap_90(base.long_side_deg + 90.0)
-    tips_pick = max(source.height_above_table_mm - grip_below_top, params.tips_min_mm)
+    tips_pick = max(source.height_above_table_mm - params.grasp_depth_mm, params.tips_min_mm)
+    # The grip depth actually reached once the floor (tips_min_mm) applies; the bundle hangs this far below the block
+    # tops in the claws, so the release height has to use it or a clamped pick would push the bundle into the base.
+    grip_below_top = source.height_above_table_mm - tips_pick
     tips_release = base.height_above_table_mm + block_height_mm - grip_below_top + release_drop_mm
     target = (base.center_xy[0] - offset_xy[0], base.center_xy[1] - offset_xy[1])
     return StackPlan(source, base, wrap_90(source.long_side_deg + ACROSS), wrap_90(target_long + ACROSS),
-                     target, target_long, tips_pick, tips_release, tuple(offset_xy))
+                     target, target_long, tips_pick, tips_release, tuple(offset_xy), grip_below_top, params.grasp_depth_mm)
 
 
 def placement_residual(plan, measured):
@@ -279,13 +302,24 @@ def _blocks(context, width, height):
 
 async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, seg_provider, direct_local=False,
                           apply_offset=False, confirm=input, plan_only=False, view_pose=None, grip_lower_mm=0.0,
-                          source_hint_xy=None):
+                          source_hint_xy=None, tips_floor_mm=None, expected_layers=None):
     """One supervised stack. Returns 0 on a verified success, 1 otherwise. See module docstring.
     plan_only: capture from the current pose, measure both layers and print the plan; no motion command is sent.
     source_hint_xy: operator-supplied world x,y (mm) of the hand-built layer when it lies outside the overview image;
-    the run hovers there and measures it close up instead of requiring it in the overview."""
+    the run hovers there and measures it close up instead of requiring it in the overview.
+    tips_floor_mm: lowest claw-tip height above the calibrated table the pick may use (default GraspParams.tips_min_mm);
+    negative values are the operator's statement that the calibrated table z sits above the real surface.
+    expected_layers: how many layers the tower has before this run (--layers); the measured count (top height divided by
+    one block height) must agree or the run stops. Without it the measurement is trusted. The episode state keeps
+    `tower_layers` and `layers_stacked`, updated on every verified placement."""
+    if expected_layers is not None and expected_layers < 1:
+        raise LayerCheckError("--layers counts the layers already on the tower; at least 1")
     if not plan_only:
         config.require_motion(operator)  # before any SDK import or connection
+    if tips_floor_mm is not None and not (MIN_TIPS_FLOOR_MM <= tips_floor_mm <= GraspParams().tips_min_mm):
+        raise LayerCheckError(f"--tips-floor-mm must be between {MIN_TIPS_FLOOR_MM} and {GraspParams().tips_min_mm}")
+    grasp = GraspParams(grasp_depth_mm=GraspParams().grasp_depth_mm + grip_lower_mm,
+                        tips_min_mm=GraspParams().tips_min_mm if tips_floor_mm is None else tips_floor_mm)
     from . import proposal, rgbd, segmentation
     from . import grasp_geometry as geom
     from .capture import capture_with_camera
@@ -412,10 +446,26 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
         if hint_note:
             print(hint_note)
             ep.event("stack", phase="source_hint", source_xy=list(source0_xy), note=hint_note)
+
+        def check_layers(top, label):
+            """Layer count from the measured top layer; --layers, when given, must agree."""
+            n = tower_layers(top, dims.height_mm)
+            blocks_high = top.height_above_table_mm / dims.height_mm
+            stacked = ep.state.get("layers_stacked", 0)
+            print(f"Tower ({label}): top layer {top.height_above_table_mm:.1f} mm = {blocks_high:.2f} blocks -> {n} layer(s); "
+                  f"this run places layer {n + 1}; stacked by the robot in this episode so far: {stacked}")
+            ep.event("stack", phase="layers", label=label, tower_layers=n, top_height_mm=round(top.height_above_table_mm, 1),
+                     blocks_high=round(blocks_high, 2), expected_layers=expected_layers, layers_stacked=stacked)
+            if expected_layers is not None and n != expected_layers:
+                raise LayerCheckError(f"--layers {expected_layers} but the tower measures {n} layer(s) ({label}: top "
+                                      f"{top.height_above_table_mm:.1f} mm = {blocks_high:.2f} blocks); check the tower or the argument")
+            return n
+
+        layers_before = check_layers(base0, "overview")
         if plan_only:
             log = ResidualLog(data_dir, config.setup_id)
             offset, offset_note = log.fitted_offset()
-            plan = plan_stack(source0, base0, dims.height_mm, params=GraspParams(grasp_depth_mm=GraspParams().grasp_depth_mm + grip_lower_mm))
+            plan = plan_stack(source0, base0, dims.height_mm, params=grasp)
             ep.event("stack", phase="plan_only", plan=plan.to_dict(), fitted_offset=offset, fitted_offset_note=offset_note,
                      table_z=table_z, table_z_verified=calib.support_surface.verified, zone_radius_mm=round(zone, 1))
             print(f"\nPLAN ONLY (overview capture, no motion). Source ({source0.center_xy[0]:.1f}, {source0.center_xy[1]:.1f}) "
@@ -426,9 +476,14 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
         # 2. Refine each layer from a hover directly above it (closer to the image centre, less extrinsic leverage).
         await hover_over(base0.center_xy)
         ctx_b, _ = await measure("base_close")
-        base = summarize_layer(split_scene(_blocks(ctx_b, *size), tower_origin, zone, dims.height_mm)[1], dims.height_mm)
+        tolerated = []
+        base = summarize_layer(split_scene(_blocks(ctx_b, *size), tower_origin, zone, dims.height_mm, ignored=tolerated)[1], dims.height_mm)
+        if tolerated:
+            ep.event("stack", phase="between_level_ignored", label="base_close",
+                     heights_mm=[round(b["height_above_table_mm"], 1) for b in tolerated])
         if math.dist(base.center_xy, base0.center_xy) > MAX_TARGET_OFFSET_MM:
             raise LayerCheckError(f"base measured {math.dist(base.center_xy, base0.center_xy):.1f} mm apart in two captures")
+        layers_before = check_layers(base, "close-up")
         base_view = await bot.gripper_origin()
         base_view_claws_deg = await bot.close_direction_deg()  # wrist camera: viewpoint includes the claw angle
         await hover_over(source0_xy)
@@ -445,14 +500,19 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
         offset, offset_note = log.fitted_offset()
         use = offset if (apply_offset and offset) else (0.0, 0.0)
         # Deeper grip changes pick and release tips together, so the bundle still lands release_drop above the base.
-        params = GraspParams(grasp_depth_mm=GraspParams().grasp_depth_mm + grip_lower_mm)
-        plan = plan_stack(source, base, dims.height_mm, params=params, offset_xy=use)
+        plan = plan_stack(source, base, dims.height_mm, params=grasp, offset_xy=use)
         ep.event("stack", phase="plan", plan=plan.to_dict(), fitted_offset=offset, fitted_offset_note=offset_note,
-                 table_z=table_z, table_z_verified=calib.support_surface.verified)
+                 table_z=table_z, table_z_verified=calib.support_surface.verified, tips_floor_mm=grasp.tips_min_mm,
+                 tower_layers=layers_before)
         print(f"\nSource layer at ({source.center_xy[0]:.1f}, {source.center_xy[1]:.1f}) long side {source.long_side_deg:.1f} deg")
         print(f"Base layer   at ({base.center_xy[0]:.1f}, {base.center_xy[1]:.1f}) long side {base.long_side_deg:.1f} deg, level {base.level}")
         print(f"Place centre ({plan.target_center_xy[0]:.1f}, {plan.target_center_xy[1]:.1f}) long side {plan.target_long_side_deg:.1f} deg;"
               f" offset applied {use} ({offset_note})")
+        print(f"Pick: claw tips {plan.pick_tips_above_table_mm:.1f} mm above the calibrated table (z {table_z:.1f}, "
+              f"{'verified' if calib.support_surface.verified else 'UNVERIFIED'}), {plan.grip_below_top_mm:.1f} mm below the block tops"
+              + (f" -- requested {plan.requested_grip_below_top_mm:.1f} mm, limited by the tips floor {grasp.tips_min_mm:.1f} mm; "
+                 f"lower it with --tips-floor-mm" if plan.grip_below_top_mm < plan.requested_grip_below_top_mm - 1e-6 else "")
+              + f". Release: tips {plan.release_tips_above_table_mm:.1f} mm above the table")
         # In a thread, so the SDK heartbeat and connection checks keep running while the operator reads the plan.
         await asyncio.to_thread(confirm, "Press Enter to pick and stack (Ctrl-C to stop) ")
 
@@ -475,7 +535,13 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
         ok, _ = await bot.move_delta(dz=PICK_LIFT_MM, near_table=True)
         if not ok:
             raise LayerCheckError("planner refused the lift; bundle still held")
-        # The gripper's "holding" only says the claws stopped on something. Look at the pick spot before travelling.
+        # The gripper's "holding" only says the claws stopped on something. Look at the pick spot before travelling,
+        # from travel height: 100 mm up the camera is ~260 mm from the table, inside the D435's minimum range at
+        # 1280x720 (robot-live-7: 0.6% valid depth, "table plane unavailable"), and the bundle fills the frame.
+        g = await bot.gripper_origin()
+        ok, _ = await bot.move_delta(dz=travel_z - g[2], near_table=True)
+        if not ok:
+            raise LayerCheckError("planner refused the rise to travel height; bundle still held")
         ctx_l, _ = await measure("after_lift")
         left = blocks_left_behind(source, _blocks(ctx_l, *size), dims.height_mm)
         ep.event("stack", phase="lift_check", blocks_left_at_pick=left)
@@ -510,25 +576,37 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
         await bot.align_claws(base_view_claws_deg, tolerance_deg=1.5)
         await hover_over(base_view[:2])
         ctx_v, _ = await measure("verify")
-        top = split_scene(_blocks(ctx_v, *size), tower_origin, zone, dims.height_mm)[1]
         try:
+            tolerated = []
+            top = split_scene(_blocks(ctx_v, *size), tower_origin, zone, dims.height_mm, ignored=tolerated)[1]
             measured = summarize_layer(top, dims.height_mm)
         except LayerCheckError as exc:
-            ep.event("stack", phase="verify_failed", reason=str(exc), observed_outcome="unknown")
+            ep.event("stack", phase="verify_failed", reason=str(exc), observed_outcome="unknown", observation_id=last_obs[0])
             print(f"Verification could not measure the new layer: {exc}. Outcome unknown; inspect by eye.")
             return 1
+        if tolerated:
+            ep.event("stack", phase="between_level_ignored", label="verify",
+                     heights_mm=[round(b["height_above_table_mm"], 1) for b in tolerated])
+        layers_after = tower_layers(measured, dims.height_mm)
         if measured.level != base.level + 1:
             ep.event("stack", phase="verify_failed", reason="no new layer on the base", observed_outcome="failure",
-                     top_level=measured.level, observation_id=last_obs[0])
-            print("\nFAILURE: the top of the tower is still the base layer; nothing was stacked.")
+                     top_level=measured.level, tower_layers=layers_after, observation_id=last_obs[0])
+            print(f"\nFAILURE: the tower still measures {layers_after} layer(s) (top {measured.height_above_table_mm:.1f} mm); nothing was stacked.")
             return 1
         res = placement_residual(plan, measured)
         log.append({"episode_id": episode_id, "observation_id": last_obs[0], "operator": operator,
                     "applied_offset_xy": list(use), "plan": plan.to_dict(), "measured": measured.to_dict(), "residual": res,
-                    "direct_local": direct_local})
-        ep.event("stack", phase="verified", residual=res, measured=measured.to_dict())
+                    "direct_local": direct_local, "tower_layers": layers_after})
+        ep.state["tower_layers"] = layers_after
+        ep.state["layers_stacked"] = ep.state.get("layers_stacked", 0) + 1
+        ep.save()
+        ep.event("stack", phase="verified", residual=res, measured=measured.to_dict(), tower_layers=layers_after,
+                 layers_stacked=ep.state["layers_stacked"])
         print(f"\nCentre error {res['center_error_vs_base_mm']} mm (along {res['along_mm']}, across {res['across_mm']}), "
               f"yaw error {res['yaw_error_deg']} deg -> {'SUCCESS' if res['success'] else 'OUT OF TOLERANCE'}")
+        print(f"Tower now has {layers_after} layers (top {measured.height_above_table_mm:.1f} mm = "
+              f"{measured.height_above_table_mm / dims.height_mm:.2f} blocks); stacked by the robot in this episode: {ep.state['layers_stacked']}. "
+              f"Next run: --layers {layers_after}")
         await bot.move_to(*view)
         return 0 if res["success"] else 1
     except (LayerCheckError, KeyboardInterrupt) as exc:

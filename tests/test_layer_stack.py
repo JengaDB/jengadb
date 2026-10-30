@@ -81,6 +81,30 @@ class SplitAndPlan(unittest.TestCase):
         with self.assertRaisesRegex(ls.LayerCheckError, "no base layer"):
             ls.split_scene(layer((300, 100), 0), (435, 203), 102.5)
 
+    def test_between_level_detections_below_the_top_are_tolerated_above_it_not(self):
+        # robot-live-8 verify: two layers crossed; the lower layer's protruding ends read 18.4 and 20.4 mm (mixed depth)
+        # next to the 29 mm top layer. Those are not a tilted block on top.
+        tower = layer((523, -15), -85, level=0) + layer((523, -18), 5, level=1)
+        ends = [{"base_point_mm": (531, 22, 0), "base_long_side_deg": 4, "height_above_table_mm": 18.4},
+                {"base_point_mm": (499, 18, 0), "base_long_side_deg": 2, "height_above_table_mm": 20.4}]
+        ignored = []
+        outside, top = ls.split_scene(layer((439, 193), 4) + tower + ends, (550, 0), 115.0, ignored=ignored)
+        measured = ls.summarize_layer(top)
+        self.assertEqual(measured.level, 1)
+        self.assertEqual(ls.tower_layers(measured), 2)
+        self.assertEqual([b["height_above_table_mm"] for b in ignored], [20.4])   # 18.4 still rounds to level 0
+        tilted_on_top = [{"base_point_mm": (523, -18, 0), "base_long_side_deg": 5, "height_above_table_mm": 37.0}]
+        with self.assertRaisesRegex(ls.LayerCheckError, "on top of the tower is between layer heights"):
+            ls.split_scene(tower + tilted_on_top, (550, 0), 115.0)
+        with self.assertRaisesRegex(ls.LayerCheckError, "between layer heights"):
+            ls.split_scene(ends, (550, 0), 115.0)   # nothing but between-level detections: still a stop
+
+    def test_tower_layers_is_height_over_block_height(self):
+        self.assertEqual(ls.tower_layers(ls.summarize_layer(layer((0, 0), 0, level=0))), 1)
+        three = ls.summarize_layer([dict(b, height_above_table_mm=44.0) for b in layer((0, 0), 0)])   # measured 44 for 45
+        self.assertEqual(ls.tower_layers(three), 3)
+        self.assertEqual(ls.tower_layers(three, block_height_mm=14.5), 3)
+
     def test_plan_rotates_ninety_and_centres(self):
         src = ls.summarize_layer(layer((300, 100), -6.5))
         base = ls.summarize_layer(layer((435, 203), 2.0))
@@ -99,6 +123,27 @@ class SplitAndPlan(unittest.TestCase):
         b = ls.plan_stack(src, base, params=ls.GraspParams(grasp_depth_mm=11.0))
         self.assertAlmostEqual(a.pick_tips_above_table_mm - b.pick_tips_above_table_mm, 3.0)
         self.assertAlmostEqual(a.release_tips_above_table_mm - b.release_tips_above_table_mm, 3.0)
+
+    def test_tips_floor_clamps_pick_and_release_follows_the_achieved_grip(self):
+        # robot-live-7, --grip-lower-mm 15 on 14.2 mm blocks: tips were clamped at the 1 mm floor (13.2 mm grip, not 23),
+        # but the release was computed from the requested 23 mm and would have pushed the bundle 8 mm into the base.
+        src = ls.summarize_layer(layer((300, 100), 0))
+        base = ls.summarize_layer(layer((435, 203), 0))
+        plan = ls.plan_stack(src, base, params=ls.GraspParams(grasp_depth_mm=23.0))
+        self.assertAlmostEqual(plan.pick_tips_above_table_mm, 1.0)
+        self.assertAlmostEqual(plan.grip_below_top_mm, 15 - 1.0)
+        self.assertAlmostEqual(plan.requested_grip_below_top_mm, 23.0)
+        self.assertAlmostEqual(plan.release_tips_above_table_mm, 15 + 15 - 14.0 + 1)   # bundle bottom 1 mm above the base
+        lower = ls.plan_stack(src, base, params=ls.GraspParams(grasp_depth_mm=23.0, tips_min_mm=-3.0))
+        self.assertAlmostEqual(lower.pick_tips_above_table_mm, -3.0)   # operator lowered the floor
+        self.assertAlmostEqual(lower.release_tips_above_table_mm, 15 + 15 - 18.0 + 1)
+
+    def test_tips_floor_is_bounded(self):
+        config = Config.from_env({"MODE": "live", "ENABLE_MOTION": "true"})
+        with self.assertRaises(ls.LayerCheckError):
+            asyncio.run(ls.run_layer_stack(config, Path(tempfile.gettempdir()), "Kris", "ep1", (550, 0), seg_provider=None, tips_floor_mm=-20.0))
+        with self.assertRaises(ls.LayerCheckError):
+            asyncio.run(ls.run_layer_stack(config, Path(tempfile.gettempdir()), "Kris", "ep1", (550, 0), seg_provider=None, tips_floor_mm=5.0))
 
     def test_plan_refuses_source_not_on_table(self):
         with self.assertRaisesRegex(ls.LayerCheckError, "on the table"):

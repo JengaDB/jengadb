@@ -23,7 +23,9 @@ def main(argv=None):
     parser.add_argument("--direct-local", action="store_true", help="layer-stack: dial viam-server on the LAN (gRPC, no cloud relay); sessions stay on")
     parser.add_argument("--view", default=None, help="layer-stack: 'x,y,z' flange pose (mm, world) for the overview capture; default 300,150,460 (sees ~x 200-545, y -130..490); raise z or shift x,y to cover more table")
     parser.add_argument("--no-pause", action="store_true", help="layer-stack: do not wait for Enter; every check still stops the run. Someone stays at the e-stop")
-    parser.add_argument("--grip-lower-mm", type=float, default=0.0, help="layer-stack: grip this much deeper than the default 8 mm below the block top")
+    parser.add_argument("--grip-lower-mm", type=float, default=0.0, help="layer-stack: grip this much deeper than the default 8 mm below the block top (limited by the tips floor)")
+    parser.add_argument("--layers", type=int, default=None, help="layer-stack: layers already on the tower; the measured count (top height / block height) must agree")
+    parser.add_argument("--tips-floor-mm", type=float, default=None, help="layer-stack: lowest claw-tip height above the calibrated table for the pick (default 1.0; down to -6.0 when the calibrated table z is known to sit above the real surface)")
     parser.add_argument("--plan-only", action="store_true", help="layer-stack: capture and plan from the home pose; never moves")
     parser.add_argument("--source", default=None, help="layer-stack: 'x,y' mm (world) where the hand-built layer lies when it is outside the overview image; the run hovers there and measures it close up")
     parser.add_argument("--apply-offset", action="store_true", help="layer-stack: apply the offset fitted from earlier verified runs")
@@ -72,7 +74,8 @@ def main(argv=None):
                                                    apply_offset=args.apply_offset, plan_only=args.plan_only, grip_lower_mm=args.grip_lower_mm,
                                                    confirm=(lambda msg: print(msg + "[--no-pause: continuing]", flush=True)) if args.no_pause else input,
                                                    view_pose=[float(v) for v in args.view.split(",")] if args.view else None,
-                                                   source_hint_xy=_parse_xy(args.source) if args.source else None))
+                                                   source_hint_xy=_parse_xy(args.source) if args.source else None,
+                                                   tips_floor_mm=args.tips_floor_mm, expected_layers=args.layers))
             except ConfigError:
                 raise
             except Exception as exc:  # noqa: BLE001 - verbatim robot/planner error for the operator; carries no secrets

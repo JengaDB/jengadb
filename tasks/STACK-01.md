@@ -73,6 +73,32 @@ local/layer-stack-data/live/episodes/):
   the z-460 captures are unchanged (95%). The run also now looks at the tower from above when the base is clipped by
   the overview edge, not only when the origin is out of frame. Test added. Open risk: Kazy's planner refusal at
   (656, 6) is the same spot as "2"; move "2" nearer the robot (x <= ~570) if the hover or place is refused.
+- Episode robot-live-6: hover over (650, 0) at flange z 650 refused, "zero IK solutions" (same as Kazy's (656, 6)).
+- Episode robot-live-7 (17:00-17:01, "2" moved to ~(524, -14), `--view 350,150,560`): two full runs reached the pick.
+  Both captured, planned (source (439,193) 4 deg; base (524,-15) -85 deg), gripped ("holding" true) and lifted 100 mm,
+  then stopped at `after_lift: table plane unavailable`: at camera z 261 the D435 returned 0.6% valid depth (inside
+  its 1280x720 minimum range). The after-lift photo shows all three blocks still on the blue square: grip failed
+  again, claws closing too high, as in Kazy's run 3. `--grip-lower-mm 15` had no extra effect: the pick tips are
+  clamped at `tips_min_mm` 1.0 above the calibrated table (z 3.0, unverified, from depth; touch-off says ~0), so
+  anything past `--grip-lower-mm 5` is cut off. Worse, the release height used the *requested* grip depth (23 mm)
+  while the achieved one was 13.2 mm: release tips 5.9 mm would have pushed the bundle ~8 mm into the base.
+  Fixes (Kris): `plan_stack` records `grip_below_top_mm` (achieved) and `requested_grip_below_top_mm` and derives the
+  release from the achieved depth; `--tips-floor-mm` (default 1.0, bounded to -6.0) lets the operator lower the
+  floor explicitly; the plan printout states tips height, achieved vs requested grip and the clamp; the after-lift
+  capture is taken after rising to travel height (depth valid, pick spot visible, bundle mostly out of frame). 2
+  tests added. Still unverified: table z and the claw-tip offset; the right next step is a touch-off at "1".
+- Episode robot-live-8, 17:07:53 (`--grip-lower-mm 20 --tips-floor-mm -6`, achieved grip 20.6 mm below the top):
+  FIRST LAYER STACKED BY THE ROBOT. Lift check 0 left behind, released, retreated. Verification stopped at
+  "between layer heights" (obs_528dabf666f44d9f): the lower layer's ends protrude beside the crossed top layer and
+  read 18.4/20.4 mm (mixed depth). By eye and from the capture the layer is on, crossed, roughly centred
+  (top-layer centre ~(522.7,-18.7) vs base (523.8,-14.6): ~4 mm; yaw ~1 deg); not counted as a verified run because
+  the run did not complete its measurement. Three further runs stopped at the same check before the pick.
+  Changes (Kris): `split_scene` tolerates between-level detections *below* the top layer (logged as
+  `between_level_ignored`), still stops on one on top; `tower_layers()` = top height / block height, rounded;
+  `--layers N` asserts the count before the pick; the episode state keeps `tower_layers` and `layers_stacked`,
+  updated on each verified placement; the run prints the count at overview, close-up and after verification.
+  Tips floor -6 with table z 3.0 means tips commanded ~3 mm below the touch-off table; the claws reached the blocks
+  only at this setting, so the real claw-tip offset or table z is off by several mm: measure it. 2 tests added.
 
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot
 complete until it is changed; table height and camera offset are unverified; `--grip-lower-mm 3` is a single-run fix,
