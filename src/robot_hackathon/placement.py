@@ -62,6 +62,9 @@ class TowerTarget:
                     "requires_filled": below, "neighbours": neighbours, "filled_neighbours": filled_neighbours,
                     "neighbour_release_room_mm": neighbour_room,
                     "neighbour_release_ok": not filled_neighbours or neighbour_room >= 0,
+                    # Claws on the block's short ends never enter the gap, so a touching neighbour only rules out
+                    # grasps that close across the block (middle/side).
+                    "requires_ends_grasp": bool(filled_neighbours) and neighbour_room < 0,
                     "validation_status": "offline_geometry_only" if layer == 0 else "unvalidated_second_layer",
                 })
         return slots

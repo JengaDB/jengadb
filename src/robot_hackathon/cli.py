@@ -11,7 +11,10 @@ from . import rgbd_cli, agent_cli
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Robot attempt logger. Offline by default; no physical actions.")
     parser.add_argument("command", nargs="?", default="mock-demo",
-                        choices=("mock-demo", "report", "viam-check", "mongo-ping", "mongo-index", "flush", "live-step") + rgbd_cli.COMMANDS + agent_cli.COMMANDS)
+                        choices=("mock-demo", "report", "viam-check", "mongo-ping", "mongo-index", "flush", "live-step", "live-run") + rgbd_cli.COMMANDS + agent_cli.COMMANDS)
+    parser.add_argument("--max-blocks", type=int, default=3, help="live-run: blocks to place in this run")
+    parser.add_argument("--arm-speed", type=float, default=None, help="live-run/live-step: arm joint speed to request via do_command (deg/s)")
+    parser.add_argument("--arm-accel", type=float, default=None, help="live-run/live-step: arm joint acceleration to request via do_command (deg/s^2)")
     parser.add_argument("--step", default=None, help="live-step: one motion segment (status|home|hover|descend|grab|lift|to-slot|release|retreat|abort-up|open)")
     parser.add_argument("--operator", default=None, help="live-step: name of the person at the e-stop")
     parser.add_argument("--decision", default=None, help="live-step hover: agent-propose decision json to execute")
@@ -48,11 +51,20 @@ def main(argv=None):
             raise ConfigError("Database writes require --confirm-write after specific authorization")
         # Avoid SDK debug/error logging accidentally disclosing credentials.
         logging.disable(logging.CRITICAL)
-        if args.command == "live-step":
-            from .live_executor import run_step
+        if args.command in ("live-step", "live-run"):
+            from .live_executor import run_step, run_flow
             logging.disable(logging.NOTSET)
             logging.getLogger().setLevel(logging.WARNING)
             try:
+                if args.command == "live-run":
+                    from .segmentation import MetaSam3Provider
+                    from .agent_cli import _parse_xy
+                    if not args.tower_origin:
+                        raise ConfigError("live-run needs --tower-origin x,y")
+                    filled = [s for s in (args.filled_slots or "").split(",") if s]
+                    return asyncio.run(run_flow(config, args.data_dir, args.operator, args.episode, _parse_xy(args.tower_origin), filled,
+                                                args.tower_gap, args.max_blocks, MetaSam3Provider(config, allow_cloud=True),
+                                                arm_speed=args.arm_speed, arm_accel=args.arm_accel))
                 return asyncio.run(run_step(config, args.data_dir, args.step, args.operator, args.episode, args.decision, args.table_z,
                                             args.push_distance))
             except ConfigError:

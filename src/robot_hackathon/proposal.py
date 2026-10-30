@@ -165,8 +165,8 @@ def build_context(scene, policy=None, reference_search=None, tower_origin_xy_mm=
         slot = next_open_slot(target, filled_slots)
         placement = {"status": "available" if slot else "complete", "target": target.to_dict(filled_slots), "filled": sorted(filled_slots),
                      "next_slot": slot, "reason": None if slot else "all_slots_filled"}
-        if slot is not None and not slot["neighbour_release_ok"]:
-            placement.update(status="blocked", reason=f"slot_release_room_insufficient:{slot['slot_id']}:{slot['neighbour_release_room_mm']:.0f}mm")
+        if slot is not None and slot.get("requires_ends_grasp"):
+            placement["note"] = f"{slot['slot_id']} touches a placed neighbour ({slot['neighbour_release_room_mm']:.0f} mm claw room): ends grasp only"
     elif tower_origin_xy_mm is not None:
         placement = {"status": "unavailable", "reason": "support_surface_offset_missing", "next_slot": None}
     body = {"schema_version": CONTEXT_SCHEMA_VERSION, "source": scene["source"], "mode": obs["mode"], "dry_run": bool(dry_run),
@@ -209,7 +209,13 @@ def validate_selection(context, candidate_id, grasp_style, shift_mm, slot_id):
         raise SelectionError(f"slot_not_open:{slot_id}")
     if context["placement"].get("status") != "available":
         raise SelectionError(f"slot_blocked:{slot_id}:{context['placement'].get('reason')}")
+    if slot.get("requires_ends_grasp") and grasp_style != "ends":
+        raise SelectionError(f"slot_requires_ends_grasp:{slot_id}:{grasp_style}")
     return entry, grasp, slot
+
+
+def grasp_order(slot):
+    return ("ends",) if slot and slot.get("requires_ends_grasp") else GRASP_PREFERENCE
 
 
 def make_proposal(context, candidate_id, grasp_style, shift_mm, slot_id, rationale, decided_by):
@@ -261,8 +267,14 @@ class DeterministicCoordinator:
                                "placement": context["placement"].get("status")})
         if context["placement"].get("next_slot") is None or context["placement"].get("status") != "available":
             return abstention(context, context["placement"].get("reason") or "no_open_slot", self.name)
-        top = candidate_entry(context, context["ranking"][0]["candidate_id"])
-        grasp = next(g for style in GRASP_PREFERENCE for g in top["grasps"] if g["style"] == style and g["eligible"])
+        slot = context["placement"]["next_slot"]
+        order = grasp_order(slot)
+        usable = [candidate_entry(context, r["candidate_id"]) for r in context["ranking"]]
+        usable = [c for c in usable if any(g["eligible"] and g["style"] in order for g in c["grasps"])]
+        if not usable:
+            return abstention(context, "no_candidate_with_required_grasp", self.name, {"required": list(order), "slot": slot["slot_id"]})
+        top = usable[0]
+        grasp = next(g for style in order for g in top["grasps"] if g["style"] == style and g["eligible"])
         ev = top["retrieval"]
         why = (f"best curated-reference match cosine {ev['best_cosine_similarity']:.3f}" if ev["status"] == "matched"
                else f"retrieval {ev['status']}; ranked by clear-grasp fraction {top['clearance_fraction']} and geometry quality {top['geometry_quality']}")

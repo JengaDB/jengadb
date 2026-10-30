@@ -137,6 +137,143 @@ class Robot:
         return abs(error) < tolerance_deg, log
 
 
+async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled, gap_mm, max_blocks=3, seg_provider=None,
+                   final_capture=True):
+    """One connection, one capture: segment, rank, then place blocks back to back. The next slot is positioned from the
+    previous block's *actual* release pose (plus one pitch along the row) rather than the nominal slot, so release
+    nudges do not accumulate. Grasp per slot: ends when the slot touches a placed neighbour, else middle/side/ends.
+    No intermediate checks; a failed grab or planner refusal stops the flow. Only the final capture is measured."""
+    from . import proposal, rgbd, segmentation
+    from . import grasp_geometry as geom
+    from .capture import open_client, capture_with_camera
+    from .pipeline import candidate_id
+    from .placement import TowerTarget, next_open_slot
+    from viam.components.arm import Arm  # noqa: F401
+    from viam.components.gripper import Gripper  # noqa: F401
+    from viam.components.camera import Camera
+    from viam.services.motion import MotionClient  # noqa: F401
+    config.require_motion(operator)
+    ep = Episode(data_dir, episode_id, operator)
+    client = await open_client(config)
+    placed = []
+    try:
+        await asyncio.wait_for(client.refresh(), timeout=10)
+        bot = Robot(client, config)
+        camera = Camera.from_robot(client, config.camera_resource)
+
+        async def scene_from_capture():
+            obs = await capture_with_camera(config, data_dir, camera, episode_id, client=client)
+            obs, rgb, depth = rgbd.ObservationStore(data_dir, "live").load_arrays(obs["observation_id"])
+            raw = seg_provider.segment(rgb)
+            masks = segmentation.finalize_masks(raw, rgb.shape[1], rgb.shape[0], 200)
+            for m in masks:
+                m.update(candidate_id=candidate_id(obs["observation_id"], "live-flow", m["mask_index"]), embedding=None, candidate=None)
+            store = geom.GeometryCalibrationStore(data_dir, "live")
+            doc = store.load(obs["setup_id"])
+            scene = {"source": "observation", "observation": obs, "rgb": rgb, "depth": depth, "masks": masks,
+                     "calibration": geom.bundle_from_records(obs, False, doc), "geometry_calibration_sha256": None,
+                     "segmentation": {"provider": seg_provider.provider_id, "model_version": "live-flow"}, "processing_version": "live-flow"}
+            return obs, scene
+
+        obs, scene = await scene_from_capture()
+        ctx = proposal.build_context(scene, tower_origin_xy_mm=tower_origin, filled_slots=filled, dry_run=True, tower_gap_mm=gap_mm)
+        proposal.save_context(ctx, {"kind": "flow_start"}, Path(data_dir) / "live" / "proposals" / obs["observation_id"])
+        calib = scene["calibration"]
+        table_z = calib.support_surface.z_in_robot_base_mm
+        target = TowerTarget(tuple(tower_origin), calib.support_surface, calib.block, calib.finger, 0.0, gap_mm=gap_mm)
+        queue = [proposal.candidate_entry(ctx, r["candidate_id"]) for r in ctx["ranking"]]
+        ep.event("flow", phase="scene", observation_id=obs["observation_id"], masks=len(scene["masks"]), eligible=[c["candidate_id"] for c in queue],
+                 rejections={c["candidate_id"]: c["rejection_reasons"] for c in ctx["candidates"] if not c["eligible"]},
+                 table_plane=ctx["table_plane"].get("status"), tower_origin=list(tower_origin), gap_mm=gap_mm, filled=list(filled))
+        filled = list(filled)
+        last_pose = None   # (x, y, long_side_deg) of the previous block as released
+        for _ in range(max_blocks):
+            slot = next_open_slot(target, filled)
+            if slot is None:
+                ep.event("flow", phase="layer_complete", filled=filled)
+                break
+            order = proposal.grasp_order(slot)
+            pick = None
+            for c in queue:
+                g = next((g for style in order for g in c["grasps"] if g["style"] == style and g["eligible"]), None)
+                if g is not None:
+                    pick, grasp = c, g
+                    break
+            if pick is None:
+                ep.event("flow", phase="stop", reason="no_candidate_with_required_grasp", required=list(order), slot=slot["slot_id"])
+                break
+            queue.remove(pick)
+            geo = pick["geometry"]
+            bx, by, bz = geo["base_point_mm"]
+            # Destination: nominal for the first block of a layer; otherwise previous release pose plus one pitch.
+            if last_pose is None or slot["index"] == 0:
+                sx, sy = slot["block_center_mm"][0], slot["block_center_mm"][1]
+            else:
+                across = math.radians(slot["long_side_deg"] + 90.0)
+                pitch = slot["block_dimensions_mm"][1] + gap_mm
+                sx, sy = last_pose[0] + pitch * math.cos(across), last_pose[1] + pitch * math.sin(across)
+            tips = grasp["tips_above_table_mm"]
+            ep.event("flow", phase="plan_block", slot=slot["slot_id"], candidate=pick["candidate_id"], grasp=grasp["style"], pick_xy=[round(bx, 1), round(by, 1)],
+                     pick_long_deg=round(geo["base_long_side_deg"], 1), dest_xy=[round(sx, 1), round(sy, 1)], dest_long_deg=slot["long_side_deg"],
+                     support_z=slot["support_z_mm"], tips_above_table_mm=round(tips, 1))
+            # --- pick
+            g0 = await bot.gripper_origin()
+            travel_z = g0[2]
+            ok, _ = await bot.move_delta(dx=bx - g0[0], dy=by - g0[1])
+            if not ok:
+                ep.event("flow", phase="stop", reason="hover_refused"); break
+            close_deg = grasp.get("claws_close_direction_deg_in_base")
+            aligned, log = await bot.align_claws(close_deg)
+            g = await bot.gripper_origin()
+            ok, _ = await bot.move_delta(dz=(table_z + tips - TIP_ABOVE_GRIPPER_FRAME_MM) - g[2], near_table=True)
+            if not ok:
+                ep.event("flow", phase="stop", reason="descend_refused"); break
+            held = await bot.world_to_frame("gripper", bx, by, bz)
+            got = await bot.gripper.grab()
+            if not got:
+                await bot.gripper.open()
+                g = await bot.gripper_origin()
+                await bot.move_delta(dz=travel_z - g[2], near_table=True)
+                ep.event("flow", phase="stop", reason="grab_failed", candidate=pick["candidate_id"]); break
+            ok, _ = await bot.move_delta(dz=PICK_LIFT_MM, near_table=True)
+            # --- place
+            g = await bot.gripper_origin()
+            ok, _ = await bot.move_delta(dx=sx - g[0], dy=sy - g[1])
+            await bot.align_claws(wrap_90(slot["long_side_deg"] + grasp["claws_deg_to_long_side"]), tolerance_deg=1.5)
+            hx, hy, _ = await bot.point_in_world("gripper", x=held[0], y=held[1])
+            ok, _ = await bot.move_delta(dx=sx - hx, dy=sy - hy)
+            g = await bot.gripper_origin()
+            release_z = slot["support_z_mm"] + tips + PLACE_DROP_MM - TIP_ABOVE_GRIPPER_FRAME_MM
+            ok, _ = await bot.move_delta(dz=release_z - g[2], near_table=True)
+            if not ok:
+                ep.event("flow", phase="stop", reason="place_descend_refused", note="block still held; use live-step abort-up/open"); break
+            rx, ry, _ = await bot.point_in_world("gripper", x=held[0], y=held[1])
+            await bot.gripper.open()
+            g = await bot.gripper_origin()
+            await bot.move_delta(dz=travel_z - g[2], near_table=True)
+            last_pose = (rx, ry, slot["long_side_deg"])
+            filled.append(slot["slot_id"])
+            placed.append({"slot": slot["slot_id"], "candidate": pick["candidate_id"], "released_at": [round(rx, 1), round(ry, 1)], "grasp": grasp["style"]})
+            ep.event("flow", phase="placed", slot=slot["slot_id"], released_block_xy=[round(rx, 1), round(ry, 1)], aligned_at_pick=aligned)
+        # --- home and final validation
+        await bot.gripper.open()
+        ok, _ = await bot.move_to(*HOME)
+        ep.event("flow", phase="home", accepted=ok, placed=placed)
+        if final_capture:
+            obs2, scene2 = await scene_from_capture()
+            ctx2 = proposal.build_context(scene2, tower_origin_xy_mm=tower_origin, filled_slots=filled, dry_run=True, tower_gap_mm=gap_mm)
+            measured = [{"xy": [round(c["geometry"]["base_point_mm"][0], 1), round(c["geometry"]["base_point_mm"][1], 1)],
+                         "z": round(c["geometry"]["base_point_mm"][2], 1), "long_deg": round(c["geometry"]["base_long_side_deg"], 1),
+                         "height": round(c["geometry"]["height_above_table_mm"], 1)}
+                        for c in ctx2["candidates"] if c["geometry"]["base_point_mm"] and "in_tower_zone" in c["rejection_reasons"]]
+            ep.event("flow", phase="final_validation", observation_id=obs2["observation_id"], blocks_in_tower_zone=sorted(measured, key=lambda m: (m["z"], m["xy"][1])))
+        ep.state["filled"] = filled
+        ep.save()
+        return 0 if placed else 1
+    finally:
+        await asyncio.wait_for(client.close(), timeout=5)
+
+
 def load_decision(path):
     decision = json.loads(Path(path).read_text())
     if decision.get("kind") not in ("pick_and_place_proposal", "geometry_preview"):
