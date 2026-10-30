@@ -269,6 +269,29 @@ class RowAlign(unittest.TestCase):
         self.assertEqual([(i, round(o, 1)) for i, o in plan], [(0, -18.0), (2, 18.0)])
         self.assertEqual(row_align_plan([(440, 170)], 0.0, 5.0), [])
 
+    def test_one_stroke_lines_up_every_end(self):
+        from robot_hackathon.live_executor import row_align_push, PUSH_START_GAP_MM
+        origin = (440.0, 195.0)
+        self.assertIsNone(row_align_push([(440, 170), (443, 195), (438, 220)], 0.0, 5.0, origin))   # within 5 mm
+        # kazy-palletize-30oct 19:40:53: ends at x 436.3 / 430.4 / 441.8 took two end pushes; now one stroke from -x
+        # pushes the two short of 441.8 (blocks 0 and 1, aimed between them) and keeps the row near the pallet origin
+        plan = row_align_push([(436.3, 167.7), (430.4, 192.5), (441.8, 217.5)], 0.0, 5.0, origin)
+        self.assertEqual(plan["sign"], -1.0)
+        self.assertEqual(plan["pushed"], [0, 1])
+        self.assertAlmostEqual(plan["aim_xy"][1], (167.7 + 192.5) / 2)
+        self.assertAlmostEqual(plan["aim_xy"][0], 430.4)                       # the stroke starts beyond the furthest-out end
+        self.assertAlmostEqual(plan["distance_mm"], PUSH_START_GAP_MM + 11.4 - 1.0)
+        self.assertAlmostEqual(plan["line_mm"], 441.8)
+        # one block out on its own: only that block is pushed back to the other two
+        plan = row_align_push([(440, 170), (440, 195), (450, 220)], 0.0, 5.0, origin)
+        self.assertEqual((plan["sign"], plan["pushed"]), (1.0, [2]))
+        # the 11:33 photo (ends stepped 18 mm): one stroke for both outer blocks, aimed at the middle (claws 45 mm wide
+        # reach blocks 25 mm either side), pushing them back to the middle block's line
+        plan = row_align_push([(440, 170), (458, 195), (476, 220)], 0.0, 5.0, (458.0, 195.0))
+        self.assertEqual(len(plan["pushed"]), 2)
+        self.assertAlmostEqual(plan["distance_mm"], PUSH_START_GAP_MM + 36.0 - 1.0)
+        self.assertIsNone(row_align_push([(440, 170)], 0.0, 5.0, origin))
+
 
 class GripReport(unittest.TestCase):
     def test_empty_grip_detection_from_gripper_report(self):

@@ -247,6 +247,17 @@ local/layer-stack-data/live/episodes/):
   between-level detection below the top layer's height and outside its footprint could be ignored, as split_scene
   already does for the base. The ~4 mm placement offset points at the unverified camera XY / table calibration.
 
+- Operator notes after the second cycle (30 Oct): (a) the claws hit the table by ~3 mm when picking: run with
+  `--tips-floor-mm 0` on this laptop's calibration (table z 0), not -3; (b) wrist rotation too slow:
+  DEFAULT_ALIGN_SPEED_DEG_S and the `--align-speed` default 45 -> 90 deg/s; (c) end alignment in one move instead of
+  one block per round, only if the blue box matters only at the start of the pallet arrangement. It does: the
+  stacking stage grips the measured row centre (second cycle: (435.4, 190.6) with --source 440,195) and uses the spot
+  only as a zone (`at_source`). `row_align_push`: one stroke from the side that leaves the row nearer the pallet
+  origin along the long axis, aimed between the blocks that stick out (claws 45 mm wide), back to the line of the
+  block furthest back; ALIGN_PUSH_ATTEMPTS 1 per push phase. On the second cycle's ends (x 436.3 / 430.4 / 441.8)
+  that is one 15.4 mm stroke instead of two pushes. Harness: two blocks 8 and 12 mm out lined up within 2 mm in one
+  stroke (the simulated claw face now pushes every block it covers). Untested live.
+
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot
 complete until it is changed; table height and camera offset are unverified; `--grip-lower-mm 3` is a single-run fix,
 not a calibration; source and base must be reachable (x <= ~600 mm worked) and both visible from the view pose.

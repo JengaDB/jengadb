@@ -29,6 +29,7 @@ PICK_LIFT_MM = 100.0
 CLAW_THICKNESS_MM = 8.0           # Sam's; closed claws are two claws thick
 PUSH_START_GAP_MM = 5.0           # gap between the closed claws and the last block before the push starts
 PUSH_TIPS_MM = 7.0                # claw tips above the table while pushing (5 was 2 mm too low: operator, 30 Oct 19:22)
+ALIGN_PUSH_ATTEMPTS = 1           # end-alignment strokes per push phase: one stroke lines up every end (row_align_push)
 CENTRE_PUSH_ATTEMPTS = 1          # close-and-centre pushes per push phase; on 30 Oct the remaining 3-4 mm "gap" came from a
                                   # block skewed 13 mm along its length, and five more pushes only slid the row 32 mm off
 DROP_HEIGHT_MM = 25.0             # a block to be laid flat is released with its bottom about this far above the drop spot
@@ -48,7 +49,7 @@ APPROACH_MM = 40.0                # the last part of every descent to the table 
 DEFAULT_ARM_SPEED_DEG_S = 180.0   # restore value when the operator gave no --arm-speed (the value used on 30 Oct)
 DEFAULT_APPROACH_SPEED_DEG_S = 40.0
 DEFAULT_PUSH_SPEED_DEG_S = 30.0
-DEFAULT_ALIGN_SPEED_DEG_S = 45.0  # wrist rotations when aligning the claws over a block or the row
+DEFAULT_ALIGN_SPEED_DEG_S = 90.0  # wrist rotations when aligning the claws over a block or the row (45 felt slow: operator, 30 Oct)
 ROW_CENTRE_TOLERANCE_MM = 3.0
 ROW_ALIGN_TOLERANCE_MM = 5.0      # a pallet block whose ends stick out further than this gets pushed back along its length
 ROW_PUSH_ROUNDS = 6               # capture/push rounds for closing, centring and end alignment together
@@ -82,6 +83,37 @@ def row_push_plan(points, origin_xy, ax, ay, block_width_mm):
     closed_centre = (points[0][0] + (len(points) - 1) / 2 * w * ax, points[0][1] + (len(points) - 1) / 2 * w * ay)
     after_close = (origin_xy[0] - closed_centre[0]) * ax + (origin_xy[1] - closed_centre[1]) * ay
     return {"gaps_mm": gaps, "offset_mm": offset, "shift_mm": max(0.0, -after_close), "unpushable_mm": max(0.0, after_close)}
+
+
+def row_align_push(points, long_deg, tolerance_mm, origin_xy, block_width_mm=25.0):
+    """One stroke that lines up every block's ends (operator request, 30 Oct: instead of one block per round). Pushing
+    from one end of the row's long axis brings every block back to the line of the block furthest back on that side;
+    the closed claws aim between the blocks that stick out, so both are pushed in the same move (claws 45 mm wide,
+    blocks 25 mm apart). Of the two sides, the one leaving the row centre closer to the pallet origin along the long
+    axis is chosen. Returns None when the ends are already within tolerance, else {sign, aim_xy, distance_mm, pushed,
+    line_mm}: the claws start beyond aim_xy on the +sign side and slide toward -sign."""
+    if len(points) < 2:
+        return None
+    a = math.radians(long_deg)
+    ux, uy = math.cos(a), math.sin(a)
+    vx, vy = -uy, ux
+    along = [p[0] * ux + p[1] * uy for p in points]
+    lateral = [p[0] * vx + p[1] * vy for p in points]
+    lo, hi = min(along), max(along)
+    if hi - lo <= tolerance_mm:
+        return None
+    origin_along = origin_xy[0] * ux + origin_xy[1] * uy
+    best = None
+    for sign, line, extreme in ((1.0, lo, hi), (-1.0, hi, lo)):
+        pushed = [i for i, v in enumerate(along) if abs(v - line) > tolerance_mm]
+        after = [line if i in pushed else v for i, v in enumerate(along)]
+        cost = abs(sum(after) / len(after) - origin_along)
+        if best is None or cost < best[0]:
+            best = (cost, sign, line, extreme, pushed)
+    _, sign, line, extreme, pushed = best
+    lat = sum(lateral[i] for i in pushed) / len(pushed)
+    return {"sign": sign, "aim_xy": (extreme * ux + lat * vx, extreme * uy + lat * vy),
+            "distance_mm": PUSH_START_GAP_MM + (hi - lo) - 1.0, "pushed": pushed, "line_mm": line}
 
 
 def row_align_plan(points, long_deg, tolerance_mm):
@@ -844,21 +876,23 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 remaining -= step
             return True
 
-        async def push_block_end(block_xy, long_deg, offset_mm):
-            """Align one block's ends with the row: closed claws come down just beyond the end it sticks out on and
-            slide it back by the offset (minus a margin so the neighbours' ends are not pushed too)."""
+        async def push_block_end(plan, long_deg):
+            """Line up the row's ends in one stroke (row_align_push): closed claws come down just beyond the ends that
+            stick out, aimed between those blocks, and slide them back to the line of the block furthest back (minus a
+            margin so that block is not pushed)."""
             a = math.radians(long_deg)
             ux, uy = math.cos(a), math.sin(a)
-            sign = 1.0 if offset_mm > 0 else -1.0
+            sign, aim = plan["sign"], plan["aim_xy"]
             back = calib.block.length_mm / 2 + CLAW_THICKNESS_MM + PUSH_START_GAP_MM
-            start = (block_xy[0] + sign * ux * back, block_xy[1] + sign * uy * back)
-            distance = PUSH_START_GAP_MM + abs(offset_mm) - 1.0
+            start = (aim[0] + sign * ux * back, aim[1] + sign * uy * back)
+            distance = plan["distance_mm"]
             await bot.gripper.grab()
             g = await bot.gripper_origin()
             travel_z = g[2]
-            ep.event("flow", phase="push_align", block_xy=[round(v, 1) for v in block_xy], offset_mm=round(offset_mm, 1),
+            ep.event("flow", phase="push_align", aim_xy=[round(v, 1) for v in aim], pushed=plan["pushed"],
                      start_xy=[round(v, 1) for v in start], direction=[round(-sign * ux, 2), round(-sign * uy, 2)], distance_mm=round(distance, 1))
-            print(f"Push (align): block at ({block_xy[0]:.0f}, {block_xy[1]:.0f}) sticks out {offset_mm:+.1f} mm along its length; pushing back", flush=True)
+            print(f"Push (align): {len(plan['pushed'])} block(s) back {distance - PUSH_START_GAP_MM + 1.0:.1f} mm along their length "
+                  f"in one stroke", flush=True)
             await bot.move_delta(dx=start[0] - g[0], dy=start[1] - g[1])
             await bot.align_claws(wrap_90(long_deg), tolerance_deg=1.5, align_speed=align_speed, travel_speed=travel_speed)   # claws close along the length: faces square to the push
             g = await bot.gripper_origin()
@@ -934,7 +968,7 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 across = math.radians(target.layer0_long_side_deg + 90.0)
                 ax, ay = math.cos(across), math.sin(across)
                 w = calib.block.width_mm
-                centre_pushes = 0
+                centre_pushes = align_pushes = 0
                 for _round in range(ROW_PUSH_ROUNDS):
                     obs_m, scene_m = await scene_from_capture()
                     ctx_m = proposal.build_context(scene_m, tower_origin_xy_mm=tower_origin, filled_slots=filled, dry_run=True, tower_gap_mm=gap_mm)
@@ -959,10 +993,12 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                         continue
                     # After the one centre push the ends get their turn even if a few mm of gap remain (a skewed block
                     # reads as gap; pushing the row again does not close it). Previously this step never ran.
-                    if misaligned:
-                        # Ends: push the block that sticks out the most back in line, one block per round, then re-measure.
-                        i, off = misaligned[0]
-                        await push_block_end(pts[i], target.layer0_long_side_deg, off)
+                    align = row_align_push(pts, target.layer0_long_side_deg, ROW_ALIGN_TOLERANCE_MM, tower_origin, w) if misaligned else None
+                    if align and align_pushes < ALIGN_PUSH_ATTEMPTS:
+                        # Ends: one stroke lines up every block (the blue box only matters for assembly; the stacking
+                        # stage grips the measured row centre, layer_stack.at_source only uses the spot as a zone).
+                        align_pushes += 1
+                        await push_block_end(align, target.layer0_long_side_deg)
                         continue
                     break
             return pallet_count

@@ -67,9 +67,9 @@ class World:
         b[3] = self.claws + dang
 
     def push(self, old_xy, new_xy):
-        """Closed claws low over the table push blocks lying ahead of them along the move. A pushed block pushes the
-        next one only end to end: a block must have been ahead of the pusher's face before the move (blocks lying side
-        by side are not shoved along) and overlap it sideways by more than 1 mm."""
+        """Closed claws low over the table push every block their face covers that lay ahead of them; a pushed block
+        pushes the next one only end to end (it must have been ahead of that block's face before the move, so blocks
+        lying side by side are not shoved along). Contact needs more than 1 mm of sideways overlap."""
         dx, dy = new_xy[0] - old_xy[0], new_xy[1] - old_xy[1]
         dist = math.hypot(dx, dy)
         if dist < 1e-6:
@@ -84,19 +84,20 @@ class World:
             across = abs(37.5 * (-math.cos(a) * uy + math.sin(a) * ux)) + abs(12.5 * (math.sin(a) * uy + math.cos(a) * ux))
             return along, across
 
-        pusher_lateral, pusher_half = -new_xy[0] * uy + new_xy[1] * ux, PUSHER_HALF_WIDTH_MM
+        # Every block the claw face covers is pushed by it; a pushed block in turn pushes a block ahead of it, end to end.
+        pushers = [(-new_xy[0] * uy + new_xy[1] * ux, PUSHER_HALF_WIDTH_MM, face_before, face)]
         for b in sorted((b for b in self.blocks if b[4] == 0), key=lambda b: b[1] * ux + b[2] * uy):
             along, across = extents(b)
             p = b[1] * ux + b[2] * uy
             lat = -b[1] * uy + b[2] * ux
-            if abs(lat - pusher_lateral) > pusher_half + across - 1.0 or p - along < face_before - 1.0:
-                continue
-            if p - along < face:
-                shift = face - (p - along)
+            shift = 0.0
+            for plat, phalf, pbefore, pface in pushers:
+                if abs(lat - plat) <= phalf + across - 1.0 and p - along >= pbefore - 1.0 and p - along < pface:
+                    shift = max(shift, pface - (p - along))
+            if shift > 0:
                 b[1] += shift * ux
                 b[2] += shift * uy
-                face_before, face = p + along, p + shift + along     # this block now pushes the next one, end to end
-                pusher_lateral, pusher_half = lat, across
+                pushers.append((lat, across, p + along, p + shift + along))
 
     def preset(self):
         return [tuple(b[:5]) for b in self.blocks]   # synthetic_scene renders flat blocks: name, x, y, long_deg, level

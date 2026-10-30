@@ -15,7 +15,7 @@ def main(argv=None):
     parser.add_argument("--cycles", type=int, default=1, help="palletize: how many layers to build and stack in one go")
     parser.add_argument("--place-spacing-mm", type=float, default=14.0, help="live-run/palletize: extra pitch between consecutive pallet blocks at release; the single-direction push closes it")
     parser.add_argument("--no-sessions", action="store_true", help="live-run/layer-stack/palletize: disable Viam sessions (a missed heartbeat ended runs with SESSION_EXPIRED); a dropped connection then no longer stops a move already executing: the e-stop does")
-    parser.add_argument("--align-speed", type=float, default=45.0, help="live-run/layer-stack/palletize: joint speed (deg/s) for the wrist rotations that align the claws")
+    parser.add_argument("--align-speed", type=float, default=90.0, help="live-run/layer-stack/palletize: joint speed (deg/s) for the wrist rotations that align the claws")
     parser.add_argument("--approach-speed", type=float, default=40.0, help="live-run/palletize: joint speed (deg/s) for the last 40 mm of every descent to the table")
     parser.add_argument("--push-speed", type=float, default=30.0, help="live-run/palletize: joint speed (deg/s) while pushing the pallet row together")
     parser.add_argument("--grip-retries", type=int, default=1, help="live-run/layer-stack/palletize: repeat the pick movement this many times when the gripper reports an empty grip (grab false, not holding, or opening <= 0.5 mm)")
