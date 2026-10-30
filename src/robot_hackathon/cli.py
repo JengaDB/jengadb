@@ -11,7 +11,7 @@ from . import rgbd_cli, agent_cli
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Robot attempt logger. Offline by default; no physical actions.")
     parser.add_argument("command", nargs="?", default="mock-demo",
-                        choices=("mock-demo", "report", "viam-check", "mongo-ping", "mongo-index", "flush", "live-step", "live-run") + rgbd_cli.COMMANDS + agent_cli.COMMANDS)
+                        choices=("mock-demo", "report", "viam-check", "mongo-ping", "mongo-index", "flush", "live-step", "live-run", "layer-stack") + rgbd_cli.COMMANDS + agent_cli.COMMANDS)
     parser.add_argument("--max-blocks", type=int, default=3, help="live-run: blocks to place in this run")
     parser.add_argument("--arm-speed", type=float, default=None, help="live-run/live-step: arm joint speed to request via do_command (deg/s)")
     parser.add_argument("--arm-accel", type=float, default=None, help="live-run/live-step: arm joint acceleration to request via do_command (deg/s^2)")
@@ -20,6 +20,12 @@ def main(argv=None):
     parser.add_argument("--decision", default=None, help="live-step hover: agent-propose decision json to execute")
     parser.add_argument("--table-z", type=float, default=None, help="live-step: override table top z (mm, world) for the descent")
     parser.add_argument("--push-distance", type=float, default=None, help="live-step push: override the computed slide distance (mm)")
+    parser.add_argument("--direct-local", action="store_true", help="layer-stack: dial viam-server on the LAN (gRPC, no cloud relay); sessions stay on")
+    parser.add_argument("--view", default=None, help="layer-stack: 'x,y,z' flange pose (mm, world) for the overview capture; default home")
+    parser.add_argument("--no-pause", action="store_true", help="layer-stack: do not wait for Enter; every check still stops the run. Someone stays at the e-stop")
+    parser.add_argument("--grip-lower-mm", type=float, default=0.0, help="layer-stack: grip this much deeper than the default 8 mm below the block top")
+    parser.add_argument("--plan-only", action="store_true", help="layer-stack: capture and plan from the home pose; never moves")
+    parser.add_argument("--apply-offset", action="store_true", help="layer-stack: apply the offset fitted from earlier verified runs")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--report", type=Path, default=None)
     parser.add_argument("--allow-cloud", action="store_true")
@@ -51,6 +57,26 @@ def main(argv=None):
             raise ConfigError("Database writes require --confirm-write after specific authorization")
         # Avoid SDK debug/error logging accidentally disclosing credentials.
         logging.disable(logging.CRITICAL)
+        if args.command == "layer-stack":
+            from .layer_stack import run_layer_stack
+            from .segmentation import MetaSam3Provider
+            from .agent_cli import _parse_xy
+            from .live_executor import BLUE_SQUARE_ORIGIN
+            logging.disable(logging.NOTSET)
+            logging.getLogger().setLevel(logging.WARNING)
+            origin = _parse_xy(args.tower_origin) if args.tower_origin else BLUE_SQUARE_ORIGIN
+            try:
+                return asyncio.run(run_layer_stack(config, args.data_dir, args.operator, args.episode, origin,
+                                                   MetaSam3Provider(config, allow_cloud=True), direct_local=args.direct_local,
+                                                   apply_offset=args.apply_offset, plan_only=args.plan_only, grip_lower_mm=args.grip_lower_mm,
+                                                   confirm=(lambda msg: print(msg + "[--no-pause: continuing]", flush=True)) if args.no_pause else input,
+                                                   view_pose=[float(v) for v in args.view.split(",")] if args.view else None))
+            except ConfigError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - verbatim robot/planner error for the operator; carries no secrets
+                print(f"layer-stack failed: {type(exc).__name__}: {exc}")
+                print("No automatic retry. Inspect the arm and scene before the next run.")
+                return 1
         if args.command in ("live-step", "live-run"):
             from .live_executor import run_step, run_flow
             logging.disable(logging.NOTSET)
