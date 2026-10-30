@@ -842,5 +842,12 @@ def evaluate_grasps(est, height_map, calib, styles=("middle", "side", "ends")):
             opt["eligible"] = not opt["reasons"]
             if est.base_long_side_deg is not None and opt["eligible"]:
                 opt["claws_close_direction_deg_in_base"] = wrap_90(est.base_long_side_deg + claws_deg)
+            if (est.base_point_mm is not None and est.pixel_center is not None and est.mm_per_px and est.depth_mm is not None
+                    and est.image_angle_deg is not None and calib.extrinsics is not None):
+                # Where the gripper centre goes down: the block centre moved shift mm along the same image axis the claw
+                # strips were checked on (base_long_side_deg is wrapped to +-90 and can point the other way).
+                a, d = math.radians(est.image_angle_deg), shift / est.mm_per_px
+                opt["grip_point_mm"] = [round(v, 2) for v in pixel_to_base(est.pixel_center[0] + d * math.cos(a), est.pixel_center[1] + d * math.sin(a),
+                                                                          est.depth_mm, calib.intrinsics, calib.extrinsics)]
             options.append(opt)
     return options

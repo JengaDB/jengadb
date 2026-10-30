@@ -10,6 +10,7 @@ Geometry follows live_executor (Sam's jenga.py conventions). No retries: a refus
 stops the run, and the next decision is the operator's. Sessions stay enabled.
 """
 import asyncio
+import itertools
 import json
 import math
 import statistics
@@ -25,6 +26,8 @@ BASE_SPACING_RANGE_MM = (20.0, 33.0)  # the tower's top layer only has to give a
                                       # have settled apart a little and the overview measures it from far above
                                       # (robot-live-8 18:50: pitch 28.3 measured, run refused)
 BASE_MIN_SHARED_CONTACT_MM = 40.0
+BLOCK_PITCH_MM = 25.0             # centre-to-centre spacing of a packed layer (one block width)
+OUTER_PAIR_PITCH_MM = (40.0, 60.0)  # two tower-top detections this far apart are the outer blocks of the layer
 MIN_SHARED_CONTACT_MM = 55.0      # 45 mm finger width plus margin must overlap all three blocks' long sides
 HEIGHT_BAND = 0.3                 # of a block height (4.5 mm): beyond this a top surface is between layers (tilted block)
 MIN_BLOCK_HEIGHT_FRACTION = 0.5   # detections lower than half a block are flat objects (paper, tape), not blocks
@@ -34,6 +37,8 @@ YAW_TOLERANCE_DEG = 3.0           # success: new layer within this of exactly 90
 MIN_RUNS_FOR_OFFSET = 3
 MAX_OFFSET_SPREAD_MM = 2.0        # residual standard deviation above which a constant offset is not trusted
 MIN_TIPS_FLOOR_MM = -6.0          # --tips-floor-mm may not send the claw tips further below the calibrated table than this
+PALLET_PICK_DEEPER_MM = 2.0       # palletize: the bundle pick goes this far below the tips floor (operator, 30 Oct run 8:
+                                  # the robot-built layer slid out of the claws on the lift with the tips at the 0 mm floor)
 EDGE_MARGIN_PX = 4                # a mask this close to the image border is cut off: its centre and angle are wrong
 # Default flange pose for the overview capture. live_executor.HOME (z 400) did not fit two layers 210 mm apart in one
 # image (Kazy, 29 Oct); z 460 did and saw x 199-546, y -128..491 mm of table (Kris, 30 Oct). Raise z or shift x/y with
@@ -120,8 +125,42 @@ def summarize_layer(blocks, block_height_mm=15.0, spacing_range=SPACING_RANGE_MM
 
 
 def base_layer(blocks, block_height_mm=15.0):
-    """The tower's top layer: same flatness/parallel checks as a bundle, looser spacing and end-stagger limits."""
-    return summarize_layer(blocks, block_height_mm, spacing_range=BASE_SPACING_RANGE_MM, min_shared_contact_mm=BASE_MIN_SHARED_CONTACT_MM)
+    """The tower's top layer: same flatness/parallel checks as a bundle, looser spacing and end-stagger limits. The top
+    always holds three blocks (operator, 30 Oct), so the number of detections is not a check: from more than three
+    (run 11: the nearest block's side face, seen at an angle, read 87.6 mm and counted as a fourth) the three forming the
+    most regular layer are used (pitch closest to one block width, then ends best lined up); two detections
+    OUTER_PAIR_PITCH_MM apart are the outer blocks, with the middle one between them. One detection, or two side by
+    side, leave the centre unknown by half a block and still stop."""
+    usable = [b for b in blocks if _usable(b)]
+    if len(usable) > BLOCKS_PER_LAYER:
+        best, best_key, last = None, None, None
+        for trio in itertools.combinations(usable, BLOCKS_PER_LAYER):
+            try:
+                pose = summarize_layer(list(trio), block_height_mm, spacing_range=BASE_SPACING_RANGE_MM,
+                                       min_shared_contact_mm=BASE_MIN_SHARED_CONTACT_MM)
+            except LayerCheckError as exc:
+                last = exc
+                continue
+            key = (sum(abs(s - BLOCK_PITCH_MM) for s in pose.spacing_mm), -pose.shared_contact_mm)
+            if best_key is None or key < best_key:
+                best, best_key = pose, key
+        if best is None:
+            raise LayerCheckError(f"{len(usable)} detections on the tower top and no three of them form one layer ({last})")
+        return best
+    if len(usable) == 2:
+        a, b = usable
+        theta = _axial_mean_deg([a["base_long_side_deg"], b["base_long_side_deg"]])
+        across = abs((b["base_point_mm"][0] - a["base_point_mm"][0]) * -math.sin(math.radians(theta))
+                     + (b["base_point_mm"][1] - a["base_point_mm"][1]) * math.cos(math.radians(theta)))
+        if OUTER_PAIR_PITCH_MM[0] <= across <= OUTER_PAIR_PITCH_MM[1]:
+            middle = {"base_point_mm": tuple((a["base_point_mm"][i] + b["base_point_mm"][i]) / 2 for i in range(3)),
+                      "base_long_side_deg": theta,
+                      "height_above_table_mm": (a["height_above_table_mm"] + b["height_above_table_mm"]) / 2}
+            usable = [a, middle, b]
+    if len(usable) < BLOCKS_PER_LAYER:
+        raise LayerCheckError(f"only {len(usable)} of the 3 top blocks measured, not the outer pair; the tower centre is unknown "
+                              f"by half a block")
+    return summarize_layer(usable, block_height_mm, spacing_range=BASE_SPACING_RANGE_MM, min_shared_contact_mm=BASE_MIN_SHARED_CONTACT_MM)
 
 
 def split_scene(blocks, tower_origin_xy, zone_radius_mm, block_height_mm=15.0, ignored=None):
@@ -157,6 +196,30 @@ def split_scene(blocks, tower_origin_xy, zone_radius_mm, block_height_mm=15.0, i
     return outside, by_level[top]
 
 
+def overview_base(blocks, tower_origin_xy, zone_radius_mm, block_height_mm=15.0):
+    """The overview's split into blocks outside the tower zone and the tower's top layer, plus whether the tower has to
+    be measured again from directly above: (outside, top, look, why). look is None when the overview's top level is
+    one usable layer, "clipped" when it is cut off by the image edge, "unclear" when it is not one three-block layer.
+    The overview sees a tall tower from the side (30 Oct run 11: tower top at 90 mm, ~230 mm off the photo's centre,
+    the top layer's camera-facing side face read 87.6 mm and counted as a fourth top block), and the stacking plan is
+    built from the close-up above the tower anyway. NoBaseLayer is raised as by split_scene."""
+    try:
+        outside, top = split_scene(blocks, tower_origin_xy, zone_radius_mm, block_height_mm)
+    except NoBaseLayer:
+        raise
+    except LayerCheckError as exc:   # e.g. a detection above the top layer between layer heights
+        outside = [b for b in blocks if _usable(b) and b["height_above_table_mm"] >= MIN_BLOCK_HEIGHT_FRACTION * block_height_mm
+                   and math.hypot(b["base_point_mm"][0] - tower_origin_xy[0], b["base_point_mm"][1] - tower_origin_xy[1]) >= zone_radius_mm]
+        return outside, [], "unclear", f"the overview does not show the tower top clearly ({exc})"
+    if any(b.get("clipped") for b in top):
+        return outside, top, "clipped", "the base layer is cut off by the overview image edge"
+    try:
+        base_layer(top, block_height_mm)
+    except LayerCheckError as exc:
+        return outside, top, "unclear", f"the overview does not show the tower top as one layer ({exc})"
+    return outside, top, None, None
+
+
 def tower_layers(top_layer, block_height_mm=15.0):
     """How many layers the tower has, from the measured top layer: its height divided by one block, rounded."""
     return int(round(top_layer.height_above_table_mm / block_height_mm))
@@ -175,6 +238,7 @@ class StackPlan:
     applied_offset_xy: tuple = (0.0, 0.0)
     grip_below_top_mm: float = 0.0    # achieved grip depth (requested depth, unless the tips floor clamped it)
     requested_grip_below_top_mm: float = 0.0
+    pick_deeper_mm: float = 0.0       # extra depth below the floor-limited pick (PALLET_PICK_DEEPER_MM in palletize)
 
     def to_dict(self):
         d = asdict(self)
@@ -182,20 +246,25 @@ class StackPlan:
         return d
 
 
-def plan_stack(source, base, block_height_mm=15.0, params=GraspParams(), release_drop_mm=1.0, offset_xy=(0.0, 0.0)):
+def plan_stack(source, base, block_height_mm=15.0, params=GraspParams(), release_drop_mm=1.0, offset_xy=(0.0, 0.0),
+               pick_deeper_mm=0.0):
     """Grip across the bundle's 75 mm width (claws close perpendicular to the long sides, pressing the three together),
-    and release with the bundle's long side at 90 deg to the base layer, centred on it."""
+    and release with the bundle's long side at 90 deg to the base layer, centred on it. pick_deeper_mm lowers the pick
+    below the floor-limited depth; the release follows, so the bundle still lands release_drop_mm above the base."""
     if source.level != 0:
         raise LayerCheckError("the hand-built layer must lie on the table")
     target_long = wrap_90(base.long_side_deg + 90.0)
-    tips_pick = max(source.height_above_table_mm - params.grasp_depth_mm, params.tips_min_mm)
+    tips_pick = max(source.height_above_table_mm - params.grasp_depth_mm, params.tips_min_mm) - pick_deeper_mm
+    if tips_pick < MIN_TIPS_FLOOR_MM:
+        raise LayerCheckError(f"pick tips {tips_pick:.1f} mm would be below the {MIN_TIPS_FLOOR_MM} mm limit under the calibrated table")
     # The grip depth actually reached once the floor (tips_min_mm) applies; the bundle hangs this far below the block
     # tops in the claws, so the release height has to use it or a clamped pick would push the bundle into the base.
     grip_below_top = source.height_above_table_mm - tips_pick
     tips_release = base.height_above_table_mm + block_height_mm - grip_below_top + release_drop_mm
     target = (base.center_xy[0] - offset_xy[0], base.center_xy[1] - offset_xy[1])
     return StackPlan(source, base, wrap_90(source.long_side_deg + ACROSS), wrap_90(target_long + ACROSS),
-                     target, target_long, tips_pick, tips_release, tuple(offset_xy), grip_below_top, params.grasp_depth_mm)
+                     target, target_long, tips_pick, tips_release, tuple(offset_xy), grip_below_top, params.grasp_depth_mm,
+                     pick_deeper_mm)
 
 
 def placement_residual(plan, measured):
@@ -322,7 +391,7 @@ def _blocks(context, width, height):
 async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, seg_provider, direct_local=False,
                           apply_offset=False, confirm=input, plan_only=False, view_pose=None, grip_lower_mm=0.0,
                           source_hint_xy=None, tips_floor_mm=None, expected_layers=None, grip_retries=1, disable_sessions=False,
-                          arm_speed=None, approach_speed=None, align_speed=None):
+                          arm_speed=None, approach_speed=None, align_speed=None, pick_deeper_mm=0.0, near_table_bands=None):
     """One supervised stack. Returns 0 on a verified success, 1 otherwise. See module docstring.
     plan_only: capture from the current pose, measure both layers and print the plan; no motion command is sent.
     source_hint_xy: operator-supplied world x,y (mm) of the hand-built layer when it lies outside the overview image;
@@ -331,7 +400,10 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
     negative values are the operator's statement that the calibrated table z sits above the real surface.
     expected_layers: how many layers the tower has before this run (--layers); the measured count (top height divided by
     one block height) must agree or the run stops. Without it the measurement is trusted. The episode state keeps
-    `tower_layers` and `layers_stacked`, updated on every verified placement."""
+    `tower_layers` and `layers_stacked`, updated on every verified placement.
+    pick_deeper_mm: the bundle pick goes this far below the floor-limited depth (palletize passes PALLET_PICK_DEEPER_MM).
+    near_table_bands: speed caps by claw-tip height above the table (default live_executor.NEAR_TABLE_BANDS; () turns
+    them off)."""
     if expected_layers is not None and expected_layers < 1:
         raise LayerCheckError("--layers counts the layers already on the tower; at least 1")
     if not plan_only:
@@ -343,7 +415,10 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
     from . import proposal, rgbd, segmentation
     from . import grasp_geometry as geom
     from .capture import capture_with_camera
-    from .live_executor import PICK_LIFT_MM, TIP_ABOVE_GRIPPER_FRAME_MM, DEFAULT_ARM_SPEED_DEG_S, Episode, Robot, grip_failed
+    from .live_executor import (PICK_LIFT_MM, TIP_ABOVE_GRIPPER_FRAME_MM, DEFAULT_ARM_SPEED_DEG_S, NEAR_TABLE_BANDS,
+                                Episode, Robot, grip_failed)
+    if near_table_bands is None:
+        near_table_bands = NEAR_TABLE_BANDS
     # Speeds as in run_flow: slow final approach and slow claw alignment, travel speed restored afterwards.
     travel_speed = arm_speed if arm_speed is not None else (DEFAULT_ARM_SPEED_DEG_S if (approach_speed or align_speed) else None)
     from .pipeline import candidate_id
@@ -443,6 +518,12 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
         ctx, calib = await measure("overview")
         dims = calib.block
         table_z = calib.support_surface.z_in_robot_base_mm
+        if near_table_bands and not plan_only:
+            # Moves with the claw tips low are capped by height, the lift with the bundle included (30 Oct run 8: the
+            # robot-built layer slid out of the claws on a 180 deg/s lift).
+            bot.set_near_table_zone(table_z, travel_speed or DEFAULT_ARM_SPEED_DEG_S, bands=near_table_bands)
+            ep.event("stack", phase="near_table_speed", bands=[list(b) for b in bot.zone[1]],
+                     travel_speed_deg_s=travel_speed or DEFAULT_ARM_SPEED_DEG_S)
         zone = footprint_clearance_mm(TowerTarget(tuple(tower_origin), calib.support_surface, dims, calib.finger))
         overview_blocks = _blocks(ctx, *size)
         seen = visible_table_extent(last_doc[0], table_z) if last_doc[0] else None
@@ -450,10 +531,11 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
         where = (f"camera saw x {seen['x_mm'][0]:.0f}..{seen['x_mm'][1]:.0f}, y {seen['y_mm'][0]:.0f}..{seen['y_mm'][1]:.0f} mm"
                  if seen else "visible area unknown")
         look_at_tower = None   # reason to hover over the tower origin and measure the base from there
+        look_phase = "base_out_of_view"
         try:
-            outside, base_blocks = split_scene(overview_blocks, tower_origin, zone, dims.height_mm)
-            if any(b.get("clipped") for b in base_blocks):
-                look_at_tower = "the base layer is cut off by the overview image edge"
+            outside, base_blocks, look, look_at_tower = overview_base(overview_blocks, tower_origin, zone, dims.height_mm)
+            if look == "unclear":
+                look_phase = "base_unclear_in_overview"
         except NoBaseLayer as exc:
             if in_view or plan_only:
                 raise LayerCheckError(f"{exc} at {tower_origin[0]:.0f}, {tower_origin[1]:.0f} ({where}); is --tower-origin the tower?") from None
@@ -463,7 +545,7 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
             # Keep the overview's source blocks; go and look at the tower from directly above.
             note = f"{look_at_tower}; hovering over the tower origin to measure the base"
             print(note)
-            ep.event("stack", phase="base_out_of_view", tower_origin=list(tower_origin), seen=seen, note=note)
+            ep.event("stack", phase=look_phase, tower_origin=list(tower_origin), seen=seen, note=note)
             await hover_over(tower_origin)
             ctx_t, _ = await measure("base_find")
             base_blocks = split_scene(_blocks(ctx_t, *size), tower_origin, zone, dims.height_mm)[1]
@@ -503,7 +585,7 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
         if plan_only:
             log = ResidualLog(data_dir, config.setup_id)
             offset, offset_note = log.fitted_offset()
-            plan = plan_stack(source0, base0, dims.height_mm, params=grasp)
+            plan = plan_stack(source0, base0, dims.height_mm, params=grasp, pick_deeper_mm=pick_deeper_mm)
             ep.event("stack", phase="plan_only", plan=plan.to_dict(), fitted_offset=offset, fitted_offset_note=offset_note,
                      table_z=table_z, table_z_verified=calib.support_surface.verified, zone_radius_mm=round(zone, 1))
             print(f"\nPLAN ONLY (overview capture, no motion). Source ({source0.center_xy[0]:.1f}, {source0.center_xy[1]:.1f}) "
@@ -538,7 +620,7 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
         offset, offset_note = log.fitted_offset()
         use = offset if (apply_offset and offset) else (0.0, 0.0)
         # Deeper grip changes pick and release tips together, so the bundle still lands release_drop above the base.
-        plan = plan_stack(source, base, dims.height_mm, params=grasp, offset_xy=use)
+        plan = plan_stack(source, base, dims.height_mm, params=grasp, offset_xy=use, pick_deeper_mm=pick_deeper_mm)
         ep.event("stack", phase="plan", plan=plan.to_dict(), fitted_offset=offset, fitted_offset_note=offset_note,
                  table_z=table_z, table_z_verified=calib.support_surface.verified, tips_floor_mm=grasp.tips_min_mm,
                  tower_layers=layers_before)
@@ -550,6 +632,7 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
               f"{'verified' if calib.support_surface.verified else 'UNVERIFIED'}), {plan.grip_below_top_mm:.1f} mm below the block tops"
               + (f" -- requested {plan.requested_grip_below_top_mm:.1f} mm, limited by the tips floor {grasp.tips_min_mm:.1f} mm; "
                  f"lower it with --tips-floor-mm" if plan.grip_below_top_mm < plan.requested_grip_below_top_mm - 1e-6 else "")
+              + (f" (pallet pick: {plan.pick_deeper_mm:.1f} mm deeper than that)" if plan.pick_deeper_mm else "")
               + f". Release: tips {plan.release_tips_above_table_mm:.1f} mm above the table")
         # In a thread, so the SDK heartbeat and connection checks keep running while the operator reads the plan.
         await asyncio.to_thread(confirm, "Press Enter to pick and stack (Ctrl-C to stop) ")
@@ -686,12 +769,13 @@ async def run_palletize(config, data_dir, operator, episode_id, tower_origin, pa
                         direct_local=False, view_pose=None, grip_lower_mm=0.0, tips_floor_mm=None, expected_layers=None,
                         confirm=input, apply_offset=False, arm_speed=None, arm_accel=None, place_spacing_mm=None, grip_retries=1,
                         references="none", approach_speed=None, push_speed=None, disable_sessions=False, align_speed=None,
-                        drop_spot_xy=None, knock_over=False):
+                        drop_spot_xy=None, knock_over=False, flatten_sweeps=0, x_sweeps=0, push_outs=0):
     """Full flow, `cycles` times: build a packed three-block layer on the pallet spot from the loose blocks in view
     (live_executor.run_flow: pick one at a time, place back to back, push the row tight and centre it), then grip that
     layer as a bundle and stack it on the tower (run_layer_stack). The tower is a keep-out for the picking stage. The
     stacking stage keeps its Enter hold point unless `confirm` is replaced. Stops at the first stage that does not
-    complete: fewer than three blocks on the pallet, or a stack that did not add a verified layer."""
+    complete: fewer than three blocks on the pallet, or a stack that did not add a verified layer. The bundle pick goes
+    PALLET_PICK_DEEPER_MM below --tips-floor-mm; single-block picks keep the floor."""
     from .live_executor import Episode, run_flow
     config.require_motion(operator)
     if cycles < 1:
@@ -713,7 +797,8 @@ async def run_palletize(config, data_dir, operator, episode_id, tower_origin, pa
                             arm_speed=arm_speed, arm_accel=arm_accel, grip_lower_mm=grip_lower_mm, tips_floor_mm=tips_floor_mm,
                             keep_out_xy=tower_origin, view_pose=view_pose, direct_local=direct_local, drop_unseen_filled=True,
                             grip_retries=grip_retries, references=references, skip_if_complete=True, layers=1, disable_sessions=disable_sessions,
-                            drop_spot_xy=drop_spot_xy, knock_over=knock_over,
+                            drop_spot_xy=drop_spot_xy, knock_over=knock_over, flatten_sweeps=flatten_sweeps, x_sweeps=x_sweeps,
+                            push_outs=push_outs,
                             **({"place_spacing_mm": place_spacing_mm} if place_spacing_mm is not None else {}),
                             **({"approach_speed": approach_speed} if approach_speed is not None else {}),
                             **({"push_speed": push_speed} if push_speed is not None else {}),
@@ -737,7 +822,8 @@ async def run_palletize(config, data_dir, operator, episode_id, tower_origin, pa
                                    apply_offset=apply_offset, confirm=confirm, view_pose=view_pose, grip_lower_mm=grip_lower_mm,
                                    source_hint_xy=pallet_xy, tips_floor_mm=tips_floor_mm, expected_layers=expected_layers,
                                    grip_retries=grip_retries, disable_sessions=disable_sessions,
-                                   arm_speed=arm_speed, approach_speed=approach_speed, align_speed=align_speed)
+                                   arm_speed=arm_speed, approach_speed=approach_speed, align_speed=align_speed,
+                                   pick_deeper_mm=PALLET_PICK_DEEPER_MM)
         state = Episode(data_dir, episode_id, operator).state
         if state.get("layers_stacked", 0) <= before:
             ep.event("palletize", phase="stop", cycle=cycle, reason="stack_not_verified", stack_rc=rc)

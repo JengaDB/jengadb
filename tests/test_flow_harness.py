@@ -122,7 +122,7 @@ class FakeGripper:
         w = self.w
         w.closed = True
         tips = w.g[2] + 0.5 - w.table_z(w.g[0], w.g[1])
-        under = [b for b in w.blocks if math.hypot(b[1] - w.g[0], b[2] - w.g[1]) < 15
+        under = [b for b in w.blocks if math.hypot(b[1] - w.g[0], b[2] - w.g[1]) < 20   # a side grip is 15 mm off centre
                  and (b[4] + 1) * 15 + b[6] > tips]
         if not under:
             return False
@@ -277,6 +277,8 @@ class RunFlowHarness(unittest.TestCase):
         self.assertEqual(rows[0]["blocks"], 3)                            # the third, ~138 mm out, is counted
         self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
         self.assertEqual(len(self.on_pallet(world)), 3)
+        zone = [e for e in events if e.get("phase") == "near_table_speed"]
+        self.assertEqual([e["bands"] for e in zone], [[[100.0, 60.0], [40.0, 20.0]]])   # set once, after the first capture
 
     def test_block_put_down_on_its_neighbour_is_taken_off_and_replaced(self):
         world = self.flat_heap()
@@ -301,7 +303,7 @@ class RunFlowHarness(unittest.TestCase):
         self.assertEqual(len(self.on_pallet(world)), 3)
         self.assertEqual([b[0] for b in world.blocks if b[4] == 1], [])  # nothing left lying on the row
 
-    def run_with_upright(self, world, prefix, dims, tips_range, fall_mm, hi_res=False):
+    def run_with_upright(self, world, prefix, dims, tips_range, fall_mm, hi_res=False, **flow_kw):
         """Blocks named prefix* are upright with footprint/height `dims` (rendered separately and composited); the
         simulated claws topple one when they sweep through it with their tips inside tips_range, leaving it flat
         `fall_mm` further along the sweep. hi_res doubles the camera resolution so a small end face clears run_flow's
@@ -352,7 +354,7 @@ class RunFlowHarness(unittest.TestCase):
             if hi_res:
                 stack.enter_context(mock.patch.object(synth, "INTRINSICS", dict(synth.INTRINSICS, width_px=640, height_px=480, focal_x_px=456.0,
                                                                                 focal_y_px=456.0, center_x_px=320.0, center_y_px=240.0)))
-            return self.run_flow(world, knock_over=True)
+            return self.run_flow(world, **{"knock_over": True, **flow_kw})
 
     def test_block_standing_on_end_is_knocked_over_then_picked(self):
         world = World([("A", 430.0, 60.0, 30.0, 0), ("C", 470.0, 250.0, -40.0, 0), ("UP1", 380.0, 120.0, 0.0, 0)])
@@ -378,6 +380,97 @@ class RunFlowHarness(unittest.TestCase):
         self.assertFalse([e for e in events if e.get("phase") == "knock_check"][0]["still_standing"])
         self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
         self.assertEqual(sorted(b[0] for b in world.blocks), ["A", "C", "FELL1"])
+
+    def test_random_flatten_sweeps_knock_a_block_flat_before_picking(self):
+        # Operator, 30 Oct: after going home, sweep a few times at random so the heap is flatter. --knock-over is off,
+        # so only the flattening sweeps can lay the block on its edge down.
+        world = World([("A", 430.0, 60.0, 30.0, 0), ("C", 470.0, 250.0, -40.0, 0), ("EDGE1", 360.0, 180.0, 10.0, 0)])
+        rc, events = self.run_with_upright(world, "EDGE", (75.0, 15.0, 25.0), (12.0, 30.0), 20.0, knock_over=False,
+                                           flatten_sweeps=3, flatten_seed=5)
+        sweeps = [e for e in events if e.get("phase") == "flatten_sweep"]
+        done = [e for e in events if e.get("phase") == "flatten_done"]
+        self.assertEqual(len(sweeps), 1)
+        self.assertEqual((sweeps[0]["tips_mm"], sweeps[0]["seed"], sweeps[0]["taller_than_sweep"]), (18.0, 5, 1))
+        self.assertLess(math.dist(sweeps[0]["target_xy"], (360.0, 180.0)), 10.0)
+        self.assertEqual((done[0]["sweeps_done"], done[0]["reason"]), (1, "nothing_above_sweep_height"))   # flat after one
+        first_pick = next(i for i, e in enumerate(events) if e.get("phase") == "plan_block")
+        self.assertLess(events.index(done[0]), first_pick)                       # all before any pick
+        self.assertFalse(any(e.get("phase") == "knock_over" for e in events))
+        self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
+        self.assertEqual(sorted(b[0] for b in world.blocks), ["A", "C", "FELL1"])
+
+    def test_packed_heap_gets_an_x_sweep_after_two_empty_looks(self):
+        # Run 10 (20:53): flat blocks packed parallel, no grasp with room for the claws, two rescans, stop. Operator: then
+        # sweep the bottom layer in an X. (The simulated push piles blocks up, so this checks the motion, not the spread.)
+        a = 30.0
+        ax, ay = math.cos(math.radians(a)), math.sin(math.radians(a))
+        world = World([(f"P{k}", 380.0 - k * 30.0 * ay + (k % 2) * 25.0 * ax, -20.0 + k * 30.0 * ax + (k % 2) * 25.0 * ay, a, 0)
+                       for k in range(5)])
+        robot_cls = make_robot_class(world)
+        base_move = robot_cls.move_delta
+        strokes = []
+
+        async def move_delta(robot, dx=0.0, dy=0.0, dz=0.0, rotate=0.0, near_table=False):
+            if world.closed and world.held is None and (dx or dy) and world.g[2] + 0.5 - world.table_z(world.g[0], world.g[1]) < 12:
+                strokes.append(math.hypot(dx, dy))
+            return await base_move(robot, dx, dy, dz, rotate, near_table)
+        robot_cls.move_delta = move_delta
+        with mock.patch(__name__ + ".make_robot_class", lambda w: robot_cls):
+            rc, events = self.run_flow(world, x_sweeps=1, disable_sessions=True)
+        x = [e for e in events if e.get("phase") == "x_sweep"]
+        self.assertEqual([e["stroke"] for e in x], [1, 2])
+        self.assertEqual({e["tips_mm"] for e in x}, {7.0})                         # the bottom layer, not over it
+        self.assertAlmostEqual((x[0]["direction_deg"] - x[1]["direction_deg"]) % 180.0, 90.0)   # crossing: an X
+        first_x = events.index(x[0])
+        self.assertEqual(sum(1 for e in events[:first_x] if e.get("phase") == "scene" and e["label"].startswith("rescan")), 2)
+        self.assertEqual(sorted(round(s) for s in strokes), sorted(round(e["distance_mm"]) for e in x))   # one move each
+        self.assertEqual([e["label"] for e in events if e.get("phase") == "scene" and e["label"].startswith("after_x")],
+                         ["after_x_sweep_1", "after_x_sweep_2"])
+        self.assertEqual([e["reason"] for e in events if e.get("phase") == "stop"], ["no_candidate_with_required_grasp"])
+
+    def test_middle_of_three_side_by_side_is_pushed_out_edge_on(self):
+        # Operator, 30 Oct: three or more flat blocks side by side -> push into the ends of the middle ones. Claws narrowed
+        # to 80 mm so no grasp fits beside a neighbour (as in the packed heap of runs 10-11). The simulated push moves
+        # whatever the 45 mm face would touch, so this checks the decision and the motion, not where the blocks end up.
+        import dataclasses
+        from robot_hackathon import grasp_geometry as geom
+        orig = geom.bundle_from_records
+
+        def narrow(*args, **kw):
+            b = orig(*args, **kw)
+            return dataclasses.replace(b, finger=dataclasses.replace(b.finger, open_gap_mm=80.0))
+        a = 30.0
+        ax, ay = math.cos(math.radians(a)), math.sin(math.radians(a))
+        world = World([(f"R{k}", 360.0 - k * 25.0 * ay, 40.0 + k * 25.0 * ax, a, 0) for k in range(3)])
+        robot_cls = make_robot_class(world)
+        base_move = robot_cls.move_delta
+        strokes = []
+
+        async def move_delta(robot, dx=0.0, dy=0.0, dz=0.0, rotate=0.0, near_table=False):
+            if world.closed and world.held is None and (dx or dy) and world.g[2] + 0.5 - world.table_z(world.g[0], world.g[1]) < 12:
+                strokes.append((math.degrees(math.atan2(dy, dx)), world.claws, math.hypot(dx, dy)))
+            return await base_move(robot, dx, dy, dz, rotate, near_table)
+        robot_cls.move_delta = move_delta
+        with mock.patch.object(geom, "bundle_from_records", narrow), mock.patch(__name__ + ".make_robot_class", lambda w: robot_cls):
+            rc, events = self.run_flow(world, push_outs=1, disable_sessions=True)
+        row = [e for e in events if e.get("phase") == "push_out_row"]
+        push = [e for e in events if e.get("phase") == "push_out"]
+        self.assertEqual(len(row[0]["row"]), 3)
+        self.assertEqual(len(push), 1)                                             # the middle one only
+        self.assertLess(math.dist(push[0]["block_xy"], (360.0 - 25.0 * ay, 40.0 + 25.0 * ax)), 2.0)
+        first = events.index(row[0])
+        self.assertEqual(sum(1 for e in events[:first] if e.get("phase") == "scene" and e["label"].startswith("rescan")), 2)
+        (direction, claws, length), = strokes                                      # one continuous stroke
+        self.assertAlmostEqual(abs(((direction - a) + 90.0) % 180.0 - 90.0), 0.0, delta=1.0)   # along the block
+        self.assertAlmostEqual(abs(((claws - direction) + 90.0) % 180.0 - 90.0), 90.0, delta=2.0)   # claws edge-on
+        self.assertAlmostEqual(length, push[0]["distance_mm"], delta=0.5)
+        self.assertIn("after_push_out_1", [e.get("label") for e in events if e.get("phase") == "scene"])
+
+    def test_no_flatten_sweeps_on_a_flat_heap(self):
+        rc, events = self.run_flow(self.flat_heap(), flatten_sweeps=3)
+        self.assertFalse(any(e.get("phase") == "flatten_sweep" for e in events))
+        self.assertEqual([e["reason"] for e in events if e.get("phase") == "flatten_done"], ["nothing_above_sweep_height"])
+        self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
 
     def test_low_travel_goes_over_a_tall_block_near_its_path(self):
         # Spec: the closed claws travel 30 mm above the table during the push stage. A 60 mm-tall object (here a block

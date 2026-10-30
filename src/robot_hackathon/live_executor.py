@@ -15,6 +15,7 @@ import asyncio
 import dataclasses
 import json
 import math
+import random
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,6 +29,8 @@ PLACE_DROP_MM = 1.0
 PICK_LIFT_MM = 100.0
 CLAW_THICKNESS_MM = 8.0           # Sam's; closed claws are two claws thick
 PUSH_START_GAP_MM = 5.0           # gap between the closed claws and the last block before the push starts
+PUSH_FACE_CLEAR_MM = 2.0          # an end push's claw face stays this far off the reference (last) block (run 9: it
+                                  # overlapped it by 18 mm and moved it 7.4 mm)
 PUSH_TIPS_MM = 7.0                # claw tips above the table while pushing (5 was 2 mm too low: operator, 30 Oct 19:22)
 DROP_HEIGHT_MM = 25.0             # a block to be laid flat is released with its bottom about this far above the drop spot
 DROP_CLEAR_MM = 60.0              # nothing else may lie within this of the drop spot (a 75 mm block landing any way round)
@@ -43,6 +46,26 @@ KNOCK_LANDING_MARGIN_MM = 5.0     # the fallen block's footprint plus this must 
 MAX_KNOCKS = 6                    # sweeps per run
 MAX_KNOCKS_PER_SPOT = 2           # sweeps of the block at one place before the flow stops and asks the operator
 CLAW_FACE_WIDTH_MM = 45.0         # closed claws: face width across the push, two claws (16 mm) along it
+FLATTEN_TIPS_ABOVE_FLAT_MM = 3.0  # random flattening sweeps: claw tips this far above a flat block's top (18 mm), so flat
+                                  # blocks pass under and a block on its edge, on its end or on another block is hit
+FLATTEN_PAST_MM = 60.0            # a flattening sweep ends this far past the centre of the block it aims through
+FLATTEN_CARRY_MM = 75.0           # blocks ahead of the claws may end up the stroke's end plus one block length further
+FLATTEN_MAX_BACK_MM = 150.0       # the claws come down on bare table at most this far behind the aimed block's centre
+FLATTEN_TRIES = 40                # random (block, direction) draws per sweep before giving up
+XSWEEP_ARM_MM = 70.0              # an X-sweep stroke runs from at least this far before the heap centre to this far past
+                                  # it (whole-heap strokes had no clear way on run 10's heap, wedged near the pallet,
+                                  # the tower and the photo's edge)
+XSWEEP_MAX_BACK_MM = 100.0        # its claws come down on bare table at most this much further out than the arm
+XSWEEP_BOUNDS_MARGIN_MM = 10.0    # stroke start and carried blocks stay this far inside the table area the photo saw
+XSWEEP_TURNS_DEG = (0.0, 15.0, -15.0, 30.0, -30.0, 45.0)   # X orientations tried, from 45 deg to the blocks' long side
+ROW_PITCH_RANGE_MM = (21.0, 30.0) # flat blocks this far apart (centre to centre, across) lie side by side...
+ROW_PARALLEL_DEG = 6.0            # ...when parallel within this...
+ROW_END_OFFSET_MM = 15.0          # ...and their ends are within this of each other ("perfectly adjacent", operator 30 Oct)
+PUSH_OUT_MM = 55.0                # a middle block is slid this far along its length: a side grip at its sticking-out end
+                                  # (claws 15 mm off centre, 45 mm wide) then clears its neighbours' ends by 10 mm
+PUSH_OUT_GAP_MM = 15.0            # the claws come down this far beyond the middle block's end
+PUSH_OUT_LOWER_MARGIN_MM = 4.0    # where they come down, nothing may lie within this of the turned claws (16 mm wide)
+CLAWS_ACROSS_MM = 2 * CLAW_THICKNESS_MM   # closed claws turned edge-on: their width across the push
 PUSH_EXTRA_MM = 8.0               # shove past the point where the gaps have closed
 ADJACENT_CLEARANCE_MM = 1.5       # placing exactly one pitch away nudged the neighbour; leave this much and push later
 MAX_RESCANS = 2                   # consecutive re-captures without a placement before the flow gives up on the layer
@@ -57,13 +80,21 @@ DEFAULT_ARM_SPEED_DEG_S = 180.0   # restore value when the operator gave no --ar
 DEFAULT_APPROACH_SPEED_DEG_S = 40.0
 DEFAULT_PUSH_SPEED_DEG_S = 30.0
 DEFAULT_ALIGN_SPEED_DEG_S = 90.0  # wrist rotations when aligning the claws over a block or the row (45 felt slow: operator, 30 Oct)
+NEAR_TABLE_BANDS = ((100.0, 60.0), (40.0, 20.0))   # (claw tips below this height above the table, speed cap deg/s).
+                                  # Operator, 30 Oct: full speed from 100 mm up, 60 deg/s between 40 and 100 mm; below
+                                  # 40 mm the 20 deg/s that held the bundle on run 9's lift (after it slid out on run 8's
+                                  # 180 deg/s lift). Was 20 below 300 mm: the carry to the pallet runs 100 mm up and
+                                  # crawled (run 11: 23 s for the third block's 446 mm, run 8 without a cap 8-10 s).
+ZONE_EDGE_MM = 0.5                # a move ending this close to a band's edge counts as at the edge (100 mm after a lift)
 ROW_ALIGN_TOLERANCE_MM = 2.0      # a pallet block whose end sticks out past the last block's by more is pushed back (spec, 30 Oct)
 ALIGN_START_GAP_MM = 10.0         # end alignment: the claws come down this far past the block's end (5 was too close: operator, 30 Oct)
 LOW_TRAVEL_TIPS_MM = 30.0         # pallet push stage: closed claws travel this high, over 15 mm block tops with 15 to spare
 LOW_TRAVEL_MARGIN_MM = 10.0       # anything taller than LOW_TRAVEL_TIPS_MM minus this near the path is gone over, not through
 LOW_PATH_HALF_WIDTH_MM = 65.0     # path clearance: claw face half-width 22.5 + a block's half-length 37.5 + 5
 PUSH_SEGMENT_MM = 25.0            # a push stroke is planned in segments no longer than this (long constrained moves
-                                  # stalled viam-server's heartbeat on 30 Oct: "Lost connection" during a 60 mm push)
+                                  # stalled viam-server's heartbeat on 30 Oct: "Lost connection" during a 60 mm push).
+                                  # Only with sessions on: that loss came from the session's 1 s connectivity probe,
+                                  # which --no-sessions turns off, so then a stroke is one continuous move.
 
 
 def release_spacing_mm(grasp_style, finger, block_width_mm, base_spacing_mm):
@@ -153,6 +184,202 @@ def knock_plan(block_xy, top_long_deg, obstacles, avoid, dims, forbidden=None, u
     return None
 
 
+def flatten_sweep_plan(rng, targets, obstacles, avoid, dims, forbidden=None, tries=FLATTEN_TRIES):
+    """One random sweep through the heap to knock blocks flat (operator request, 30 Oct: after going home, sweep a few
+    times at random so the heap is flatter). Each draw takes a random block centre from `targets` and a random
+    direction. The closed claws come down on bare table behind it: the nearest spot, 10 to FLATTEN_MAX_BACK_MM back,
+    where their footprint grown by KNOCK_LOWER_MARGIN_MM overlaps no block in `obstacles` (as in knock_plan). They sweep
+    through the block to FLATTEN_PAST_MM past its centre with the tips FLATTEN_TIPS_ABOVE_FLAT_MM above a flat block's
+    top. Blocks ahead may be carried FLATTEN_CARRY_MM further, so that whole line, widened by half the claw face, must
+    keep out of every (centre, radius) in avoid, and no point on it may be forbidden(xy).
+    Returns {target_xy, u_deg, start_xy, end_xy, distance_mm, tips_mm} or None when no draw passes."""
+    tips = dims.height_mm + FLATTEN_TIPS_ABOVE_FLAT_MM
+    rects = [block_footprint(o["xy"], o["long_deg"], o["size"]) for o in obstacles]
+    for _ in range(tries):
+        t = rng.choice(targets)
+        u_deg = rng.uniform(0.0, 360.0)
+        ux, uy = math.cos(math.radians(u_deg)), math.sin(math.radians(u_deg))
+        start, back = None, 10.0
+        while back <= FLATTEN_MAX_BACK_MM:
+            s = (t[0] - ux * back, t[1] - uy * back)
+            lower = (s[0], s[1], u_deg, CLAW_THICKNESS_MM + KNOCK_LOWER_MARGIN_MM, CLAW_FACE_WIDTH_MM / 2 + KNOCK_LOWER_MARGIN_MM)
+            if not any(_rects_overlap(lower, r) for r in rects):
+                start = s
+                break
+            back += 5.0
+        if start is None:
+            continue
+        end = (t[0] + ux * FLATTEN_PAST_MM, t[1] + uy * FLATTEN_PAST_MM)
+        reach = (end[0] + ux * FLATTEN_CARRY_MM, end[1] + uy * FLATTEN_CARRY_MM)
+        if any(point_segment_distance(c, start, reach) < r + CLAW_FACE_WIDTH_MM / 2 for c, r in avoid):
+            continue
+        if forbidden is not None and any(forbidden((start[0] + (reach[0] - start[0]) * k / 20, start[1] + (reach[1] - start[1]) * k / 20))
+                                         for k in range(21)):
+            continue
+        return {"target_xy": tuple(t), "u_deg": u_deg, "start_xy": start, "end_xy": end, "distance_mm": back + FLATTEN_PAST_MM,
+                "tips_mm": tips}
+    return None
+
+
+def cross_sweep_plan(heap, obstacles, line_deg, avoid, forbidden=None, bounds=None):
+    """One stroke of the X sweep of a packed heap's bottom layer (operator request, 30 Oct: if two looks find nothing to
+    pick, sweep the bottom layer in an X). heap: the loose blocks as {"xy", "long_deg", "size", "top"}; the stroke runs
+    along line_deg (either way) through their mean centre with the claw tips PUSH_TIPS_MM above the table, so it pushes
+    the blocks lying on the table. The closed claws come down on bare table at least XSWEEP_ARM_MM before the centre
+    (the nearest spot up to XSWEEP_MAX_BACK_MM further out whose footprint grown by KNOCK_LOWER_MARGIN_MM overlaps no
+    block in `obstacles`) and stop XSWEEP_ARM_MM past it. Blocks carried ahead may end up FLATTEN_CARRY_MM further, so
+    that whole line, widened by half the claw face, must keep out of every (centre, radius) in avoid, off forbidden
+    points, and (start and carried end) inside bounds ((xmin, xmax), (ymin, ymax)) less XSWEEP_BOUNDS_MARGIN_MM.
+    Of the two ways along the line, the one whose carried end has more room wins.
+    Returns {u_deg, start_xy, end_xy, centre_xy, distance_mm, tips_mm, room_mm} or None."""
+    if not heap:
+        return None
+    cx = sum(o["xy"][0] for o in heap) / len(heap)
+    cy = sum(o["xy"][1] for o in heap) / len(heap)
+    rects = [block_footprint(o["xy"], o["long_deg"], o["size"]) for o in obstacles]
+
+    def inside(p):
+        if bounds is None:
+            return True
+        (x0, x1), (y0, y1) = bounds
+        m = XSWEEP_BOUNDS_MARGIN_MM
+        return x0 + m <= p[0] <= x1 - m and y0 + m <= p[1] <= y1 - m
+    best = None
+    for u_deg in (line_deg, line_deg + 180.0):
+        ux, uy = math.cos(math.radians(u_deg)), math.sin(math.radians(u_deg))
+        start, back = None, XSWEEP_ARM_MM
+        while back <= XSWEEP_ARM_MM + XSWEEP_MAX_BACK_MM:
+            s = (cx - ux * back, cy - uy * back)
+            lower = (s[0], s[1], u_deg, CLAW_THICKNESS_MM + KNOCK_LOWER_MARGIN_MM, CLAW_FACE_WIDTH_MM / 2 + KNOCK_LOWER_MARGIN_MM)
+            if not any(_rects_overlap(lower, r) for r in rects):
+                start = s
+                break
+            back += 5.0
+        if start is None:
+            continue
+        end = (cx + ux * XSWEEP_ARM_MM, cy + uy * XSWEEP_ARM_MM)
+        reach = (end[0] + ux * FLATTEN_CARRY_MM, end[1] + uy * FLATTEN_CARRY_MM)
+        if any(point_segment_distance(c, start, reach) < r + CLAW_FACE_WIDTH_MM / 2 for c, r in avoid):
+            continue
+        if forbidden is not None and any(forbidden((start[0] + (reach[0] - start[0]) * k / 20, start[1] + (reach[1] - start[1]) * k / 20))
+                                         for k in range(21)):
+            continue
+        if not (inside(start) and inside(reach)):
+            continue
+        room = min([math.dist(reach, c) - r for c, r in avoid] or [float("inf")])
+        plan = {"u_deg": u_deg % 360.0, "start_xy": start, "end_xy": end, "centre_xy": (cx, cy),
+                "distance_mm": math.dist(start, end), "tips_mm": PUSH_TIPS_MM, "room_mm": room}
+        if best is None or plan["room_mm"] > best["room_mm"]:
+            best = plan
+    return best
+
+
+def x_sweep_line(heap, obstacles, base_deg, avoid, forbidden=None, bounds=None):
+    """The X's first line (the second is 90 deg to it): of base_deg turned by each of XSWEEP_TURNS_DEG, the first with
+    the most strokes cross_sweep_plan finds clear now. Returns (line_deg, strokes_clear)."""
+    best = (base_deg, 0)
+    for turn in XSWEEP_TURNS_DEG:
+        n = sum(1 for k in (0, 1) if cross_sweep_plan(heap, obstacles, base_deg + turn + 90.0 * k, avoid, forbidden, bounds))
+        if n > best[1]:
+            best = (base_deg + turn, n)
+        if n == 2:
+            break
+    return best
+
+
+def side_by_side_rows(blocks, block_height_mm=15.0):
+    """Rows of three or more flat blocks lying side by side on the table (operator, 30 Oct: "3 or more blocks perfectly
+    adjacent to each other on the bottom layer"): parallel within ROW_PARALLEL_DEG, ROW_PITCH_RANGE_MM apart across their
+    long sides and with their ends within ROW_END_OFFSET_MM. blocks: {"xy", "long_deg", "top"}; only those whose top is
+    between half a block and 1.4 blocks (lying flat on the table) count. Returns lists of indices into blocks, each
+    ordered across its row."""
+    flat = [i for i, b in enumerate(blocks) if b.get("top") is not None and 0.5 * block_height_mm <= b["top"] <= 1.4 * block_height_mm]
+
+    def adjacent(i, j):
+        a, b = blocks[i], blocks[j]
+        if abs(wrap_90(a["long_deg"] - b["long_deg"])) > ROW_PARALLEL_DEG:
+            return False
+        t = math.radians((a["long_deg"] + (a["long_deg"] + wrap_90(b["long_deg"] - a["long_deg"]))) / 2)
+        dx, dy = b["xy"][0] - a["xy"][0], b["xy"][1] - a["xy"][1]
+        along, across = dx * math.cos(t) + dy * math.sin(t), -dx * math.sin(t) + dy * math.cos(t)
+        return abs(along) <= ROW_END_OFFSET_MM and ROW_PITCH_RANGE_MM[0] <= abs(across) <= ROW_PITCH_RANGE_MM[1]
+    group = {i: i for i in flat}
+
+    def root(i):
+        while group[i] != i:
+            i = group[i]
+        return i
+    for i in flat:
+        for j in flat:
+            if i < j and adjacent(i, j):
+                group[root(i)] = root(j)
+    rows = []
+    for r in {root(i) for i in flat}:
+        members = [i for i in flat if root(i) == r]
+        if len(members) < 3:
+            continue
+        t = math.radians(blocks[members[0]]["long_deg"])
+        members.sort(key=lambda i: -blocks[i]["xy"][0] * math.sin(t) + blocks[i]["xy"][1] * math.cos(t))
+        run = [members[0]]
+        for i in members[1:]:                       # keep only unbroken chains of neighbours
+            if adjacent(run[-1], i):
+                run.append(i)
+            else:
+                if len(run) >= 3:
+                    rows.append(run)
+                run = [i]
+        if len(run) >= 3:
+            rows.append(run)
+    return rows
+
+
+def push_out_plan(row, obstacles, avoid, dims, forbidden=None, bounds=None):
+    """Pushes that slide the middle blocks of a side-by-side row out along their length (operator, 30 Oct: "sweep them so
+    that the gripper moves into the ends of the middle ones"). row: the row's blocks in order across, as
+    {"xy", "long_deg", "size", "top"}; obstacles: every block, the row's included. For each middle block, sides
+    alternating from one to the next: the closed claws, turned edge-on (CLAWS_ACROSS_MM wide, narrower than the 25 mm
+    end so the neighbours' ends are not caught), come down PUSH_OUT_GAP_MM beyond its end on bare table (nothing within
+    PUSH_OUT_LOWER_MARGIN_MM) and push it PUSH_OUT_MM along its length with the tips PUSH_TIPS_MM above the table. Its
+    new place must overlap no block outside the row, keep out of every (centre, radius) in avoid, not be forbidden and
+    lie inside bounds; otherwise the other side is tried. Returns [{index, block_xy, u_deg, start_xy, distance_mm,
+    claws_close_deg, tips_mm}] for the middle blocks that have a clear push."""
+    length, width = dims.length_mm, dims.width_mm
+    members = {id(b) for b in row}
+    others = [block_footprint(o["xy"], o["long_deg"], o["size"]) for o in obstacles if id(o) not in members]
+    every = [block_footprint(o["xy"], o["long_deg"], o["size"]) for o in obstacles]
+    pushes = []
+    for k in range(1, len(row) - 1):
+        b = row[k]
+        first = 1.0 if k % 2 else -1.0
+        for s in (first, -first):
+            u_deg = b["long_deg"] + (0.0 if s > 0 else 180.0)
+            ux, uy = math.cos(math.radians(u_deg)), math.sin(math.radians(u_deg))
+            back = length / 2 + PUSH_OUT_GAP_MM + CLAW_FACE_WIDTH_MM / 2
+            start = (b["xy"][0] - ux * back, b["xy"][1] - uy * back)
+            lower = (start[0], start[1], u_deg, CLAW_FACE_WIDTH_MM / 2 + PUSH_OUT_LOWER_MARGIN_MM,
+                     CLAWS_ACROSS_MM / 2 + PUSH_OUT_LOWER_MARGIN_MM)
+            if any(_rects_overlap(lower, r) for r in every):
+                continue
+            moved = (b["xy"][0] + ux * PUSH_OUT_MM, b["xy"][1] + uy * PUSH_OUT_MM)
+            far = (moved[0] + ux * length / 2, moved[1] + uy * length / 2)
+            if any(_rects_overlap(block_footprint(moved, b["long_deg"], (length, width), 2.0), r) for r in others):
+                continue
+            if any(point_segment_distance(c, moved, far) < r for c, r in avoid):
+                continue
+            if forbidden is not None and (forbidden(moved) or forbidden(far)):
+                continue
+            if bounds is not None:
+                (x0, x1), (y0, y1) = bounds
+                if not (x0 + XSWEEP_BOUNDS_MARGIN_MM <= far[0] <= x1 - XSWEEP_BOUNDS_MARGIN_MM
+                        and y0 + XSWEEP_BOUNDS_MARGIN_MM <= far[1] <= y1 - XSWEEP_BOUNDS_MARGIN_MM):
+                    continue
+            pushes.append({"index": k, "block_xy": tuple(b["xy"]), "u_deg": u_deg % 360.0, "start_xy": start,
+                           "distance_mm": PUSH_OUT_GAP_MM + PUSH_OUT_MM, "claws_close_deg": wrap_90(u_deg + 90.0),
+                           "tips_mm": PUSH_TIPS_MM})
+            break
+    return pushes
+
+
 MISS_MATCH_MM = 15.0              # a block this close to an earlier pick's spot, at the same height and direction, was not picked
 MISS_MATCH_HEIGHT_MM = 6.0
 MISS_MATCH_DEG = 15.0
@@ -172,6 +399,40 @@ def missed_attempts(geometry, attempts, observation_id):
             and (a is None or t["long_deg"] is None or abs(wrap_90(a - t["long_deg"])) <= MISS_MATCH_DEG)]
 
 
+REFINE_BEYOND_MM = 80.0           # a heap block further than this from where the planning photo looked is measured again
+                                  # from straight above before the pick (operator, 30 Oct: blocks far to one side were
+                                  # slightly missed; run 9: measurements drift ~3 mm at 125 mm, ~5 mm at 250 mm off-centre)
+REFINE_MATCH_MM = 20.0            # the block in the close-up must lie this close to the planned centre to count as it
+
+
+def table_point_under_camera(rotation, translation_mm, table_z):
+    """Where the camera's optical axis (its z column in the base frame) meets the table plane z = table_z."""
+    ax = (rotation[0][2], rotation[1][2], rotation[2][2])
+    if abs(ax[2]) < 1e-6:
+        return None
+    s = (table_z - translation_mm[2]) / ax[2]
+    return (translation_mm[0] + s * ax[0], translation_mm[1] + s * ax[1])
+
+
+def match_block(geometry, candidates, max_mm=REFINE_MATCH_MM):
+    """The candidate in a newer capture that is the same block as `geometry`: the nearest centre within max_mm whose top
+    is within MISS_MATCH_HEIGHT_MM and long side within MISS_MATCH_DEG (as for missed picks). None if none is."""
+    p, h, a = geometry.get("base_point_mm"), geometry.get("height_above_table_mm"), geometry.get("base_long_side_deg")
+    best = None
+    for c in candidates:
+        g = c["geometry"]
+        q = g.get("base_point_mm")
+        if not p or not q or math.dist(p[:2], q[:2]) > max_mm:
+            continue
+        if h is not None and g.get("height_above_table_mm") is not None and abs(h - g["height_above_table_mm"]) > MISS_MATCH_HEIGHT_MM:
+            continue
+        if a is not None and g.get("base_long_side_deg") is not None and abs(wrap_90(a - g["base_long_side_deg"])) > MISS_MATCH_DEG:
+            continue
+        if best is None or math.dist(p[:2], q[:2]) < math.dist(p[:2], best["geometry"]["base_point_mm"][:2]):
+            best = c
+    return best
+
+
 def point_segment_distance(p, a, b):
     """Distance from point p to the segment a-b in the table plane (mm)."""
     dx, dy = b[0] - a[0], b[1] - a[1]
@@ -185,12 +446,14 @@ def pallet_push_plan(points, long_deg, block_dims, tolerance_mm=ROW_ALIGN_TOLERA
     row, points[0] the first block (the others are pushed against it), points[-1] the last (the end-alignment
     reference, never pushed along its length).
     Step 1, when the gaps exceed PUSH_IF_GAPS_OVER_MM: start beside the last block on the side away from the first
-    (5 mm gap to the claws), push toward the first by the gaps + 10 mm; afterwards the blocks touch and the first has
-    not moved. Step 2, for every other block whose end sticks out past the last block's by more than tolerance_mm,
-    furthest first: start just past that end (end + ALIGN_START_GAP_MM + 8 mm to the claws' middle), push along the
-    block by the overhang + ALIGN_START_GAP_MM so its end stops level with the last block's. A neighbour sticking out the same way by no more is
-    caught by the claw face (face_width_mm) and lined up in the same push. Positions after step 1 are predicted, not
-    measured: the closing push moves blocks across the row only, so their offsets along it are unchanged."""
+    (5 mm gap to the claws), push toward the first by the gaps + 10 mm; afterwards the blocks touch and the whole row
+    has moved on by the 5 mm overshoot (the first block moved 6.5 and 7.6 mm in runs 8 and 9). Step 2, for every other
+    block whose end sticks out past the last block's by more than tolerance_mm, furthest first: start just past that
+    end (end + ALIGN_START_GAP_MM + 8 mm to the claws' middle), push along the block by the overhang +
+    ALIGN_START_GAP_MM so its end stops level with the last block's. The claw face (face_width_mm) is centred on the
+    block but held PUSH_FACE_CLEAR_MM off the last block, so the reference never moves; a neighbour sticking out the
+    same way by no more is caught by the face and lined up in the same push. Positions after step 1 are predicted
+    (the flow looks again after a closing push and plans step 2 from that look)."""
     w, length = block_dims.width_mm, block_dims.length_mm
     a, l = math.radians(long_deg + 90.0), math.radians(long_deg)
     ax, ay, lx, ly = math.cos(a), math.sin(a), math.cos(l), math.sin(l)
@@ -206,11 +469,12 @@ def pallet_push_plan(points, long_deg, block_dims, tolerance_mm=ROW_ALIGN_TOLERA
         back = w / 2 + CLAW_THICKNESS_MM + PUSH_START_GAP_MM
         plan["push"] = {"start_xy": (points[-1][0] + side * ax * back, points[-1][1] + side * ay * back),
                         "direction": (-side * ax, -side * ay), "distance_mm": gaps + 2 * PUSH_START_GAP_MM}
-        after = [across[0] + side * w * j for j in range(len(points))]
+        after = [across[0] + side * (w * j - PUSH_START_GAP_MM) for j in range(len(points))]
     offsets = [along[i] - along[-1] for i in range(len(points) - 1)]
     plan["offsets_mm"] = offsets
     done = set()
     reach = face_width_mm / 2 + w / 2 - 1.0
+    face_limit = side * after[-1] - w / 2 - PUSH_FACE_CLEAR_MM - face_width_mm / 2   # face centre, toward-the-last coordinate
     for i in sorted((i for i, o in enumerate(offsets) if abs(o) > tolerance_mm), key=lambda i: -abs(offsets[i])):
         if i in done:
             continue
@@ -218,10 +482,12 @@ def pallet_push_plan(points, long_deg, block_dims, tolerance_mm=ROW_ALIGN_TOLERA
         s = 1.0 if o > 0 else -1.0
         back = length / 2 + ALIGN_START_GAP_MM + CLAW_THICKNESS_MM
         at_along = along[i] + s * back
+        face = side * min(side * after[i], face_limit)
         also = [j for j, oj in enumerate(offsets) if j != i and j not in done and (oj > 0) == (o > 0)
-                and abs(oj) <= abs(o) and abs(after[j] - after[i]) <= reach]
-        plan["ends"].append({"index": i, "offset_mm": o, "start_xy": (at_along * lx + after[i] * ax, at_along * ly + after[i] * ay),
-                             "direction": (-s * lx, -s * ly), "distance_mm": abs(o) + ALIGN_START_GAP_MM, "also_lines_up": also})
+                and abs(oj) <= abs(o) and abs(after[j] - face) <= reach]
+        plan["ends"].append({"index": i, "offset_mm": o, "start_xy": (at_along * lx + face * ax, at_along * ly + face * ay),
+                             "direction": (-s * lx, -s * ly), "distance_mm": abs(o) + ALIGN_START_GAP_MM, "also_lines_up": also,
+                             "face_off_block_mm": face - after[i]})
         done |= {i, *also}
     return plan
 
@@ -273,6 +539,11 @@ class Episode:
 
 
 class Robot:
+    zone = None              # (table_z, bands) once set_near_table_zone is called; bands ((below_mm, speed), ...) highest first
+    requested_speed = None   # the speed the flow asked for with set_speed
+    applied_speed = None     # the speed last sent to the arm
+    cap_paused = False       # True during a sweep (closed, empty claws): the near-table cap does not apply
+
     def __init__(self, client, config):
         from viam.components.arm import Arm
         from viam.components.gripper import Gripper
@@ -285,6 +556,37 @@ class Robot:
         self.near_table = Constraints(linear_constraint=[LinearConstraint()],
                                       collision_specification=[CollisionSpecification(
                                           allows=[CollisionSpecification.AllowedFrameCollisions(frame1="gripper", frame2="table")])])
+
+    def set_near_table_zone(self, table_z, travel_speed, bands=NEAR_TABLE_BANDS):
+        """From here on, a move whose claw tips get lower than a band's height above table_z runs at that band's speed at
+        most (the lowest band reached wins), and a move that crosses band heights is split at them. set_speed then
+        records the speed asked for; each move applies it, capped. travel_speed is what moves above every band use
+        until the flow asks for another speed."""
+        self.zone = (table_z, tuple(sorted(bands, reverse=True)))
+        if self.requested_speed is None:
+            self.requested_speed = travel_speed
+
+    async def _apply_speed(self, deg_s):
+        if deg_s is None or deg_s == self.applied_speed:
+            return None
+        try:
+            result = await asyncio.wait_for(self.arm.do_command({"set_speed": float(deg_s)}), timeout=5)
+        except Exception as exc:  # noqa: BLE001 - a module without the key must not stop the run
+            return {"error": type(exc).__name__}
+        self.applied_speed = deg_s
+        return result
+
+    def _zone_speed(self, lowest_tips_mm, rotation_only=False):
+        """The speed for a move whose claw tips get as low as lowest_tips_mm: the requested one, capped at the zone
+        speed in the zone. Turning the claws in place is not capped (operator, 30 Oct: turn at 90 deg/s), nor is a
+        sweep (cap_paused: empty claws, nothing to drop)."""
+        caps = [speed for below, speed in self.zone[1] if lowest_tips_mm < below - ZONE_EDGE_MM]
+        if not caps or rotation_only or self.cap_paused:
+            return self.requested_speed
+        return min(caps) if self.requested_speed is None else min(self.requested_speed, min(caps))
+
+    async def tips_above_table(self):
+        return (await self.gripper_origin())[2] + TIP_ABOVE_GRIPPER_FRAME_MM - self.zone[0]
 
     async def point_in_world(self, frame, x=0.0, y=0.0, z=0.0):
         from viam.proto.common import Pose, PoseInFrame
@@ -308,8 +610,12 @@ class Robot:
         return math.degrees(math.atan2(y[1] - o[1], y[0] - o[0]))
 
     async def set_speed(self, deg_s):
-        """Joint speed via the arm module's do_command (UFactory xArm key). None leaves the speed alone."""
+        """Joint speed via the arm module's do_command (UFactory xArm key). None leaves the speed alone. With a
+        near-table zone set, the speed is recorded and applied by the next move (capped while the claw tips are low)."""
         if deg_s is None:
+            return None
+        if self.zone is not None:
+            self.requested_speed = deg_s
             return None
         try:
             return await asyncio.wait_for(self.arm.do_command({"set_speed": float(deg_s)}), timeout=5)
@@ -378,7 +684,27 @@ class Robot:
                 "arm_moving": await self.arm.is_moving(), "gripper_moving": await self.gripper.is_moving()}
 
     async def move_delta(self, dx=0.0, dy=0.0, dz=0.0, rotate=0.0, near_table=False):
-        """Shift the flange by (dx, dy, dz) mm in world and spin theta by `rotate` degrees, planner-checked (Sam's move)."""
+        """Shift the flange by (dx, dy, dz) mm in world and spin theta by `rotate` degrees, planner-checked (Sam's move).
+        With near-table bands set, a move that crosses band heights is split at them, each part at its band's speed
+        (the requested speed above every band). A refused part stops the move."""
+        if self.zone is None:
+            return await self._planned_move(dx, dy, dz, rotate, near_table)
+        h0 = await self.tips_above_table()
+        h1 = h0 + dz
+        cuts = sorted({b for b, _ in self.zone[1] if min(h0, h1) < b < max(h0, h1)}, reverse=dz < 0)
+        if not cuts:
+            await self._apply_speed(self._zone_speed(min(h0, h1), rotation_only=bool(rotate) and not (dx or dy or dz)))
+            return await self._planned_move(dx, dy, dz, rotate, near_table)
+        heights = [h0] + cuts + [h1]
+        for a, b in zip(heights, heights[1:]):
+            f = (b - a) / dz
+            await self._apply_speed(self._zone_speed(min(a, b)))
+            ok, target = await self._planned_move(dx * f, dy * f, b - a, rotate * f, near_table)
+            if not ok:
+                return ok, target
+        return ok, target
+
+    async def _planned_move(self, dx, dy, dz, rotate, near_table):
         from viam.proto.common import Pose, PoseInFrame
         cur = await self.flange_pose()
         target = Pose(x=cur.x + dx, y=cur.y + dy, z=cur.z + dz, o_x=cur.o_x, o_y=cur.o_y, o_z=cur.o_z, theta=cur.theta + rotate)
@@ -387,7 +713,13 @@ class Robot:
         return ok, [round(target.x, 1), round(target.y, 1), round(target.z, 1), round(target.theta, 1)]
 
     async def move_to(self, x, y, z):
+        """Free move of the flange to (x, y, z), gripper pointing down. With a near-table zone set, the whole move runs
+        at the zone speed if either end has the claw tips in the zone (a free path cannot be split at a height)."""
         from viam.proto.common import Pose, PoseInFrame
+        if self.zone is not None:
+            h0 = await self.tips_above_table()
+            h1 = h0 + z - (await self.flange_pose()).z
+            await self._apply_speed(self._zone_speed(min(h0, h1)))
         target = Pose(x=x, y=y, z=z, o_x=0, o_y=0, o_z=-1, theta=0)
         ok = await self.motion.move("arm", PoseInFrame(reference_frame="world", pose=target), timeout=MOVE_TIMEOUT_S)
         return ok, [x, y, z]
@@ -424,7 +756,8 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                    keep_out_xy=None, view_pose=None, direct_local=False, drop_unseen_filled=False,
                    place_spacing_mm=PLACE_SPACING_MM, grip_retries=1, references="none", approach_speed=DEFAULT_APPROACH_SPEED_DEG_S,
                    push_speed=DEFAULT_PUSH_SPEED_DEG_S, skip_if_complete=False, layers=2, disable_sessions=False,
-                   align_speed=DEFAULT_ALIGN_SPEED_DEG_S, drop_spot_xy=None, knock_over=False):
+                   align_speed=DEFAULT_ALIGN_SPEED_DEG_S, drop_spot_xy=None, knock_over=False,
+                   near_table_bands=NEAR_TABLE_BANDS, flatten_sweeps=0, flatten_seed=None, x_sweeps=0, push_outs=0):
     """One connection, one capture: segment, rank, then place blocks back to back. The next slot is positioned from the
     previous block's *actual* release pose (plus one pitch along the row) rather than the nominal slot, so release
     nudges do not accumulate. Grasp per slot: ends when the slot touches a placed neighbour, else middle/side/ends.
@@ -443,6 +776,15 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
     vector search ahead of the rest (the SKY-66 retrieval; "atlas" needs MONGODB_URI and ALLOW_CLOUD).
     approach_speed / push_speed: joint speed (deg/s) for the last APPROACH_MM of every descent and for the row push;
     the travel speed (arm_speed, else DEFAULT_ARM_SPEED_DEG_S) is restored afterwards. None disables the switch.
+    near_table_bands: ((height_mm, speed_cap_deg_s), ...) for moves with the claw tips below those heights above the
+    table, set once the first capture gives the table height (Robot.set_near_table_zone). None or () turns it off.
+    flatten_sweeps: after the first capture from home, up to this many random sweeps through the heap (flatten_heap)
+    before any pick, when the pallet still has an open slot; flatten_seed fixes the random draws (default: a new seed,
+    recorded in the events).
+    x_sweeps: when MAX_RESCANS looks in a row find nothing to pick, sweep the heap's bottom layer in an X (x_sweep) and
+    look again, up to this many times per run, before stopping.
+    push_outs: before that, when three or more flat blocks lie side by side, slide their middle ones out along their
+    length (push_out_rows), up to this many rows per run.
     skip_if_complete: when the first capture already shows the full layer on the pallet, return at once (no push
     rounds, no final capture) so the caller can go straight to stacking.
     layers: how many layers this target may receive. A pallet is 1: blocks are never stacked on the pallet spot.
@@ -563,6 +905,10 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
         proposal.save_context(ctx, {"kind": "flow_start"}, Path(data_dir) / "live" / "proposals" / obs["observation_id"])
         calib = scene["calibration"]
         table_z = calib.support_surface.z_in_robot_base_mm
+        if near_table_bands:
+            bot.set_near_table_zone(table_z, travel_speed or DEFAULT_ARM_SPEED_DEG_S, bands=near_table_bands)
+            ep.event("flow", phase="near_table_speed", bands=[list(b) for b in bot.zone[1]],
+                     travel_speed_deg_s=travel_speed or DEFAULT_ARM_SPEED_DEG_S)
         target = TowerTarget(tuple(tower_origin), calib.support_surface, calib.block, calib.finger, 0.0, layers=layers, gap_mm=gap_mm)
         # Slots evaluated with the release spacing: a neighbour place_spacing_mm away leaves claw room, so the
         # middle/side grasps stay allowed and the row is not limited to the ends ("wide way") grasp.
@@ -748,26 +1094,88 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 ep.state["pallet_count"] = len(row0)
                 ep.save()
                 return 0
+        async def look_closer(geo, label, candidate_id, what):
+            """The block measured again from straight above, when it lies more than REFINE_BEYOND_MM from where the
+            planning photo looked: the camera is moved over it, a capture is taken, and match_block finds it there.
+            Returns (geometry, off_centre_mm, observation_id); geometry None when not needed, not possible or not found
+            (events `<what>_refine_skipped` / `<what>_refine_no_match`)."""
+            p0 = geo["base_point_mm"]
+            ext = scene["calibration"].extrinsics
+            centre = table_point_under_camera(ext.rotation, ext.translation_mm, table_z) if ext is not None else None
+            off = math.dist(p0[:2], centre) if centre else None
+            if off is None or off < REFINE_BEYOND_MM:
+                return None, off, None
+            from .capture import read_camera_pose
+            g = await bot.gripper_origin()
+            cam = await read_camera_pose(client, config.camera_resource)
+            under = table_point_under_camera(cam["rotation"], cam["translation_mm"], table_z) if cam.get("status") == "read" else None
+            ox, oy = (under[0] - g[0], under[1] - g[1]) if under else (0.0, 0.0)    # camera's view centre relative to the gripper
+            ok, _ = await bot.move_delta(dx=p0[0] - ox - g[0], dy=p0[1] - oy - g[1])
+            if not ok:
+                ep.event("flow", phase=f"{what}_refine_skipped", slot=label, candidate=candidate_id, reason="hover_refused")
+                return None, off, None
+            obs_r, scene_r = await scene_from_capture()
+            ctx_r = proposal.build_context(scene_r, tower_origin_xy_mm=tower_origin, filled_slots=filled, dry_run=True, tower_gap_mm=gap_mm)
+            c = match_block(geo, ctx_r["candidates"])
+            if c is None:
+                ep.event("flow", phase=f"{what}_refine_no_match", slot=label, candidate=candidate_id, observation_id=obs_r["observation_id"],
+                         planned_xy=[round(v, 1) for v in p0[:2]], off_centre_mm=round(off, 1))
+                print(f"{label}: close-up found no block within {REFINE_MATCH_MM:.0f} mm of ({p0[0]:.0f}, {p0[1]:.0f}); using the planned position", flush=True)
+                return None, off, obs_r["observation_id"]
+            return c["geometry"], off, obs_r["observation_id"]
+
+        async def refine_pick(pick, grasp, label):
+            """Measure a heap block again from straight above before the claws go down (operator, 30 Oct: blocks far to
+            one side were slightly missed). Positions from the home photo drift with distance from where the camera
+            looks (run 9: the same blocks ~3 mm apart at 125 mm off-centre, ~5 mm at 250 mm), and an ends grip has only
+            ~6 mm spare at each end (open claws read 853 = ~87 mm, a 75 mm block 730). For a block more than
+            REFINE_BEYOND_MM from that point, the camera is moved over the block, a capture is taken, and the same
+            block (match_block) gives the new centre and angle; the grip point keeps its place along the block.
+            Returns (geometry, grip_xy, claws_close_deg); the planned ones when it is not needed or not possible."""
+            geo = pick["geometry"]
+            p0 = geo["base_point_mm"]
+            grip = grasp.get("grip_point_mm") or p0
+            close_deg = grasp.get("claws_close_direction_deg_in_base")
+            new, off, obs_id = await look_closer(geo, label, pick["candidate_id"], "pick")
+            if new is None:
+                return geo, grip, close_deg
+            q = new["base_point_mm"]
+            da = wrap_90(new["base_long_side_deg"] - geo["base_long_side_deg"]) \
+                if new.get("base_long_side_deg") is not None and geo.get("base_long_side_deg") is not None else 0.0
+            vx, vy = grip[0] - p0[0], grip[1] - p0[1]
+            ca, sa = math.cos(math.radians(da)), math.sin(math.radians(da))
+            grip_new = (q[0] + ca * vx - sa * vy, q[1] + sa * vx + ca * vy)
+            close_new = wrap_90(close_deg + da) if close_deg is not None else None
+            moved = math.dist(p0[:2], q[:2])
+            ep.event("flow", phase="pick_refined", slot=label, candidate=pick["candidate_id"], observation_id=obs_id,
+                     off_centre_mm=round(off, 1), planned_xy=[round(v, 1) for v in p0[:2]], refined_xy=[round(v, 1) for v in q[:2]],
+                     moved_mm=round(moved, 1), angle_change_deg=round(da, 1), grip_xy=[round(v, 1) for v in grip_new])
+            print(f"{label}: close-up moved the block {moved:.1f} mm to ({q[0]:.0f}, {q[1]:.0f}), angle {da:+.1f} deg "
+                  f"(it was {off:.0f} mm from the photo's centre)", flush=True)
+            return new, grip_new, close_new
+
         async def grab_block(pick, grasp, tips, label):
             """Hover, align the claws, descend and grab, with the gripper's own report as the grip check and a bounded
             retry of the same movement. Returns (stop_reason, held, travel_z, attempts, aligned); held is the block
-            centre in the gripper frame."""
-            bx, by, bz = pick["geometry"]["base_point_mm"]
+            centre in the gripper frame. The claws come down on the grasp's grip point (the centre, or 15 mm along the
+            block for a side grip), after refine_pick has measured a block far from the photo's centre again."""
+            geo, grip, close_deg = await refine_pick(pick, grasp, label)
+            bx, by, bz = geo["base_point_mm"]
+            gx, gy = grip[0], grip[1]
             g0 = await bot.gripper_origin()
             travel_z = g0[2]
-            close_deg = grasp.get("claws_close_direction_deg_in_base")
             stop_reason, held, aligned = None, None, False
             attempt = 0
             while True:
                 attempt += 1
                 await bot.gripper.open()   # always approach with open claws (after a push the gripper is closed)
                 g = await bot.gripper_origin()
-                ok, _ = await bot.move_delta(dx=bx - g[0], dy=by - g[1])
+                ok, _ = await bot.move_delta(dx=gx - g[0], dy=gy - g[1])
                 if not ok:
                     stop_reason = "hover_refused"; break
                 aligned, log = await bot.align_claws(close_deg, align_speed=align_speed, travel_speed=travel_speed)
                 g = await bot.gripper_origin()
-                ok, _ = await bot.move_delta(dx=bx - g[0], dy=by - g[1])   # re-centre: rotating moves the gripper origin
+                ok, _ = await bot.move_delta(dx=gx - g[0], dy=gy - g[1])   # re-centre: rotating moves the gripper origin
                 ok = await bot.descend_to(table_z + tips - TIP_ABOVE_GRIPPER_FRAME_MM, approach_speed, travel_speed)
                 if not ok:
                     await bot.set_speed(travel_speed)
@@ -865,6 +1273,218 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                     return c
             return None
 
+        async def sweep_stroke(start_xy, u_deg, tips_mm, distance_mm, claws_deg=None):
+            """Closed claws come down at start_xy, push distance_mm along u_deg with the tips tips_mm above the table
+            (claws closing along u_deg, the 45 mm face leading, unless claws_deg turns them; edge-on for a push-out),
+            rise to travel height, open and go home. Returns (stroke_completed, home_accepted). The claws are empty, so
+            the near-table cap is paused (operator, 30 Oct: speed up sweeping): travel speed down to APPROACH_MM above
+            the stroke height, approach speed for the rest, push speed for the stroke, travel speed back up."""
+            ux, uy = math.cos(math.radians(u_deg)), math.sin(math.radians(u_deg))
+            sx, sy = start_xy
+            await bot.gripper.grab()                     # closed claws are the pusher
+            g0 = await bot.gripper_origin()
+            travel_z = g0[2]
+            bot.cap_paused = True
+            try:
+                ok, _ = await bot.move_delta(dx=sx - g0[0], dy=sy - g0[1])
+                if ok:
+                    await bot.align_claws(wrap_90(u_deg) if claws_deg is None else claws_deg, tolerance_deg=1.5,
+                                          align_speed=align_speed, travel_speed=travel_speed)
+                    g1 = await bot.gripper_origin()
+                    ok, _ = await bot.move_delta(dx=sx - g1[0], dy=sy - g1[1])
+                if ok:
+                    ok = await bot.descend_to(table_z + tips_mm - TIP_ABOVE_GRIPPER_FRAME_MM, approach_speed, travel_speed)
+                if ok:
+                    await bot.set_speed(push_speed)
+                    ok = await slide(ux, uy, distance_mm)
+                await bot.set_speed(travel_speed)
+                g2 = await bot.gripper_origin()
+                await bot.move_delta(dz=travel_z - g2[2], near_table=True)
+            finally:
+                bot.cap_paused = False
+            await bot.gripper.open()
+            ok_home, _ = await bot.move_to(*home)
+            return ok, ok_home
+
+        async def flatten_heap(sweeps):
+            """Before picking (operator, 30 Oct): `sweeps` random sweeps through the heap with the closed claws, so blocks
+            on their edge, on end or on another block fall flat. Each sweep is planned from a fresh capture
+            (flatten_sweep_plan), aimed at a heap block taller than the sweep and kept clear of the pallet, its row lane,
+            the keep-out and the drop spot; then the arm goes home and captures again. Ends early when nothing in the
+            heap stands above the sweep height, no random draw passes the checks, or a move is refused (no retry).
+            Returns a stop reason (event recorded) or None to carry on with picking."""
+            nonlocal obs, scene, ctx, queue
+            seed = flatten_seed if flatten_seed is not None else random.SystemRandom().randrange(2 ** 32)
+            rng = random.Random(seed)
+            tips = calib.block.height_mm + FLATTEN_TIPS_ABOVE_FLAT_MM
+            clear = footprint_clearance_mm(target) + 10.0
+            avoid = [(tuple(tower_origin), clear)] + ([(tuple(keep_out_xy), clear)] if keep_out_xy is not None else []) \
+                + ([(tuple(drop_spot_xy), DROP_CLEAR_MM)] if drop_spot_xy is not None else [])
+
+            def taller_heap_blocks():
+                blocks = [c["geometry"] for c in ctx["candidates"] if c["geometry"].get("base_point_mm")]
+                tall = [tuple(g["base_point_mm"][:2]) for g in blocks
+                        if (g.get("height_above_table_mm") or 0.0) > tips and not in_row_lane(g, any_height=True)
+                        and all(math.dist(g["base_point_mm"][:2], c) >= r for c, r in avoid)]
+                return blocks, tall
+
+            for i in range(1, sweeps + 1):
+                blocks, tall = taller_heap_blocks()
+                if not tall:
+                    ep.event("flow", phase="flatten_done", sweeps_done=i - 1, reason="nothing_above_sweep_height", tips_mm=tips, seed=seed)
+                    print(f"Flatten: nothing in the heap stands above {tips:.0f} mm; {i - 1} sweep(s) done", flush=True)
+                    return None
+                plan = flatten_sweep_plan(rng, tall, [block_obstacle(g) for g in blocks], avoid, calib.block,
+                                          forbidden=lambda xy: in_row_lane({"base_point_mm": xy}, any_height=True))
+                if plan is None:
+                    ep.event("flow", phase="flatten_done", sweeps_done=i - 1, reason="no_clear_sweep", taller_than_sweep=len(tall), seed=seed)
+                    print(f"Flatten: no random sweep clears the pallet, tower and drop spot with bare table to come down on; "
+                          f"{i - 1} sweep(s) done", flush=True)
+                    return None
+                ep.event("flow", phase="flatten_sweep", sweep=i, sweeps=sweeps, seed=seed, taller_than_sweep=len(tall),
+                         target_xy=[round(v, 1) for v in plan["target_xy"]], direction_deg=round(plan["u_deg"], 1),
+                         start_xy=[round(v, 1) for v in plan["start_xy"]], end_xy=[round(v, 1) for v in plan["end_xy"]],
+                         distance_mm=round(plan["distance_mm"], 1), tips_mm=round(plan["tips_mm"], 1))
+                print(f"Flatten {i}/{sweeps}: sweeping through ({plan['target_xy'][0]:.0f}, {plan['target_xy'][1]:.0f}) toward "
+                      f"{plan['u_deg']:.0f} deg, {plan['distance_mm']:.0f} mm at {plan['tips_mm']:.0f} mm ({len(tall)} block(s) above that)", flush=True)
+                stroke_ok, home_ok = await sweep_stroke(plan["start_xy"], plan["u_deg"], plan["tips_mm"], plan["distance_mm"])
+                if not home_ok:
+                    ep.event("flow", phase="stop", reason="view_pose_refused_after_flatten")
+                    return "view_pose_refused_after_flatten"
+                obs, scene = await scene_from_capture()
+                ctx = await context_for(scene, filled)
+                reconcile_pallet(ctx, f"after_flatten_{i}")
+                queue = build_queue(ctx, obs, scene, f"after_flatten_{i}")
+                if not stroke_ok:
+                    ep.event("flow", phase="flatten_done", sweeps_done=i, reason="move_refused", seed=seed)
+                    print(f"Flatten {i}/{sweeps}: a move was refused; no more sweeps", flush=True)
+                    return None
+            ep.event("flow", phase="flatten_done", sweeps_done=sweeps, reason="all_sweeps_done", taller_than_sweep=len(taller_heap_blocks()[1]),
+                     seed=seed)
+            return None
+
+        async def push_out_rows(label):
+            """When MAX_RESCANS looks in a row found nothing to pick and three or more flat blocks lie side by side
+            (operator, 30 Oct): slide the middle ones out along their length, the claws turned edge-on driving into
+            their ends (side_by_side_rows, push_out_plan; the longest row). Before each push the block is found again in
+            the newest capture and, if far from the photo's centre, measured from above; a capture follows every push.
+            Returns the number of pushes made (0: no row or no clear push), or "stop"."""
+            nonlocal obs, scene, ctx, queue, push_outs_used
+            clear = footprint_clearance_mm(target) + 10.0
+            avoid = [(tuple(tower_origin), clear)] + ([(tuple(keep_out_xy), clear)] if keep_out_xy is not None else []) \
+                + ([(tuple(drop_spot_xy), DROP_CLEAR_MM)] if drop_spot_xy is not None else [])
+            from .layer_stack import visible_table_extent
+            geos = [c["geometry"] for c in ctx["candidates"] if c["geometry"].get("base_point_mm") and c["geometry"].get("base_long_side_deg") is not None]
+            heap = [g for g in geos if not in_row_lane(g, any_height=True) and not geom.upright_kind(g, calib.block)
+                    and all(math.dist(g["base_point_mm"][:2], c) >= r for c, r in avoid)]
+            heap_obs = [block_obstacle(g) for g in heap]
+            other_obs = [block_obstacle(g) for g in geos if not any(g is h for h in heap)]
+            rows = side_by_side_rows(heap_obs, calib.block.height_mm)
+            if not rows:
+                return 0
+            row = max(rows, key=len)
+            seen = visible_table_extent(obs, table_z)
+            bounds = (tuple(seen["x_mm"]), tuple(seen["y_mm"])) if seen else None
+            pushes = push_out_plan([heap_obs[i] for i in row], heap_obs + other_obs, avoid, calib.block,
+                                   forbidden=lambda xy: in_row_lane({"base_point_mm": xy}, any_height=True), bounds=bounds)
+            ep.event("flow", phase="push_out_row", slot=label, row=[[round(v, 1) for v in heap_obs[i]["xy"]] for i in row],
+                     pushes=[{"index": p["index"], "direction_deg": round(p["u_deg"], 1)} for p in pushes])
+            print(f"{label}: {len(row)} flat blocks side by side; {len(pushes)} middle block(s) with a clear push out", flush=True)
+            if not pushes:
+                return 0
+            push_outs_used += 1
+            done = 0
+            for p in pushes:
+                geo = heap[row[p["index"]]]
+                if done:                                     # an earlier push may have nudged it: find it in the newest capture
+                    c = match_block(geo, ctx["candidates"])
+                    if c is None:
+                        ep.event("flow", phase="push_out_lost", slot=label, block_xy=[round(v, 1) for v in p["block_xy"]])
+                        continue
+                    geo = c["geometry"]
+                new, off, _ = await look_closer(geo, label, None, "push_out")
+                moved = math.dist(geo["base_point_mm"][:2], new["base_point_mm"][:2]) if new is not None else 0.0
+                geo = new or geo
+                a = geo["base_long_side_deg"]
+                u_deg = a if abs((p["u_deg"] - a + 180.0) % 360.0 - 180.0) <= 90.0 else a + 180.0   # same end as planned
+                ux, uy = math.cos(math.radians(u_deg)), math.sin(math.radians(u_deg))
+                back = calib.block.length_mm / 2 + PUSH_OUT_GAP_MM + CLAW_FACE_WIDTH_MM / 2
+                bx, by = geo["base_point_mm"][:2]
+                start = (bx - ux * back, by - uy * back)
+                ep.event("flow", phase="push_out", slot=label, block_xy=[round(bx, 1), round(by, 1)], close_up_moved_mm=round(moved, 1),
+                         direction_deg=round(u_deg % 360.0, 1), start_xy=[round(v, 1) for v in start], distance_mm=p["distance_mm"],
+                         tips_mm=p["tips_mm"])
+                print(f"{label}: pushing the middle block at ({bx:.0f}, {by:.0f}) out {PUSH_OUT_MM:.0f} mm toward {u_deg % 360.0:.0f} deg, "
+                      f"claws edge-on into its end", flush=True)
+                stroke_ok, home_ok = await sweep_stroke(start, u_deg, p["tips_mm"], p["distance_mm"], claws_deg=wrap_90(u_deg + 90.0))
+                if not home_ok:
+                    ep.event("flow", phase="stop", reason="view_pose_refused_after_push_out")
+                    return "stop"
+                done += 1
+                obs, scene = await scene_from_capture()
+                ctx = await context_for(scene, filled)
+                reconcile_pallet(ctx, f"after_push_out_{done}")
+                queue = build_queue(ctx, obs, scene, f"after_push_out_{done}")
+                if not stroke_ok:
+                    ep.event("flow", phase="push_out_move_refused", slot=label)
+                    break
+            return done
+
+        async def x_sweep(label):
+            """When MAX_RESCANS looks in a row found nothing to pick (operator, 30 Oct run 10: earlier sweeps had pushed the
+            heap into a packed cluster of parallel flat blocks 33-54 mm apart, every claw strip blocked): two strokes in
+            an X through the heap's bottom layer (cross_sweep_plan), at 45 deg either side of the blocks' mean long side,
+            each planned from a fresh capture and followed by one. Returns the number of strokes made, or "stop"."""
+            nonlocal obs, scene, ctx, queue, x_sweeps_used
+            x_sweeps_used += 1
+            clear = footprint_clearance_mm(target) + 10.0
+            avoid = [(tuple(tower_origin), clear)] + ([(tuple(keep_out_xy), clear)] if keep_out_xy is not None else []) \
+                + ([(tuple(drop_spot_xy), DROP_CLEAR_MM)] if drop_spot_xy is not None else [])
+            from .layer_stack import visible_table_extent
+            line = None
+            strokes = 0
+            for k in range(2):
+                blocks = [c["geometry"] for c in ctx["candidates"] if c["geometry"].get("base_point_mm")]
+                heap = [block_obstacle(g) for g in blocks if not in_row_lane(g, any_height=True)
+                        and all(math.dist(g["base_point_mm"][:2], c) >= r for c, r in avoid)]
+                obstacles = [block_obstacle(g) for g in blocks]
+                seen = visible_table_extent(obs, table_z)
+                bounds = (tuple(seen["x_mm"]), tuple(seen["y_mm"])) if seen else None
+                lane = lambda xy: in_row_lane({"base_point_mm": xy}, any_height=True)   # noqa: E731
+                if line is None:
+                    # 45 deg to the blocks' mean long side, turned as needed so both strokes have a clear way
+                    angles = [o["long_deg"] for o in heap]
+                    s2 = sum(math.sin(math.radians(2 * a)) for a in angles)
+                    c2 = sum(math.cos(math.radians(2 * a)) for a in angles)
+                    base = wrap_90(math.degrees(math.atan2(s2, c2)) / 2) + 45.0 if angles else 45.0
+                    line, clear_now = x_sweep_line(heap, obstacles, base, avoid, forbidden=lane, bounds=bounds)
+                    ep.event("flow", phase="x_sweep_start", slot=label, heap_blocks=len(heap), line_deg=round(line % 180.0, 1),
+                             strokes_clear=clear_now, bounds=seen)
+                plan = cross_sweep_plan(heap, obstacles, line + 90.0 * k, avoid, forbidden=lane, bounds=bounds)
+                if plan is None:
+                    ep.event("flow", phase="x_sweep_not_possible", slot=label, stroke=k + 1, line_deg=round((line + 90.0 * k) % 180.0, 1),
+                             heap_blocks=len(heap), note="no way along this line with bare table to come down on and the carried blocks clear")
+                    print(f"{label}: X sweep stroke {k + 1}: no clear way along {(line + 90.0 * k) % 180.0:.0f} deg; skipped", flush=True)
+                    continue
+                ep.event("flow", phase="x_sweep", slot=label, stroke=k + 1, heap_blocks=len(heap), centre_xy=[round(v, 1) for v in plan["centre_xy"]],
+                         direction_deg=round(plan["u_deg"], 1), start_xy=[round(v, 1) for v in plan["start_xy"]],
+                         end_xy=[round(v, 1) for v in plan["end_xy"]], distance_mm=round(plan["distance_mm"], 1), tips_mm=plan["tips_mm"])
+                print(f"{label}: X sweep stroke {k + 1}/2 through the heap centre ({plan['centre_xy'][0]:.0f}, {plan['centre_xy'][1]:.0f}) "
+                      f"toward {plan['u_deg']:.0f} deg, {plan['distance_mm']:.0f} mm at {plan['tips_mm']:.0f} mm", flush=True)
+                stroke_ok, home_ok = await sweep_stroke(plan["start_xy"], plan["u_deg"], plan["tips_mm"], plan["distance_mm"])
+                if not home_ok:
+                    ep.event("flow", phase="stop", reason="view_pose_refused_after_x_sweep")
+                    return "stop"
+                strokes += 1
+                obs, scene = await scene_from_capture()
+                ctx = await context_for(scene, filled)
+                reconcile_pallet(ctx, f"after_x_sweep_{k + 1}")
+                queue = build_queue(ctx, obs, scene, f"after_x_sweep_{k + 1}")
+                if not stroke_ok:
+                    ep.event("flow", phase="x_sweep_move_refused", slot=label, stroke=k + 1)
+                    break
+            return strokes
+
         async def knock_over_block(c, label):
             """Sweep an upright block (standing on its end, or on its edge) over with the closed claws, then capture and
             look at where it fell. Returns (status, reason): ("knocked", None), ("not_possible", why) with no motion, or
@@ -891,33 +1511,14 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 print(f"{label}: block {what} at ({bxy[0]:.0f}, {bxy[1]:.0f}): no sweep that clears the other blocks; leaving it", flush=True)
                 return "not_possible", "no_clear_sweep"
             knock_spots.append(bxy)
-            ux, uy = math.cos(math.radians(plan["u_deg"])), math.sin(math.radians(plan["u_deg"]))
-            sx, sy = plan["start_xy"]
             ep.event("flow", phase="knock_over", slot=label, candidate=c["candidate_id"], block_xy=[round(v, 1) for v in bxy],
                      height_mm=g.get("height_above_table_mm"), direction_deg=round(plan["u_deg"], 1), onto=plan["onto"],
                      landing_xy=[round(v, 1) for v in plan["landing_xy"]], distance_mm=round(plan["distance_mm"], 1), tips_mm=round(plan["tips_mm"], 1),
                      upright=kind)
             print(f"{label}: block {what} at ({bxy[0]:.0f}, {bxy[1]:.0f}); sweeping it over at {plan['tips_mm']:.0f} mm toward "
                   f"({plan['landing_xy'][0]:.0f}, {plan['landing_xy'][1]:.0f}) onto its {plan['onto'].replace('_', ' ')}", flush=True)
-            await bot.gripper.grab()                     # closed claws are the pusher
-            g0 = await bot.gripper_origin()
-            travel_z = g0[2]
-            ok, _ = await bot.move_delta(dx=sx - g0[0], dy=sy - g0[1])
-            if ok:
-                await bot.align_claws(wrap_90(plan["u_deg"]), tolerance_deg=1.5, align_speed=align_speed, travel_speed=travel_speed)
-                g1 = await bot.gripper_origin()
-                ok, _ = await bot.move_delta(dx=sx - g1[0], dy=sy - g1[1])
-            if ok:
-                ok = await bot.descend_to(table_z + plan["tips_mm"] - TIP_ABOVE_GRIPPER_FRAME_MM, approach_speed, travel_speed)
-            if ok:
-                await bot.set_speed(push_speed)
-                ok = await slide(ux, uy, plan["distance_mm"])
-            await bot.set_speed(travel_speed)
-            g2 = await bot.gripper_origin()
-            await bot.move_delta(dz=travel_z - g2[2], near_table=True)
-            await bot.gripper.open()
+            ok, ok_home = await sweep_stroke(plan["start_xy"], plan["u_deg"], plan["tips_mm"], plan["distance_mm"])
             knocks_used += 1
-            ok_home, _ = await bot.move_to(*home)
             if not ok_home:
                 ep.event("flow", phase="stop", reason="view_pose_refused_after_knock")
                 return "stop", "view_pose_refused_after_knock"
@@ -943,7 +1544,8 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
 
         async def pick_phase():
             """Place blocks until the layer is full, the placement budget is spent, or a hard stop."""
-            nonlocal filled, last_pose, obs, scene, ctx, queue, flow_stopped, rescans_without_progress, placed_at_last_scan
+            nonlocal filled, last_pose, obs, scene, ctx, queue, flow_stopped, rescans_without_progress, placed_at_last_scan, x_sweeps_used, \
+                push_outs_used
             rescans_without_progress = 0
             placed_at_last_scan = 0
             while len(placed) < max_blocks:
@@ -983,6 +1585,22 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                     if len(placed) > placed_at_last_scan:
                         rescans_without_progress = 0
                     placed_at_last_scan = len(placed)
+                    if rescans_without_progress >= MAX_RESCANS and push_outs_used < push_outs:
+                        # Flat blocks side by side: slide the middle ones out first (operator, 30 Oct), then look again.
+                        done = await push_out_rows(slot["slot_id"])
+                        if done == "stop":
+                            flow_stopped = True; break
+                        if done:
+                            rescans_without_progress = 0
+                            continue
+                    if rescans_without_progress >= MAX_RESCANS and x_sweeps_used < x_sweeps:
+                        # A packed heap: sweep its bottom layer in an X, then look for picks again (operator, 30 Oct).
+                        done = await x_sweep(slot["slot_id"])
+                        if done == "stop":
+                            flow_stopped = True; break
+                        if done:
+                            rescans_without_progress = 0
+                            continue
                     if rescans_without_progress >= MAX_RESCANS:
                         flow_stopped = True; ep.event("flow", phase="stop", reason="no_candidate_with_required_grasp", required=list(order), slot=slot["slot_id"],
                                  rescans=rescans_without_progress)
@@ -1042,6 +1660,7 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 tips = grasp["tips_above_table_mm"]
                 resting = grasp.get("resting_level_mm", 0.0)
                 ep.event("flow", phase="plan_block", slot=slot["slot_id"], candidate=pick["candidate_id"], grasp=grasp["style"], pick_xy=[round(bx, 1), round(by, 1)],
+                         grip_xy=[round(v, 1) for v in (grasp.get("grip_point_mm") or (bx, by))[:2]], grip_shift_mm=grasp["shift_mm_along_long_side"],
                          pick_long_deg=round(geo["base_long_side_deg"], 1), block_top_mm=round(geo["height_above_table_mm"], 1), resting_level_mm=resting,
                          dest_xy=[round(sx, 1), round(sy, 1)], dest_long_deg=slot["long_side_deg"],
                          support_z=slot["support_z_mm"], tips_above_table_mm=round(tips, 1), tips_floor_mm=tips_floor, place_spacing_mm=place_spacing_mm,
@@ -1084,10 +1703,11 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 ep.event("flow", phase="placed", slot=slot["slot_id"], released_block_xy=[round(rx, 1), round(ry, 1)], aligned_at_pick=aligned)
 
         async def slide(ux, uy, distance):
-            """Push stroke along (ux, uy) in planner-friendly segments of at most PUSH_SEGMENT_MM."""
+            """Push stroke along (ux, uy): one continuous move with sessions off (operator, 30 Oct: the sweep went in slow
+            steps), else in segments of at most PUSH_SEGMENT_MM so the session's connectivity probe is not starved."""
             remaining = distance
             while remaining > 1e-6:
-                step = min(PUSH_SEGMENT_MM, remaining)
+                step = remaining if disable_sessions else min(PUSH_SEGMENT_MM, remaining)
                 ok, _ = await bot.move_delta(dx=ux * step, dy=uy * step, near_table=True)
                 if not ok:
                     return False
@@ -1195,8 +1815,8 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
             return ok and rise_ok
 
         async def push_phase():
-            """Sam's pallet procedure (30 Oct spec), one look then no further captures: 0. look from home; 1. push the row
-            together toward the first block; 2. line up every end with the last block's, furthest first; 3. go home.
+            """Sam's pallet procedure (30 Oct spec): 0. look from home; 1. push the row together toward the first block, then
+            look again from home (run 9); 2. line up every end with the last block's, furthest first; 3. go home.
             The closed claws travel LOW_TRAVEL_TIPS_MM above the table between strokes. Returns the measured pallet count."""
             nonlocal pallet_count
             pallet_count = len([s for s in filled if s.startswith("L0")])
@@ -1234,8 +1854,39 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 ep.event("flow", phase="push_together", start_xy=[round(v, 1) for v in plan["push"]["start_xy"]],
                          direction=[round(v, 2) for v in plan["push"]["direction"]], distance_mm=round(plan["push"]["distance_mm"], 1), accepted=ok)
                 print(f"Push together: {plan['push']['distance_mm']:.1f} mm toward the first block", flush=True)
+            ends = plan["ends"]
+            if ok and plan["push"]:
+                # 1b. Look again (closed claws kept): the closing push moves the whole row on by its overshoot and can turn
+                # blocks, so the end pushes are planned from where the blocks now are (run 9: planned from the first
+                # look, the face landed 8 mm off and moved the reference block 7.4 mm).
+                g = await bot.gripper_origin()
+                if g[2] < high_z - 1.0:
+                    await bot.move_delta(dz=high_z - g[2], near_table=True)
+                ok_home, _ = await bot.move_to(*home)
+                ends = []
+                if ok_home:
+                    obs_m, scene_m = await scene_from_capture()
+                    ctx_m = proposal.build_context(scene_m, tower_origin_xy_mm=tower_origin, filled_slots=filled, dry_run=True, tower_gap_mm=gap_mm)
+                    row = row_blocks(ctx_m, 0)
+                    pallet_count = len(row)
+                    pts = [g_["base_point_mm"] for g_ in row]
+                    plan2 = pallet_push_plan(pts, target.layer0_long_side_deg, calib.block, ROW_ALIGN_TOLERANCE_MM, calib.finger.finger_width_mm)
+                    ends = plan2["ends"]
+                    obstacles = [(tuple(c["geometry"]["base_point_mm"][:2]), c["geometry"]["height_above_table_mm"]) for c in ctx_m["candidates"]
+                                 if c["geometry"].get("base_point_mm") and c["geometry"].get("height_above_table_mm") is not None]
+                    high_z = (await bot.gripper_origin())[2]
+                    ep.event("flow", phase="row_remeasured", observation_id=obs_m["observation_id"], blocks=len(row),
+                             row_gaps_mm=round(plan2["gaps_mm"], 1), centres=[[round(p[0], 1), round(p[1], 1)] for p in pts],
+                             end_offsets_mm=[round(o, 1) for o in plan2["offsets_mm"]],
+                             end_pushes=[{"index": e["index"], "offset_mm": round(e["offset_mm"], 1), "also_lines_up": e["also_lines_up"]} for e in ends])
+                    print(f"Row after the push: {len(row)} block(s), gaps {plan2['gaps_mm']:.1f} mm; ends vs the last block "
+                          f"{', '.join(format(o, '+.1f') for o in plan2['offsets_mm']) or '-'} mm; {len(ends)} end push(es)", flush=True)
+                    if len(row) < 2:
+                        ends = []
+                else:
+                    ep.event("flow", phase="row_remeasure_refused", note="no end pushes without a look after the closing push")
             turned = False
-            for e in plan["ends"] if ok else []:
+            for e in ends if ok else []:
                 # 2. Line up the ends, furthest first; the claws turn a quarter turn the first time only
                 ok = await move_low(e["start_xy"], obstacles, high_z)
                 if ok:
@@ -1263,9 +1914,14 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
         drops_used = 0
         knocks_used = 0
         knock_spots = []
+        x_sweeps_used = 0
+        push_outs_used = 0
         rescans_without_progress = 0
         placed_at_last_scan = 0
         pallet_count = len([s for s in filled if s.startswith('L0')])
+        if flatten_sweeps and next_open_slot(target, filled) is not None:
+            if await flatten_heap(flatten_sweeps):
+                return 1
         for fill_round in range(MAX_FILL_ROUNDS):
             await pick_phase()
             # --- home, measure, push the table row together if the measured gaps say so (layer 0 only), measure again

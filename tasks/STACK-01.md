@@ -372,6 +372,190 @@ local/layer-stack-data/live/episodes/):
   claws at 0 mm (20:17:12, ends grip, width 776).
   The sweep was not used because every direction had neighbours under the claws, in the path or at the landing.
 
+- 30 Oct 20:27-20:30 UTC, eighth cycle (@19701fd), first assemble-and-stack attempt from the heap:
+  - L0S0: side grip, placed.
+  - L0S1: an on-edge block (top 23.5 mm) got `resting_level_mm` 0, so the narrow-top rule worked. No sweep cleared
+    its neighbours, so an ends grip went in for a drop, with the tips raised to 13.7 mm over a 7.7 mm neighbour in
+    the claw strips. The gripper reported holding (701). The block never reached the drop spot
+    (`not_found_near_drop_spot`): the before and after photos show it lying flat where it was picked. Another block
+    filled L0S1.
+  - L0S2: a standing block was swept over (landed flat, top 11 mm), then picked with an ends grip and placed.
+  - Push stage: pushed together 82 mm with one end push of 7.2 mm. Pallet check: pitch 25.5 and 24.6 mm, x spread
+    4 mm.
+  - Stack: the tower measured 5 layers. The plan put the pick tips at 0 mm (the floor), 12.7 mm below the tops.
+    After Enter the grab reported holding (718).
+  - Failure: the after-lift photo shows the three blocks scattered around the pallet. `blocks_left_behind` only
+    looks within 15 mm of each block, so it counted 0 left and the arm "placed" an empty gripper. The verify capture
+    still showed 5 layers (`stack_not_verified`).
+  - Likely cause: the lift ran at 180 deg/s. `move_z_to` restores the travel speed right after the slow descent,
+    before the grab, and the grip held only 12.7 mm of each block.
+- Change (operator: go 2 mm deeper when picking up the pallet; within 30 cm of the table reduce the speed to 20):
+  - `PALLET_PICK_DEEPER_MM` 2: palletize's bundle pick goes 2 mm below `--tips-floor-mm`, so -2 mm with floor 0.
+    The release goes 2 mm lower too, so the bundle still lands 1 mm above the base. Single-block picks and the
+    standalone layer-stack command keep the floor. A pick below -6 mm is refused.
+  - `NEAR_TABLE_MM` 300 and `NEAR_TABLE_SPEED_DEG_S` 20 (`Robot.set_near_table_zone`): once the first capture gives
+    the table height, every `move_delta` with the claw tips below 300 mm runs at 20 deg/s at most, in run_flow and
+    run_layer_stack. That covers descents, the grab lift, pushes, low rotations and the rise. A move crossing
+    300 mm is split there, so travel above it keeps the travel speed. A `move_to` with either end low runs wholly
+    at 20. A slower request (for example 10) is kept.
+- Change (operator: after going home, sweep a few times at random to knock blocks over so the heap is flatter):
+  - `--flatten-sweeps N` (live-run/palletize, default 0) calls `flatten_heap` after the first capture from home,
+    before any pick, while the pallet has an open slot.
+  - Each sweep is drawn by `flatten_sweep_plan`. It aims at a random heap block taller than the sweep, from a random
+    direction (seed recorded in the events). The closed claws come down on bare table 10-150 mm behind it and sweep
+    to 60 mm past its centre, with the tips 18 mm above the table: flat 15 mm tops pass under; blocks on their edge,
+    on end or on another block are hit.
+  - The stroke plus 75 mm of carried blocks must keep clear of the pallet, the tower keep-out, the row lane and the
+    drop spot.
+  - Each sweep is planned from a new capture. The sweeps stop early when nothing stands above 18 mm, no draw passes,
+    or a move is refused (no retry). The stroke motion is shared with `knock_over_block` (`sweep_stroke`).
+  - The operator's "Jenga logo up" success test was dropped at their request.
+- Tests: plan depth and release; the palletize call; three speed-zone cases on a fake arm; the run_flow zone event;
+  three flatten planner cases (bare table, clear of the pallet, random but repeatable, none when every draw fails);
+  two harness runs (an edge block flattened by one sweep before picking; no sweeps on a flat heap). 170 tests pass.
+  Untested live.
+- Not changed: the after-lift check still misses a bundle that scatters more than 15 mm from where it lay.
+
+- 30 Oct 20:38-20:45 UTC, ninth cycle (uncommitted tree on 19701fd, `--flatten-sweeps 3`): a layer was stacked.
+  - Flatten: 3 random sweeps (seed 1573711020), each about 25 s with its capture. Heap blocks taller than 18 mm went
+    6, 5, 4, 3. One block standing on end at (252, 19) stayed up: no sweep cleared its neighbours.
+  - Picking: two grips reported holding with the claws almost fully open and lifted nothing: the side grip at
+    (309, 138) read 853 and the ends grip at (332, 345) read 835 (held grips read 701-731 along and 220 across). Both
+    were "placed", and the pallet then showed 1 block. The miss rule caught both, and the other grip style picked
+    each block on the next try. That cost one top-up round.
+  - Push stage: the end push hit the wrong pair. It was planned from the photo taken before the push-together
+    (start y 258.8, 45 mm face covering y 236-281), but the push-together's 10 mm overshoot moved the first block
+    from y 233.8 to 226.2. The face pushed blocks 1 and 2 (x 439.4 to 424.0 and 428.9 to 421.5), not 1 and 0. The
+    reference block, which should never move, moved 7.4 mm. Ends stood 16 mm apart on the pallet (x 437.8, 424.0,
+    421.5).
+  - Stack: pick tips -2.0 mm, 15.4 mm below the tops, at most 20 deg/s near the table. The lift held: no table-level
+    block within 160 mm of the pallet afterwards (run 8: three scattered). Verified: the tower went from 5 to 6
+    layers (tops 88.3-89.4 mm at -86 deg). Centre error 5.66 mm (along 5.19, across -2.25), yaw -0.6 deg: outside
+    the 3 mm tolerance. The ends of the placed layer were still staggered by 11.4 mm (shared contact 63.6 mm). The
+    stagger moves the layer's measured centre along its length, so the end push is the likely main cause of the
+    along error.
+  - Next: plan the end push for where the push-together leaves the row (first block moved by the overshoot), or
+    look again after it. Treat a grip reading near fully open (above ~800) as empty.
+- Changes after run 9 (operator: fix the end push; blocks too far left (+y) are slightly missed; speed up sweeping;
+  turn at 90 deg/s; no confirm before picking up the pallet; build another pallet after stacking):
+  - End push: the push stage looks again from home after a closing push and plans the end pushes from that look
+    (`row_remeasured`). `pallet_push_plan` predicts the 5 mm overshoot and holds the claw face `PUSH_FACE_CLEAR_MM`
+    (2 mm) off the reference block (face shifted up to 12 mm toward the first block; at least 20 mm of the pushed
+    block still under it).
+  - Side grips: `evaluate_grasps` checked the claw strips 15 mm along the block, but `grab_block` brought the claws
+    down at the block centre. Each grasp now carries `grip_point_mm` (the same image-axis shift, in base
+    coordinates), and the claws come down there. `plan_block` logs `grip_xy`.
+  - Far-side picks: `refine_pick` re-measures a heap block more than `REFINE_BEYOND_MM` (80 mm) from the home photo's
+    centre (416, 182). The camera is moved over the block (camera pose from the frame system), one capture is taken,
+    and `match_block` (within 20 mm, 6 mm and 15 deg) gives the new centre and angle. The grip point keeps its place
+    along the block. Without a match the planned pose is used (`pick_refine_no_match`). Cost: one capture and SAM
+    call per far pick.
+    Evidence from 19 stack runs (157 static blocks seen from two poses, cameras 0-283 mm apart):
+    - Poses disagree by 4.3 mm mean.
+    - A 1.1 deg camera rotation about its axis plus a -0.6 % scale explains part of it (2.7 mm left).
+    - After each photo pair's common shift, blocks within 150 mm of both photo centres agree to 0.8 mm; blocks
+      220+ mm from one disagree by 3.6 mm, with no consistent radial direction (+0.2 mm outward).
+    - The code applies no lens-distortion model (pinhole `deproject`), and no distortion coefficients are recorded.
+    - Open claws read 853 against 730 for a 75 mm block and 220 for 25 mm (~10.2 units/mm), so the claws open about
+      87 mm, not the configured `open_gap_mm` 104: an ends grip has ~6 mm spare per end. The configuration is
+      unchanged (calibration data; to be measured).
+  - Speed: turning in place is not capped near the table (align speed, 90 deg/s, at any height). Sweeps
+    (`sweep_stroke`, used by the random flattening and by knock-overs) pause the 20 deg/s cap, since the claws are
+    empty: travel speed down to 40 mm above the stroke, then the approach speed, the push speed for the stroke, and
+    travel speed back up.
+  - No confirm and repeat: already in palletize: `--no-pause` skips the Enter hold, and `--cycles N` builds and stacks
+    N layers back to back (the stack returns to the view pose between cycles). The `--no-pause` help now says so.
+  - Tests: end-push face vs the reference (three rows, including run 9's), turn and sweep speeds, the camera view
+    centre, block matching, side grip points 15 mm along the block, and two palletize cycles without a prompt.
+    176 tests pass. Untested live.
+
+- 30 Oct 20:52-20:53 UTC, tenth cycle (`--layers 6 --flatten-sweeps 3 --no-pause --cycles 2`): stopped before any pick.
+  - One flatten sweep knocked down the only block above 18 mm (195 mm stroke).
+  - Then no heap block had a grasp with room for the claws in three looks (start and two rescans):
+    `no_candidate_with_required_grasp`, pallet 0 of 3.
+  - The start capture shows a packed cluster of flat blocks lying parallel at 26-39 deg, 33-54 mm apart. Every grasp
+    of every block had 7-18 mm neighbours in its claw strips.
+  - The run 9 photos show the earlier sweeps pushed the loose heap into that cluster.
+- Changes (operator: why does it sweep in slow steps; after two looks with no candidates, sweep the bottom layer in an X):
+  - Steps: `slide` split every stroke into 25 mm planned moves because a 60 mm constrained push lost the connection
+    on 30 Oct. That loss came from the session's 1 s connectivity probe, which `--no-sessions` turns off (11:36 entry
+    above). With sessions off, a stroke is now one continuous move; with sessions on, it keeps the segments.
+  - X sweep (`--x-sweeps N`, live-run/palletize, default 0): when MAX_RESCANS looks in a row find nothing to pick,
+    `x_sweep` makes two crossing strokes through the heap centre with the claw tips 7 mm above the table (the bottom
+    layer), then looks again. Up to N times per run before the old stop.
+    - Each stroke (`cross_sweep_plan`) runs from bare table at least 70 mm before the centre to 70 mm past it.
+    - The stroke plus 75 mm of carried blocks keeps clear of the pallet, the tower keep-out, the row lane and the
+      drop spot, and stays inside the table area the photo saw (10 mm margin).
+    - The X starts at 45 deg to the blocks' mean long side and is turned by up to 45 deg (`x_sweep_line`) until both
+      strokes are clear. Run 10's heap: strokes through the whole heap had no clear way in any direction; with 70 mm
+      arms and a 15 deg turn, both strokes are clear (230 deg for 170 mm, 320 deg for 180 mm).
+    - Each stroke is planned from a fresh capture.
+  - Tests: the X on run 10's heap (bare table, through the centre, clear of the pallet, tower and drop spot, inside
+    the photo, crossing at 90 deg), refusals, and a harness run: two empty looks, then an X of two continuous strokes
+    at 7 mm with a look after each, then the stop. The simulator's push piles blocks onto one spot, so the spreading
+    itself is unproven. 179 tests pass. Untested live.
+
+- 30 Oct 20:56-21:01 UTC, eleventh cycle (`--x-sweeps 2 --no-pause --cycles 2`, uncommitted tree): pallet built and
+  pushed tight; stacking stopped at the overview.
+  - Flatten: nothing above 18 mm, no sweep.
+  - First side grips at their real point: L0S0 side -15 (grip 15 mm from the centre), L0S1 side +15. Both held
+    (214, 221).
+  - Close-ups moved the planned blocks 6.5, 8.6 and 11.5 mm (151, 220 and 343 mm from the home photo's centre). All
+    three picks held at the first try (214, 221, 729).
+  - X sweeps: twice, each after two empty looks. Each time only the first stroke had a clear way: 261 deg for 190 mm,
+    then 106 deg for 145 mm. After the second X, two blocks were pickable and the layer was completed.
+  - Push stage: closing push 74.2 mm. The look after it gave gaps 0.4 mm and ends +5.0 / +0.6 mm, so one end push
+    on block 0 with block 1; the reference block was not touched. Pallet check: x 435.2 / 438.2 / 436.6 (3 mm
+    spread; run 9: 16 mm), pitch 24.9 and 24.5 mm.
+  - Stack overview: "expected 3 measured blocks in the layer, saw 4". The photo shows three blocks on the tower top.
+    The fourth detection (509, -11) at 87.6 mm is the camera-facing side face of the top layer's nearest block, seen
+    at an angle (the tower is ~230 mm off the photo's centre). The overview base check (`base_layer`, line 490)
+    stops the run before the close-up from above (`base_close`) that the plan uses.
+  - Next: when the overview's top level is not one 3-block layer, measure it from above (the existing hover over
+    the tower origin) instead of stopping.
+- Change (operator: yes, fix it): `overview_base` splits the overview into source-side blocks and the tower top,
+  and says whether to look again from above: "clipped" (as before), or "unclear" when the top level is not one usable
+  layer (run 11's four detections, or a detection between layer heights above the top). In those cases
+  `run_layer_stack` hovers over the tower origin, measures there (`base_find`, event `base_unclear_in_overview`) and
+  validates the base from that capture. A real problem still stops the run from the close-up. Plan-only mode
+  never moves and still stops on the overview. Test: run 11's overview blocks (unclear, pallet still found), run 9's
+  (one layer, no extra look), a between-heights detection on top, and no tower. 180 tests pass. Untested live.
+- Change (operator: the tower top is three blocks every time, so the count must not matter): `base_layer` no longer
+  checks how many detections the top level has. It is used for the tower top in the overview, the close-up and the
+  verification.
+  - More than three: of every three detections, the ones forming the most regular layer are used (pitch closest to
+    25 mm, then ends best lined up; the usual spacing, parallel and contact checks still apply to them).
+  - Two detections 40-60 mm apart: they are the outer blocks, and the middle one is placed between them.
+  - One detection, or two side by side: still a stop ("the tower centre is unknown by half a block"), after the
+    look from above.
+  - Run 11's overview now passes with the three real blocks (x 524.0 / 550.2 / 572.8, the side face at 509.0 left
+    out) and needs no extra look.
+  - Tests updated. 180 tests pass. Untested live.
+- Operator: after the third block was picked it moved slowly to the pallet; why?
+  - The carry runs at the lift height, 100 mm above the pick (`PICK_LIFT_MM`), and every move below 300 mm was capped
+    at 20 deg/s.
+  - Run 11, grab to placed: 13.8 s for 164 mm, 21.6 s for 289 mm, 23.2 s for the third block's 446 mm. Run 8 (no
+    cap): 8.0-10.1 s for 206-229 mm.
+- Changes (operator: full speed, 180 deg/s, from 100 mm above the table, 60 deg/s between 40 and 100 mm; push into the
+  ends of the middle ones when 3+ flat blocks lie side by side):
+  - `NEAR_TABLE_BANDS` ((100, 60), (40, 20)) replaces the 300 mm / 20 deg/s cap. A move crossing a band edge is split
+    there. Below 40 mm the 20 deg/s that held the bundle on run 9's lift stays (the operator gave no speed there).
+    The carry at 100 mm, travel and rises above 100 mm now run at the travel speed.
+  - Push-out (`--push-outs N`, live-run/palletize, default 0). When two looks find nothing to pick, before any X
+    sweep, `side_by_side_rows` finds rows of 3+ flat blocks: parallel within 6 deg, 21-30 mm apart, ends within
+    15 mm. `push_out_plan` slides each middle block 55 mm along its length, sides alternating, with the closed claws
+    turned edge-on (16 mm, narrower than the 25 mm end) and the tips 7 mm above the table.
+    - The claws come down 15 mm beyond the block's end, with nothing within 4 mm of them.
+    - The block's new place must be free of other blocks, clear of the pallet, tower and drop spot, and inside the
+      photo.
+    - After 55 mm, a side grip at the sticking-out end clears the neighbours' ends by 10 mm.
+    - Each block is found again in the newest capture and measured from above when far from the photo's centre
+      (`look_closer`, now shared with `refine_pick`). A capture follows every push.
+  - Tests: speed bands (descent, lift, carry, rise, crossing splits), rows (staggered, on-edge and pairs excluded),
+    push plans (edge-on, alternating, the other side when a keep-out is in the way, none when both are blocked), and
+    a harness run: two empty looks, then one edge-on 70 mm stroke into the middle block. The simulator pushes with a
+    45 mm face, so the result on the blocks is unproven. 183 tests pass. Untested live.
+
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot
 complete until it is changed; table height and camera offset are unverified; `--grip-lower-mm 3` is a single-run fix,
 not a calibration; source and base must be reachable (x <= ~600 mm worked) and both visible from the view pose.
