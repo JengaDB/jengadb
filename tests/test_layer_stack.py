@@ -259,9 +259,9 @@ class PalletPushPlan(unittest.TestCase):
         self.assertEqual([round(o, 1) for o in plan["offsets_mm"]], [-5.5, -11.4])
         first = plan["ends"][0]
         self.assertEqual(first["index"], 1)                                         # furthest first
-        self.assertAlmostEqual(first["distance_mm"], 11.4 + 5.0, places=1)
+        self.assertAlmostEqual(first["distance_mm"], 11.4 + 10.0, places=1)                # overhang + the 10 mm start gap
         self.assertEqual(first["direction"], (1.0, 0.0))                            # pushed toward +x, back to the line
-        self.assertAlmostEqual(first["start_xy"][0], 430.4 - (37.5 + 5.0 + 8.0))     # end + 5 mm gap + 8 to the claws' middle
+        self.assertAlmostEqual(first["start_xy"][0], 430.4 - (37.5 + 10.0 + 8.0))    # end + 10 mm gap (operator: 5 more) + 8 to the claws' middle
         self.assertEqual(first["also_lines_up"], [0])                               # its neighbour sticks out the same way, less
         self.assertEqual(len(plan["ends"]), 1)
 

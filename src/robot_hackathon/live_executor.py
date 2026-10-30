@@ -58,6 +58,7 @@ DEFAULT_APPROACH_SPEED_DEG_S = 40.0
 DEFAULT_PUSH_SPEED_DEG_S = 30.0
 DEFAULT_ALIGN_SPEED_DEG_S = 90.0  # wrist rotations when aligning the claws over a block or the row (45 felt slow: operator, 30 Oct)
 ROW_ALIGN_TOLERANCE_MM = 2.0      # a pallet block whose end sticks out past the last block's by more is pushed back (spec, 30 Oct)
+ALIGN_START_GAP_MM = 10.0         # end alignment: the claws come down this far past the block's end (5 was too close: operator, 30 Oct)
 LOW_TRAVEL_TIPS_MM = 30.0         # pallet push stage: closed claws travel this high, over 15 mm block tops with 15 to spare
 LOW_TRAVEL_MARGIN_MM = 10.0       # anything taller than LOW_TRAVEL_TIPS_MM minus this near the path is gone over, not through
 LOW_PATH_HALF_WIDTH_MM = 65.0     # path clearance: claw face half-width 22.5 + a block's half-length 37.5 + 5
@@ -167,8 +168,8 @@ def pallet_push_plan(points, long_deg, block_dims, tolerance_mm=ROW_ALIGN_TOLERA
     Step 1, when the gaps exceed PUSH_IF_GAPS_OVER_MM: start beside the last block on the side away from the first
     (5 mm gap to the claws), push toward the first by the gaps + 10 mm; afterwards the blocks touch and the first has
     not moved. Step 2, for every other block whose end sticks out past the last block's by more than tolerance_mm,
-    furthest first: start just past that end (end + 5 mm gap + 8 mm to the claws' middle), push along the block by the
-    overhang + 5 mm so its end stops level with the last block's. A neighbour sticking out the same way by no more is
+    furthest first: start just past that end (end + ALIGN_START_GAP_MM + 8 mm to the claws' middle), push along the
+    block by the overhang + ALIGN_START_GAP_MM so its end stops level with the last block's. A neighbour sticking out the same way by no more is
     caught by the claw face (face_width_mm) and lined up in the same push. Positions after step 1 are predicted, not
     measured: the closing push moves blocks across the row only, so their offsets along it are unchanged."""
     w, length = block_dims.width_mm, block_dims.length_mm
@@ -196,12 +197,12 @@ def pallet_push_plan(points, long_deg, block_dims, tolerance_mm=ROW_ALIGN_TOLERA
             continue
         o = offsets[i]
         s = 1.0 if o > 0 else -1.0
-        back = length / 2 + PUSH_START_GAP_MM + CLAW_THICKNESS_MM
+        back = length / 2 + ALIGN_START_GAP_MM + CLAW_THICKNESS_MM
         at_along = along[i] + s * back
         also = [j for j, oj in enumerate(offsets) if j != i and j not in done and (oj > 0) == (o > 0)
                 and abs(oj) <= abs(o) and abs(after[j] - after[i]) <= reach]
         plan["ends"].append({"index": i, "offset_mm": o, "start_xy": (at_along * lx + after[i] * ax, at_along * ly + after[i] * ay),
-                             "direction": (-s * lx, -s * ly), "distance_mm": abs(o) + PUSH_START_GAP_MM, "also_lines_up": also})
+                             "direction": (-s * lx, -s * ly), "distance_mm": abs(o) + ALIGN_START_GAP_MM, "also_lines_up": also})
         done |= {i, *also}
     return plan
 
@@ -1077,7 +1078,13 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                   f"{', '.join(reasons)}; taking it off to lay it flat", flush=True)
             # Pallet blocks are excluded from picking by the zone; grasps come from a context of the same capture without it.
             entry = proposal.candidate_entry(proposal.build_context(scene, filled_slots=filled, dry_run=True), c["candidate_id"])
-            grasp = next((g for style in proposal.grasp_order(None) for g in entry["grasps"] if g["style"] == style and g["eligible"]), None)
+            styles = list(proposal.grasp_order(None))
+            cxy = c["geometry"]["base_point_mm"][:2]
+            if any(o is not c and math.dist(o["geometry"]["base_point_mm"][:2], cxy) < calib.block.width_mm + 15.0 for o, _, _ in checked):
+                # Pallet ends are flush after alignment: an ends grip on one block clamps its touching neighbours too
+                # (30 Oct 20:11: one repair lifted two blocks and the pallet count fell from 3 to 1).
+                styles = [st for st in styles if st != "ends"]
+            grasp = next((g for style in styles for g in entry["grasps"] if g["style"] == style and g["eligible"]), None)
             blocker = drop_spot_blocked(ctx, c["candidate_id"])
             if grasp is None or blocker:
                 flow_stopped = True

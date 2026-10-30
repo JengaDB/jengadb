@@ -705,9 +705,11 @@ def upright_kind(geometry, dims):
 
 
 PALLET_YAW_TOLERANCE_DEG = 10.0   # a pallet block turned further than this from the row's long side is taken off (pushes cannot turn it)
+PALLET_TILT_DEG = 15.0            # tilt alone takes a pallet block off only above this: touching blocks read 8.2-8.3 deg at a normal
+                                  # 13 mm height (30 Oct 20:11/20:13, a good block taken off twice); resting on a neighbour shows in height
 
 
-def misplaced_on_pallet_reasons(geometry, tilt_deg, dims, max_tilt_deg=REORIENT_TILT_DEG, row_long_deg=None,
+def misplaced_on_pallet_reasons(geometry, tilt_deg, dims, max_tilt_deg=PALLET_TILT_DEG, row_long_deg=None,
                                 max_yaw_deg=PALLET_YAW_TOLERANCE_DEG):
     """A pallet block that must be taken off and laid flat again: not one block thick (on a neighbour, on its edge),
     standing on its edge, tilted, or (given row_long_deg) turned off the row's long side, e.g. rotated 90 deg or lying

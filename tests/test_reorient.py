@@ -91,7 +91,10 @@ class Reasons(unittest.TestCase):
         self.assertEqual(geom.misplaced_on_pallet_reasons(flat_geometry(height_above_table_mm=11.9), 2.0, self.dims), [])   # 30 Oct pallet
         on_neighbour = geom.misplaced_on_pallet_reasons(flat_geometry(height_above_table_mm=30.0), 1.0, self.dims)
         self.assertEqual(on_neighbour, ["height:30.0mm_not_one_block"])
-        self.assertEqual(geom.misplaced_on_pallet_reasons(flat_geometry(height_above_table_mm=18.0), 12.0, self.dims), ["tilt:12.0deg"])
+        # 30 Oct 20:11/20:13: a good pallet block read 8.2 / 8.3 deg at 13.2 / 13.1 mm and was taken off twice; tilt alone
+        # now needs more than 15 deg (a block resting on a neighbour shows in its height)
+        self.assertEqual(geom.misplaced_on_pallet_reasons(flat_geometry(height_above_table_mm=13.2), 8.3, self.dims), [])
+        self.assertEqual(geom.misplaced_on_pallet_reasons(flat_geometry(height_above_table_mm=18.0), 18.0, self.dims), ["tilt:18.0deg"])
         self.assertIn("on_edge", geom.misplaced_on_pallet_reasons(flat_geometry(height_above_table_mm=25.0, flags=["possibly_on_edge"]), 0.5, self.dims))
         # turned off the row (edge-case list: rotated 90, diagonal): the stacking stage needs the three parallel within 4 deg
         self.assertEqual(geom.misplaced_on_pallet_reasons(flat_geometry(base_long_side_deg=2.0), 1.0, self.dims, row_long_deg=0.0), [])

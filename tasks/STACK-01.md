@@ -330,6 +330,19 @@ local/layer-stack-data/live/episodes/):
   out of the claw-hidden strip, e.g. --drop-spot 340,340 (176 mm from the pallet, off its lane). Not addressed: a
   heap packed side by side with no clear grasp (the team's "shuffle the bottom layer" case). Untested live.
 
+- 30 Oct 20:09-20:13 UTC, fifth cycle (@e953cbb, `--drop-spot 340,340`), stopped by the operator (Ctrl-C) during
+  the second pallet repair; afterwards the arm was idle over the drop spot and the gripper reported not holding.
+  Worked: an on-edge block tilted 14 deg, resting on another, was dropped at the spot and lay flat (then placed);
+  push together and end alignment as specified. Wrong: (1) the pallet check took a good block off for tilt 8.2 deg
+  at a normal 13.2 mm height (and again 8.3 deg / 13.1 mm at 20:13): touching blocks read noisy tilt; (2) that
+  repair used an ends grip, which on a flush row clamps the touching neighbours too: the pallet count fell from 3 to
+  1 and the top-up carried them back. Operator notes: the unnecessary pick-and-drop; the pallet "picked up in the
+  wrong orientation" with two blocks moved; end alignment must start 5 mm further away.
+- Changes: tilt alone takes a pallet block off only above PALLET_TILT_DEG 15 (resting on a neighbour or on its edge
+  is still caught by height); a pallet repair never uses the ends grip when another pallet block is within 40 mm (no
+  safe grip -> stop for the operator); end alignment starts ALIGN_START_GAP_MM 10 past the block's end (was 5) and
+  pushes 5 mm further, so ends still stop level. Untested live.
+
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot
 complete until it is changed; table height and camera offset are unverified; `--grip-lower-mm 3` is a single-run fix,
 not a calibration; source and base must be reachable (x <= ~600 mm worked) and both visible from the view pose.
