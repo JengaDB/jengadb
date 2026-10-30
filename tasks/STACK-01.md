@@ -365,8 +365,11 @@ local/layer-stack-data/live/episodes/):
 - Cause: resting_level_mm rounds the top (22-29 mm for those blocks) to "on a block at 15 mm", so the claws stopped
   15 mm too high (six picks 20:15-20:21: tops 23.7-28.9, tips 15.0-20.3; four missed). Change: a top up to one block
   width + 6 mm (31 mm) rests on the table (grip_tips_mm, claw_obstruction and the heap order); a real lower block
-  under the claws still raises the tips (claw_obstruction). Known risk: a flat block lying exactly on top of an
-  aligned flat block (top ~30 mm, nothing in the claw strips) would be gripped from the table, i.e. both blocks.
+  under the claws still raises the tips (claw_obstruction). Follow-up fix: this applies only when the visible top is
+  narrow (`narrow_top`: flagged on edge, or measured width <= 0.9 x 25 mm; on-edge tops read 11.1-19.6 mm on 30 Oct,
+  flat tops 22.9-23.8), so a flat block lying on an aligned flat block (full-width top ~30 mm) keeps "on a block at
+  15 mm" and the pair is not gripped together. Still unexplained: the one flat block on the table missed with the
+  claws at 0 mm (20:17:12, ends grip, width 776).
   The sweep was not used because every direction had neighbours under the claws, in the path or at the landing.
 
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot

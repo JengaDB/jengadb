@@ -641,8 +641,10 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
             from the top: blocks resting on others come before blocks on the table (stable within a level)."""
             q = [proposal.candidate_entry(context, r["candidate_id"]) for r in context["ranking"]]
             thickness = scene_["calibration"].block.height_mm
-            q.sort(key=lambda c: -geom.resting_level_mm(c["geometry"].get("height_above_table_mm"), thickness,
-                                                         scene_["calibration"].block.width_mm))
+            dims_ = scene_["calibration"].block
+            q.sort(key=lambda c: -geom.resting_level_mm(
+                c["geometry"].get("height_above_table_mm"), thickness,
+                dims_.width_mm if geom.narrow_top(c["geometry"].get("flags"), c["geometry"].get("width_mm"), dims_) else None))
             if keep_out_xy is not None:
                 radius = footprint_clearance_mm(target)
                 kept_out = [c for c in q if c["geometry"].get("base_point_mm")

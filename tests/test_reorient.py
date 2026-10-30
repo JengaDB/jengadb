@@ -147,6 +147,15 @@ class OnEdgeGripHeight(unittest.TestCase):
         self.assertEqual(geom.resting_level_mm(38.6, dims.height_mm, dims.width_mm), 30.0)
         self.assertEqual(geom.resting_level_mm(44.0, dims.height_mm, dims.width_mm), 30.0)
 
+    def test_only_a_narrow_top_counts_as_on_its_edge(self):
+        # A full-width top at ~30 mm is a flat block on another: it keeps "on a block at 15 mm", so an aligned pair is not
+        # gripped together. On 30 Oct on-edge tops read 11.1-19.6 mm wide, flat tops 22.9-23.8.
+        dims = geom.BlockDimensions()
+        self.assertTrue(geom.narrow_top(["possibly_on_edge"], 19.6, dims))
+        self.assertTrue(geom.narrow_top([], 12.1, dims))
+        self.assertFalse(geom.narrow_top([], 23.8, dims))
+        self.assertFalse(geom.narrow_top([], None, dims))
+
 
 class KnockPlan(unittest.TestCase):
     dims = geom.BlockDimensions()
