@@ -18,8 +18,9 @@ def _intrinsics(props):
     return {k: getattr(intr, k, None) for k in ("width_px", "height_px", "focal_x_px", "focal_y_px", "center_x_px", "center_y_px")}
 
 
-async def open_client(config):
-    """Read-only connection to the machine (robot address with API key, or local viam-server without one)."""
+async def open_client(config, disable_sessions=False):
+    """Connection to the machine (robot address with API key, or local viam-server without one). Sessions are on
+    unless the operator disables them (see layer_stack._open_client for the trade-off)."""
     config.require_viam()
     from viam.robot.client import RobotClient
     if config.machine_auth == "none":
@@ -27,6 +28,10 @@ async def open_client(config):
         options = RobotClient.Options(dial_options=DialOptions(insecure=True, disable_webrtc=True))
     else:
         options = RobotClient.Options.with_api_key(api_key=config.key, api_key_id=config.key_id)
+    if disable_sessions:
+        options.disable_sessions = True
+        options.check_connection_interval = 0   # no 1 s connectivity probe that a busy server can miss
+        options.attempt_reconnect_interval = 0
     return await asyncio.wait_for(RobotClient.at_address(config.address, options), timeout=15)
 
 
@@ -49,7 +54,33 @@ async def read_frames(camera):
     return rgb, depth, encoded, sources, metadata, received_at
 
 
-async def capture_with_camera(config, data_dir, camera, episode_id=None):
+async def read_camera_pose(client, camera_name, destination="world", axis_mm=100.0):
+    """Camera frame -> `destination` rigid transform at this instant, read through the frame system only.
+
+    Transforms the camera origin and three axis points (Sam's flange_axes idea), so no orientation-vector maths is
+    needed. Returns None with a reason when the camera has no frame. Read-only: no motion, no configuration."""
+    from viam.proto.common import Pose, PoseInFrame
+    read_at = datetime.now(timezone.utc)
+    try:
+        frames = {p.frame.reference_frame for p in await asyncio.wait_for(client.get_frame_system_config(), timeout=10)}
+        if camera_name not in frames:
+            return {"status": "unavailable", "reason": f"no frame named {camera_name} in the frame system", "frames": sorted(frames)}
+
+        async def point(x=0.0, y=0.0, z=0.0):
+            q = PoseInFrame(reference_frame=camera_name, pose=Pose(x=x, y=y, z=z, o_z=1))
+            p = (await asyncio.wait_for(client.transform_pose(q, destination), timeout=10)).pose
+            return (p.x, p.y, p.z)
+        o = await point()
+        ex, ey, ez = await point(x=axis_mm), await point(y=axis_mm), await point(z=axis_mm)
+        cols = [[(a[i] - o[i]) / axis_mm for a in (ex, ey, ez)] for i in range(3)]  # rows of R: columns are camera axes
+        return {"status": "read", "frame_from": camera_name, "frame_to": destination, "rotation": cols, "translation_mm": list(o),
+                "read_at": read_at.isoformat(), "method": "frame_system.transform_pose on origin and axis points",
+                "note": "pose applicable at read time; for a wrist camera it changes whenever the arm moves"}
+    except Exception as exc:  # noqa: BLE001 - frame system is optional for capture
+        return {"status": "unavailable", "reason": type(exc).__name__}
+
+
+async def capture_with_camera(config, data_dir, camera, episode_id=None, client=None):
     """Save one observation from an already-connected camera. Read-only."""
     if config.mode != "live":
         raise ConfigError("Live capture requires MODE=live")
@@ -68,8 +99,23 @@ async def capture_with_camera(config, data_dir, camera, episode_id=None):
                       "note": "depth registered to colour by the camera module; colour intrinsics applied to depth"}
     except Exception:  # noqa: BLE001 - properties are optional
         pass
+    # Camera pose immediately before and after the frames: if they differ the arm moved during capture.
+    pose_before = await read_camera_pose(client, config.camera_resource) if client is not None else None
     rgb, depth, _, sources, metadata, received_at = await read_frames(camera)
-    return _save(config, data_dir, rgb, depth, sources, metadata, received_at, intrinsics, cal, version, episode_id)
+    pose_after = await read_camera_pose(client, config.camera_resource) if client is not None else None
+    return _save(config, data_dir, rgb, depth, sources, metadata, received_at, intrinsics, cal, version, episode_id,
+                 camera_pose=_camera_pose_record(pose_before, pose_after))
+
+
+def _camera_pose_record(before, after):
+    if before is None and after is None:
+        return {"status": "not_read", "reason": "no robot client (camera-only capture)"}
+    if before is None or after is None or before.get("status") != "read" or after.get("status") != "read":
+        return {"status": "unavailable", "before": before, "after": after}
+    moved = max(abs(a - b) for a, b in zip(before["translation_mm"], after["translation_mm"]))
+    moved = max(moved, 100.0 * max(abs(a - b) for ra, rb in zip(before["rotation"], after["rotation"]) for a, b in zip(ra, rb)))
+    return {**before, "read_at_after": after["read_at"], "max_change_mm_between_reads": moved,
+            "stable": moved < 1.0}
 
 
 async def capture_live(config, data_dir, episode_id=None):
@@ -77,7 +123,7 @@ async def capture_live(config, data_dir, episode_id=None):
     from viam.components.camera import Camera
     client = await open_client(config)
     try:
-        return await capture_with_camera(config, data_dir, Camera.from_robot(client, config.camera_resource), episode_id)
+        return await capture_with_camera(config, data_dir, Camera.from_robot(client, config.camera_resource), episode_id, client=client)
     finally:
         await asyncio.wait_for(client.close(), timeout=5)
 
@@ -95,8 +141,13 @@ def colorize_depth(depth, near_mm=200, far_mm=1500):
     return out
 
 
-def _save(config, data_dir, rgb, depth, sources, metadata, received_at, intrinsics, cal, version, episode_id):
+def _save(config, data_dir, rgb, depth, sources, metadata, received_at, intrinsics, cal, version, episode_id, camera_pose=None):
     flags = []
+    camera_pose = camera_pose or {"status": "not_read"}
+    if camera_pose.get("status") != "read":
+        flags.append("camera_pose_not_recorded")
+    elif not camera_pose.get("stable", True):
+        flags.append("camera_moved_during_capture")
     if rgb is None or depth is None:
         raise RuntimeError("Camera did not return both an RGB image and a depth map")
     captured_at = None
@@ -115,7 +166,8 @@ def _save(config, data_dir, rgb, depth, sources, metadata, received_at, intrinsi
         "live", config.setup_id, episode_id or f"ep_{uuid.uuid4().hex[:8]}", version,
         alignment=dict(cal["alignment"], calibration_version=version),
         camera={"resource_name": config.camera_resource, "serial": config.camera_serial or None, "model": None,
-                "sources": sources, "machine_address_kind": "loopback" if config.machine_auth == "none" else "remote"},
+                "sources": sources, "machine_address_kind": "loopback" if config.machine_auth == "none" else "remote",
+                "pose_in_world": camera_pose},
         intrinsics=intrinsics, captured_at=captured_at,
         timing={"clock_source": "viam_response_metadata", "per_image_timestamps": "not_provided",
                 "rgb_depth_skew_ms": None, "capture_to_local_receive_ms": skew_ms,
