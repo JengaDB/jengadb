@@ -1064,11 +1064,17 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
             from the top: blocks resting on others come before blocks on the table (stable within a level)."""
             q = [proposal.candidate_entry(context, r["candidate_id"]) for r in context["ranking"]]
             thickness = scene_["calibration"].block.height_mm
-            # The top layer first (operator, 30 Oct): highest measured top first, in half-block steps so the ranking order
-            # holds among blocks at one level. Not by resting level: a block lying on another measured 20.7 mm wide (run 13,
-            # top 27.7 mm), and the narrow-top rule took it for one on its edge on the table.
+            # Good candidates first (operator, 30 Oct): blocks lying flat before those that would have to be laid flat first
+            # (on an edge, on end, tilted); among each, the top layer first: highest measured top first, in half-block steps
+            # so the ranking order holds at one level. Not by resting level: a block lying on another measured 20.7 mm wide
+            # (run 13, top 27.7 mm), and the narrow-top rule took it for one on its edge on the table.
             step = thickness / 2
-            q.sort(key=lambda c: -round((c["geometry"].get("height_above_table_mm") or 0.0) / step) * step)
+
+            def order(c):
+                g = c["geometry"]
+                needs_laying_flat = bool(geom.upright_kind(g, scene_["calibration"].block) or geom.reorient_reasons(g, candidate_tilt(scene_, c)))
+                return needs_laying_flat, -round((g.get("height_above_table_mm") or 0.0) / step) * step
+            q.sort(key=order)
             if keep_out_xy is not None:
                 radius = footprint_clearance_mm(target)
                 kept_out = [c for c in q if c["geometry"].get("base_point_mm")
@@ -1425,12 +1431,14 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
             return ok, ok_home
 
         async def flatten_heap(sweeps):
-            """Before picking (operator, 30 Oct): `sweeps` random sweeps through the heap with the closed claws, so blocks
-            on their edge, on end or on another block fall flat. Each sweep is planned from a fresh capture
-            (flatten_sweep_plan), aimed at a heap block taller than the sweep and kept clear of the pallet, its row lane,
-            the keep-out and the drop spot; then the arm goes home and captures again. Ends early when nothing in the
-            heap stands above the sweep height, no random draw passes the checks, or a move is refused (no retry).
-            Returns a stop reason (event recorded) or None to carry on with picking."""
+            """Up to `sweeps` random sweeps through the heap with the closed claws, so blocks on their edge, on end or on
+            another block fall flat (operator, 30 Oct). Picking comes first (operator, 30 Oct run 14: a sweep turned 2
+            pickable blocks into 0): before every sweep, if any heap block can be picked as it lies, the sweeping stops
+            and the picks go ahead; the flow calls this again when nothing is pickable. Each sweep is planned from a
+            fresh capture (flatten_sweep_plan), aimed at a heap block taller than the sweep and kept clear of the
+            pallet, its row lane, the keep-out and the drop spot; then the arm goes home and captures again. Ends early
+            when nothing stands above the sweep height, no random draw passes the checks, or a move is refused (no
+            retry). Returns "stop" (event recorded) or the number of sweeps made."""
             nonlocal obs, scene, ctx, queue
             seed = flatten_seed if flatten_seed is not None else random.SystemRandom().randrange(2 ** 32)
             rng = random.Random(seed)
@@ -1444,13 +1452,18 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 table was taken for one)."""
                 return bool(geom.upright_kind(c["geometry"], calib.block)) or not any(r.startswith("implausible_") for r in c["rejection_reasons"])
 
+            def good_candidates():
+                """Blocks to pick and place as they lie: a usable grip now, lying flat (a block on its edge or tilted
+                would only be laid flat first, which is what sweeping is for)."""
+                return [c for c in queue if any(g["eligible"] for g in c["grasps"]) and not geom.upright_kind(c["geometry"], calib.block)
+                        and not geom.reorient_reasons(c["geometry"], candidate_tilt(scene, c))]
+
             def taller_heap_blocks():
                 """(every block, sweep targets, blocks to keep): the heap's top layer is picked, not swept (operator,
                 30 Oct): a block with a usable grip now is never a target and no stroke may pass through it."""
                 blocks = [c["geometry"] for c in ctx["candidates"] if c["geometry"].get("base_point_mm")]
                 # pickable and lying flat (a block on its edge or tilted would only be dropped flat: that is what sweeping is for)
-                pickable = {c["candidate_id"] for c in queue if any(g["eligible"] for g in c["grasps"])
-                            and not geom.upright_kind(c["geometry"], calib.block) and not geom.reorient_reasons(c["geometry"], candidate_tilt(scene, c))}
+                pickable = {c["candidate_id"] for c in good_candidates()}
                 tall = [c for c in ctx["candidates"] if c["geometry"].get("base_point_mm")
                         and (c["geometry"].get("height_above_table_mm") or 0.0) > tips and not in_row_lane(c["geometry"], any_height=True)
                         and all(math.dist(c["geometry"]["base_point_mm"][:2], o) >= r for o, r in avoid)
@@ -1460,20 +1473,25 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 return blocks, targets, keep, len(tall) - len(targets)
 
             for i in range(1, sweeps + 1):
+                pickable_now = good_candidates()
+                if pickable_now:
+                    ep.event("flow", phase="flatten_done", sweeps_done=i - 1, reason="pickable_candidates_first", pickable=len(pickable_now), seed=seed)
+                    print(f"Flatten: {len(pickable_now)} block(s) can be picked as they lie; picking first, {i - 1} sweep(s) done", flush=True)
+                    return i - 1
                 blocks, tall, keep, tall_pickable = taller_heap_blocks()
                 if not tall:
                     reason = "top_layer_pickable" if tall_pickable else "nothing_above_sweep_height"
                     ep.event("flow", phase="flatten_done", sweeps_done=i - 1, reason=reason, tips_mm=tips, seed=seed, pickable_above=tall_pickable)
                     print(f"Flatten: {'the blocks standing above ' + format(tips, '.0f') + ' mm can be picked as they lie' if tall_pickable else 'nothing in the heap stands above ' + format(tips, '.0f') + ' mm'}; "
                           f"{i - 1} sweep(s) done", flush=True)
-                    return None
+                    return i - 1
                 plan = flatten_sweep_plan(rng, tall, [block_obstacle(g) for g in blocks], avoid, calib.block,
                                           forbidden=lambda xy: in_row_lane({"base_point_mm": xy}, any_height=True), protect=keep)
                 if plan is None:
                     ep.event("flow", phase="flatten_done", sweeps_done=i - 1, reason="no_clear_sweep", taller_than_sweep=len(tall), seed=seed)
                     print(f"Flatten: no random sweep clears the pallet, tower and drop spot with bare table to come down on; "
                           f"{i - 1} sweep(s) done", flush=True)
-                    return None
+                    return i - 1
                 ep.event("flow", phase="flatten_sweep", sweep=i, sweeps=sweeps, seed=seed, taller_than_sweep=len(tall),
                          target_xy=[round(v, 1) for v in plan["target_xy"]], direction_deg=round(plan["u_deg"], 1),
                          start_xy=[round(v, 1) for v in plan["start_xy"]], end_xy=[round(v, 1) for v in plan["end_xy"]],
@@ -1483,7 +1501,7 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 stroke_ok, home_ok = await sweep_stroke(plan["start_xy"], plan["u_deg"], plan["tips_mm"], plan["distance_mm"])
                 if not home_ok:
                     ep.event("flow", phase="stop", reason="view_pose_refused_after_flatten")
-                    return "view_pose_refused_after_flatten"
+                    return "stop"
                 obs, scene = await scene_from_capture()
                 ctx = await context_for(scene, filled)
                 reconcile_pallet(ctx, f"after_flatten_{i}")
@@ -1491,10 +1509,10 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 if not stroke_ok:
                     ep.event("flow", phase="flatten_done", sweeps_done=i, reason="move_refused", seed=seed)
                     print(f"Flatten {i}/{sweeps}: a move was refused; no more sweeps", flush=True)
-                    return None
+                    return i
             ep.event("flow", phase="flatten_done", sweeps_done=sweeps, reason="all_sweeps_done", taller_than_sweep=len(taller_heap_blocks()[1]),
                      seed=seed)
-            return None
+            return sweeps
 
         async def push_out_rows(label):
             """When MAX_RESCANS looks in a row found nothing to pick and three or more flat blocks lie side by side
@@ -1679,7 +1697,7 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
         async def pick_phase():
             """Place blocks until the layer is full, the placement budget is spent, or a hard stop."""
             nonlocal filled, last_pose, obs, scene, ctx, queue, flow_stopped, rescans_without_progress, placed_at_last_scan, x_sweeps_used, \
-                push_outs_used
+                push_outs_used, flatten_used
             rescans_without_progress = 0
             placed_at_last_scan = 0
             while len(placed) < max_blocks:
@@ -1719,6 +1737,15 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                     if len(placed) > placed_at_last_scan:
                         rescans_without_progress = 0
                     placed_at_last_scan = len(placed)
+                    if rescans_without_progress >= MAX_RESCANS and flatten_used < flatten_sweeps:
+                        # Nothing pickable now: the random sweeps not spent at the start (picks come first, operator 30 Oct).
+                        done = await flatten_heap(flatten_sweeps - flatten_used)
+                        if done == "stop":
+                            flow_stopped = True; break
+                        if done:
+                            flatten_used += done
+                            rescans_without_progress = 0
+                            continue
                     if rescans_without_progress >= MAX_RESCANS and push_outs_used < push_outs:
                         # Flat blocks side by side: slide the middle ones out first (operator, 30 Oct), then look again.
                         done = await push_out_rows(slot["slot_id"])
@@ -2047,11 +2074,12 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                   f"{', '.join(format(o, '+.1f') for o in plan['offsets_mm']) or '-'} mm; "
                   f"{'push together ' + format(plan['push']['distance_mm'], '.1f') + ' mm' if plan['push'] else 'no push needed'}, "
                   f"{len(plan['ends'])} end push(es)", flush=True)
-            if len(row) < target.blocks_per_layer:
-                # Operator, 30 Oct: no pushing or aligning until the layer's blocks are all on the pallet; the fill loop
-                # fetches the missing ones first.
+            if len(row) != target.blocks_per_layer:
+                # Operator, 30 Oct: no pushing or aligning until exactly the layer's blocks are on the pallet; the fill loop
+                # fetches missing ones, the pallet check takes extra ones off (run 14: four blocks were pushed 98.9 mm).
                 ep.event("flow", phase="push_waits_for_full_row", blocks=len(row), needed=target.blocks_per_layer)
-                print(f"Pallet shows {len(row)} of {target.blocks_per_layer} blocks; no pushing or aligning until all are there", flush=True)
+                print(f"Pallet shows {len(row)} of {target.blocks_per_layer} blocks; no pushing or aligning until exactly "
+                      f"{target.blocks_per_layer} are there", flush=True)
                 return pallet_count
             if plan["push"] is None and not plan["ends"]:
                 return pallet_count
@@ -2175,16 +2203,22 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
         rescans_without_progress = 0
         placed_at_last_scan = 0
         pallet_count = len([s for s in filled if s.startswith('L0')])
+        flatten_used = 0
         if flatten_sweeps and next_open_slot(target, filled) is not None:
-            if await flatten_heap(flatten_sweeps):
+            done = await flatten_heap(flatten_sweeps)            # sweeps only while nothing is pickable
+            if done == "stop":
                 return 1
+            flatten_used += done
         for fill_round in range(MAX_FILL_ROUNDS):
             await pick_phase()
             # --- home, measure, push the table row together if the measured gaps say so (layer 0 only), measure again
             await bot.gripper.open()
             ok, _ = await bot.move_to(*home)
             ep.event("flow", phase="home", accepted=ok, placed=placed, pose=list(home), fill_round=fill_round)
-            await push_phase()
+            if not flow_stopped:
+                # Never push after a stop (run 14, 21:41: the pallet check stopped on an extra block it could not grip,
+                # and the push stage then pushed four blocks 98.9 mm).
+                await push_phase()
             if not flow_stopped:
                 fixed = await square_pallet(f"after_push_{fill_round}")
                 if fixed == "stop":

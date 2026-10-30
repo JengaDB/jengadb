@@ -381,10 +381,11 @@ class RunFlowHarness(unittest.TestCase):
         self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
         self.assertEqual(sorted(b[0] for b in world.blocks), ["A", "C", "FELL1"])
 
-    def test_random_flatten_sweeps_knock_a_block_flat_before_picking(self):
-        # Operator, 30 Oct: after going home, sweep a few times at random so the heap is flatter. --knock-over is off,
-        # so only the flattening sweeps can lay the block on its edge down.
-        world = World([("A", 430.0, 60.0, 30.0, 0), ("C", 470.0, 250.0, -40.0, 0), ("EDGE1", 360.0, 180.0, 10.0, 0)])
+    def test_random_flatten_sweeps_only_when_nothing_good_to_pick(self):
+        # Operator, 30 Oct: sweep at random so the heap is flatter, but pick good candidates first (run 14: a sweep turned
+        # two pickable blocks into none). Only a block on its edge: nothing good, so it is swept; once it lies flat the
+        # sweeping stops and it is picked. --knock-over is off, so only the sweep can lay it down.
+        world = World([("EDGE1", 360.0, 180.0, 10.0, 0)])
         rc, events = self.run_with_upright(world, "EDGE", (75.0, 15.0, 25.0), (12.0, 30.0), 20.0, knock_over=False,
                                            flatten_sweeps=3, flatten_seed=5)
         sweeps = [e for e in events if e.get("phase") == "flatten_sweep"]
@@ -392,12 +393,22 @@ class RunFlowHarness(unittest.TestCase):
         self.assertEqual(len(sweeps), 1)
         self.assertEqual((sweeps[0]["tips_mm"], sweeps[0]["seed"], sweeps[0]["taller_than_sweep"]), (18.0, 5, 1))
         self.assertLess(math.dist(sweeps[0]["target_xy"], (360.0, 180.0)), 10.0)
-        self.assertEqual((done[0]["sweeps_done"], done[0]["reason"]), (1, "nothing_above_sweep_height"))   # flat after one
-        first_pick = next(i for i, e in enumerate(events) if e.get("phase") == "plan_block")
-        self.assertLess(events.index(done[0]), first_pick)                       # all before any pick
+        self.assertEqual((done[0]["sweeps_done"], done[0]["reason"]), (1, "pickable_candidates_first"))   # stops once pickable
+        first_pick = next(e for e in events if e.get("phase") == "plan_block")
+        self.assertLess(events.index(done[0]), events.index(first_pick))
+        self.assertLess(first_pick["block_top_mm"], 20.0)                        # the swept block, now lying flat
         self.assertFalse(any(e.get("phase") == "knock_over" for e in events))
-        self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
-        self.assertEqual(sorted(b[0] for b in world.blocks), ["A", "C", "FELL1"])
+        self.assertEqual(sorted(b[0] for b in world.blocks), ["FELL1"])
+
+    def test_good_candidates_are_picked_before_any_sweep(self):
+        # A flat block to pick and a block on its edge: no sweep, the flat one is picked first.
+        world = World([("EDGE1", 360.0, 180.0, 10.0, 0), ("A", 430.0, 60.0, 30.0, 0)])
+        rc, events = self.run_with_upright(world, "EDGE", (75.0, 15.0, 25.0), (12.0, 30.0), 20.0, knock_over=False,
+                                           flatten_sweeps=3, flatten_seed=5)
+        self.assertFalse(any(e.get("phase") == "flatten_sweep" for e in events))
+        self.assertEqual([e["reason"] for e in events if e.get("phase") == "flatten_done"][0], "pickable_candidates_first")
+        first_pick = next(e for e in events if e.get("phase") == "plan_block")
+        self.assertLess(math.dist(first_pick["pick_xy"], (430.0, 60.0)), 5.0)    # the flat block, not the one on its edge
 
     def test_packed_heap_gets_an_x_sweep_after_two_empty_looks(self):
         # Run 10 (20:53): flat blocks packed parallel, no grasp with room for the claws, two rescans, stop. Operator: then
@@ -475,7 +486,7 @@ class RunFlowHarness(unittest.TestCase):
         out = [e for e in events if e.get("phase") == "out_of_work_area"]
         self.assertTrue(out and all(math.hypot(*xy) > 580.0 for xy in out[0]["xy"]))
         self.assertFalse(any(e.get("phase") == "flatten_sweep" for e in events))
-        self.assertEqual([e["reason"] for e in events if e.get("phase") == "flatten_done"], ["nothing_above_sweep_height"])
+        self.assertEqual([e["reason"] for e in events if e.get("phase") == "flatten_done"][0], "pickable_candidates_first")
         self.assertFalse(any(math.dist(e["pick_xy"], (520.0, 280.0)) < 20 for e in events if e.get("phase") == "plan_block"))
         self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
         self.assertEqual([b[1:3] for b in world.blocks if b[0] in ("LOW", "TOP")], [[520.0, 280.0], [520.0, 280.0]])   # untouched
@@ -558,6 +569,21 @@ class RunFlowHarness(unittest.TestCase):
         first_push = next(i for i, e in enumerate(events) if e.get("phase") == "push_together")
         self.assertLess(events.index(repair[0]), first_push)                     # fixed before any pushing
 
+    def test_four_blocks_on_the_pallet_are_never_pushed(self):
+        # Run 14 (21:41): the pallet check stopped on an extra block it could not take off, and the push stage then pushed
+        # four blocks 98.9 mm. Without --drop-spot the extra can only be reported; the push stage waits for exactly three.
+        self.world_for_pallet = World([("F", 360.0, 40.0, 30.0, 0), ("G", 330.0, 170.0, 10.0, 0), ("H", 470.0, 260.0, 90.0, 0),
+                                       ("K", 420.0, 330.0, -20.0, 0), ("Q", 460.0, 120.0, 60.0, 0)])
+
+        def double_pick(gripper, b, n):
+            if n == 3:
+                k = next(x for x in gripper.w.blocks if x[0] == "K")
+                k[1], k[2], k[3], k[4] = b[1], b[2] + 25.0, b[3], 0
+        rc, events = self.run_with_pallet_mishap(double_pick)
+        self.assertTrue([e for e in events if e.get("phase") == "pallet_fix_needs_drop_spot"])
+        self.assertIn(4, [e["blocks"] for e in events if e.get("phase") == "push_waits_for_full_row"])
+        self.assertFalse(any(e.get("phase") in ("push_together", "push_align") for e in events))
+
     def test_block_landing_turned_is_put_back_square(self):
         self.world_for_pallet = self.flat_heap()
 
@@ -579,7 +605,7 @@ class RunFlowHarness(unittest.TestCase):
                        ("C", 470.0, 120.0, 10.0, 0), ("UP", 330.0, 200.0, 0.0, 0)])
         rc, events = self.run_flow(world, flatten_sweeps=2, flatten_seed=3)
         self.assertFalse(any(e.get("phase") == "flatten_sweep" for e in events))
-        self.assertEqual([e["reason"] for e in events if e.get("phase") == "flatten_done"], ["top_layer_pickable"])
+        self.assertEqual([e["reason"] for e in events if e.get("phase") == "flatten_done"][0], "pickable_candidates_first")
         first = next(e for e in events if e.get("phase") == "plan_block")
         self.assertLess(math.dist(first["pick_xy"], (360.0, 60.0)), 5.0)
         self.assertGreater(first["block_top_mm"], 25.0)                         # the block lying on LOW
@@ -588,7 +614,7 @@ class RunFlowHarness(unittest.TestCase):
     def test_no_flatten_sweeps_on_a_flat_heap(self):
         rc, events = self.run_flow(self.flat_heap(), flatten_sweeps=3)
         self.assertFalse(any(e.get("phase") == "flatten_sweep" for e in events))
-        self.assertEqual([e["reason"] for e in events if e.get("phase") == "flatten_done"], ["nothing_above_sweep_height"])
+        self.assertEqual([e["reason"] for e in events if e.get("phase") == "flatten_done"][0], "pickable_candidates_first")
         self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
 
     def test_low_travel_goes_over_a_tall_block_near_its_path(self):

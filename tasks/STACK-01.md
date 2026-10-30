@@ -657,6 +657,31 @@ local/layer-stack-data/live/episodes/):
     first and not swept; a missed first placement is seen at once and its slot refilled.
   - 194 tests pass. Untested live.
 
+- 30 Oct 21:38-21:42 UTC, fourteenth cycle (@f8cc9eb).
+  - Flatten sweeps ran first, as designed then. Eligible picks went 0, 2 (after sweep 1), 0 (sweep 2 destroyed them),
+    1.
+  - L0S0 side grip (close-up 14.8 mm) held and placed; the check after it counted 1. Two empty looks, then an X
+    sweep (one stroke) made 2 pickable. L0S1 placed; check counted 2. L0S2 placed.
+  - The check after L0S2 counted 4, including a block 33 mm off the line at (406.5, 290). It was extra, had no clear
+    grip, and the flow stopped (`pallet_repair_impossible`).
+  - But the fill loop still ran the push stage, which needed only "at least 3", and pushed four blocks 98.9 mm.
+  - A second start at 21:42:42 was stopped by the operator with Ctrl-C during its first sweep.
+- Change (operator: check for good candidates first, and sweep only when there are none, not full sweep mode):
+  - `flatten_heap` stops before every sweep, the first included, while any good candidate exists
+    (`pickable_candidates_first`). A good candidate has a usable grip now and lies flat; a block on its edge, on
+    end or tilted is not.
+  - Sweeps not spent at the start are used when two looks find nothing to pick, before push-outs and X sweeps.
+  - The pick queue puts blocks lying flat before blocks that would need laying flat first; the top layer first
+    within each.
+- Fixes from run 14: the push stage never runs after the flow has stopped, and needs exactly the layer's three
+  blocks (with more it waits for the pallet check to take the extra off).
+- Tests (harness):
+  - an edge block alone is swept once, then picked once flat;
+  - a flat block and an edge block: no sweep, the flat one first;
+  - a double pick without `--drop-spot` is reported and four blocks are never pushed;
+  - the earlier sweep tests now expect picks first.
+  - 196 tests pass. Untested live.
+
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot
 complete until it is changed; table height and camera offset are unverified; `--grip-lower-mm 3` is a single-run fix,
 not a calibration; source and base must be reachable (x <= ~600 mm worked) and both visible from the view pose.
