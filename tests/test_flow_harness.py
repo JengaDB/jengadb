@@ -358,6 +358,18 @@ class RunFlowHarness(unittest.TestCase):
         self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
         self.assertEqual(sorted(b[0] for b in world.blocks), ["A", "C", "FELL1"])
 
+    def test_low_travel_goes_over_a_tall_block_near_its_path(self):
+        # Spec: the closed claws travel 30 mm above the table during the push stage. A 60 mm-tall object (here a block
+        # rendered at level 3, rejected for picking) right on the way from home to the push start is gone over instead.
+        world = self.flat_heap()
+        world.blocks.append(["TALL", 250.0, 232.0, 60.0, 3, 0.0, 0.0])
+        rc, events = self.run_flow(world)
+        detours = [e for e in events if e.get("phase") == "low_travel_detour"]
+        self.assertTrue(detours)
+        self.assertTrue(any(abs(o[0] - 250.0) < 5 and abs(o[1] - 232.0) < 5 for d in detours for o in d["over"]))
+        self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
+        self.assertEqual([b[1:3] for b in world.blocks if b[0] == "TALL"], [[250.0, 232.0]])   # never touched
+
     def refused_before_picking(self, spot, reason):
         rc, events = self.run_flow(self.flat_heap(), drop_spot_xy=spot)
         self.assertEqual(rc, 1)

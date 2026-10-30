@@ -223,25 +223,6 @@ class LiftCheck(unittest.TestCase):
         self.assertEqual(ls.blocks_left_behind(src, held), 0)
 
 
-class RowPush(unittest.TestCase):
-    def test_single_direction_push_closes_gaps_and_centres_in_one_stroke(self):
-        from robot_hackathon.live_executor import row_push_plan
-        # Row along +y, (ax, ay) = (0, 1). Nominal anchor for a 3 x 25 mm row centred on y 195 is 170; it was released
-        # 8 mm past that toward the open end (178) and the next two 39 mm apart (14 mm release spacing).
-        pts = [(440, 178), (440, 217), (440, 256)]          # 14 mm release spacing: pitch 39
-        plan = row_push_plan(pts, (440, 195), 0.0, 1.0, 25.0)
-        self.assertAlmostEqual(plan["gaps_mm"], 28.0)
-        # closed row centre = anchor + 25 = 203 -> must move 8 mm toward the anchor (-a): pushable
-        self.assertAlmostEqual(plan["shift_mm"], 8.0)
-        self.assertAlmostEqual(plan["unpushable_mm"], 0.0)
-        # a row whose anchor sits short of nominal cannot be fixed by pushing toward the anchor
-        plan = row_push_plan([(440, 160), (440, 185), (440, 210)], (440, 195), 0.0, 1.0, 25.0)
-        self.assertAlmostEqual(plan["gaps_mm"], 0.0)
-        self.assertAlmostEqual(plan["shift_mm"], 0.0)
-        self.assertAlmostEqual(plan["unpushable_mm"], 10.0)
-        self.assertEqual(row_push_plan([], (440, 195), 0.0, 1.0, 25.0)["gaps_mm"], 0.0)
-
-
 class ReleaseSpacing(unittest.TestCase):
     def test_across_grasps_leave_the_claw_sweep_next_to_a_neighbour(self):
         from robot_hackathon.live_executor import release_spacing_mm
@@ -253,45 +234,47 @@ class ReleaseSpacing(unittest.TestCase):
         self.assertAlmostEqual(release_spacing_mm("ends", finger, 25.0, 14.0), 14.0)
 
 
-class RowAlign(unittest.TestCase):
-    def test_blocks_sticking_out_along_their_length_are_listed_largest_first(self):
-        from robot_hackathon.live_executor import row_align_plan
-        # row along +y, blocks' long sides along +x (long_deg 0); the middle block sits 7 mm further along +x
-        pts = [(440, 170), (447, 195), (438, 220)]
-        plan = row_align_plan(pts, 0.0, 5.0)
-        self.assertEqual([(i, round(o, 1)) for i, o in plan], [(1, 7.0)])
-        self.assertEqual(row_align_plan([(440, 170), (443, 195), (438, 220)], 0.0, 5.0), [])   # within 5 mm
-        # long sides along +y (row runs along x): offsets measured along y
-        plan = row_align_plan([(440, 195), (465, 195), (490, 232)], 90.0, 5.0)
-        self.assertEqual([(i, round(o, 1)) for i, o in plan], [(2, 37.0)])
-        # the photo of 11:33: three blocks each shifted ~18 mm further along their length than the previous one
-        plan = row_align_plan([(440, 170), (458, 195), (476, 220)], 0.0, 5.0)
-        self.assertEqual([(i, round(o, 1)) for i, o in plan], [(0, -18.0), (2, 18.0)])
-        self.assertEqual(row_align_plan([(440, 170)], 0.0, 5.0), [])
+class PalletPushPlan(unittest.TestCase):
+    """Sam's pallet procedure (30 Oct spec): one look, push together, line up the ends against the last block."""
+    dims = None
 
-    def test_one_stroke_lines_up_every_end(self):
-        from robot_hackathon.live_executor import row_align_push, PUSH_START_GAP_MM
-        origin = (440.0, 195.0)
-        self.assertIsNone(row_align_push([(440, 170), (443, 195), (438, 220)], 0.0, 5.0, origin))   # within 5 mm
-        # kazy-palletize-30oct 19:40:53: ends at x 436.3 / 430.4 / 441.8 took two end pushes; now one stroke from -x
-        # pushes the two short of 441.8 (blocks 0 and 1, aimed between them) and keeps the row near the pallet origin
-        plan = row_align_push([(436.3, 167.7), (430.4, 192.5), (441.8, 217.5)], 0.0, 5.0, origin)
-        self.assertEqual(plan["sign"], -1.0)
-        self.assertEqual(plan["pushed"], [0, 1])
-        self.assertAlmostEqual(plan["aim_xy"][1], (167.7 + 192.5) / 2)
-        self.assertAlmostEqual(plan["aim_xy"][0], 430.4)                       # the stroke starts beyond the furthest-out end
-        self.assertAlmostEqual(plan["distance_mm"], PUSH_START_GAP_MM + 11.4 - 1.0)
-        self.assertAlmostEqual(plan["line_mm"], 441.8)
-        # one block out on its own: only that block is pushed back to the other two
-        plan = row_align_push([(440, 170), (440, 195), (450, 220)], 0.0, 5.0, origin)
-        self.assertEqual((plan["sign"], plan["pushed"]), (1.0, [2]))
-        # the 11:33 photo (ends stepped 18 mm): one stroke for both outer blocks, aimed at the middle (claws 45 mm wide
-        # reach blocks 25 mm either side), pushing them back to the middle block's line
-        plan = row_align_push([(440, 170), (458, 195), (476, 220)], 0.0, 5.0, (458.0, 195.0))
-        self.assertEqual(len(plan["pushed"]), 2)
-        self.assertAlmostEqual(plan["distance_mm"], PUSH_START_GAP_MM + 36.0 - 1.0)
-        self.assertIsNone(row_align_push([(440, 170)], 0.0, 5.0, origin))
+    def plan(self, pts, tol=2.0):
+        from robot_hackathon.grasp_geometry import BlockDimensions
+        from robot_hackathon.live_executor import pallet_push_plan
+        return pallet_push_plan(pts, 0.0, BlockDimensions(), tol)   # long sides along +x, row along +y
 
+    def test_push_together_starts_beside_the_last_block_and_covers_gaps_plus_ten(self):
+        from robot_hackathon.live_executor import PUSH_START_GAP_MM, CLAW_THICKNESS_MM
+        # kazy-palletize-30oct 19:40:35: released 77 mm apart, gaps 105.7 mm
+        plan = self.plan([(436.0, 175.7), (427.6, 252.6), (438.5, 330.2)])
+        self.assertAlmostEqual(plan["gaps_mm"], 105.7, delta=0.3)
+        self.assertEqual(plan["push"]["direction"][1], -1.0)                       # toward the first block
+        self.assertAlmostEqual(plan["push"]["start_xy"][1], 330.2 + 12.5 + CLAW_THICKNESS_MM + PUSH_START_GAP_MM)
+        self.assertAlmostEqual(plan["push"]["distance_mm"], plan["gaps_mm"] + 10.0)
+        self.assertIsNone(self.plan([(440, 170), (440, 195.5), (440, 220.5)])["push"])   # gaps under 2 mm: no push
+
+    def test_ends_line_up_with_the_last_block_furthest_first(self):
+        # second cycle, after the push: ends at x 436.3 / 430.4 / 441.8; reference = the last block (441.8)
+        plan = self.plan([(436.3, 167.7), (430.4, 192.5), (441.8, 217.5)])
+        self.assertEqual([round(o, 1) for o in plan["offsets_mm"]], [-5.5, -11.4])
+        first = plan["ends"][0]
+        self.assertEqual(first["index"], 1)                                         # furthest first
+        self.assertAlmostEqual(first["distance_mm"], 11.4 + 5.0, places=1)
+        self.assertEqual(first["direction"], (1.0, 0.0))                            # pushed toward +x, back to the line
+        self.assertAlmostEqual(first["start_xy"][0], 430.4 - (37.5 + 5.0 + 8.0))     # end + 5 mm gap + 8 to the claws' middle
+        self.assertEqual(first["also_lines_up"], [0])                               # its neighbour sticks out the same way, less
+        self.assertEqual(len(plan["ends"]), 1)
+
+    def test_within_two_mm_is_never_touched_and_opposite_sides_are_separate(self):
+        self.assertEqual(self.plan([(441.0, 170), (439.5, 195), (440.0, 220)])["ends"], [])
+        plan = self.plan([(446.0, 170), (433.0, 195), (440.0, 220)])                  # +6 and -7 vs the last block
+        self.assertEqual([e["index"] for e in plan["ends"]], [1, 0])
+        self.assertEqual([e["also_lines_up"] for e in plan["ends"]], [[], []])
+        self.assertEqual([e["direction"][0] for e in plan["ends"]], [1.0, -1.0])
+        # predicted positions after the closing push: blocks touch, the first one does not move
+        plan = self.plan([(446.0, 170), (433.0, 250), (440.0, 330)])
+        self.assertAlmostEqual(plan["ends"][0]["start_xy"][1], 195.0)                # block 1 now 25 mm from the first
+        self.assertEqual(self.plan([(440, 170)])["ends"], [])
 
 class GripReport(unittest.TestCase):
     def test_empty_grip_detection_from_gripper_report(self):

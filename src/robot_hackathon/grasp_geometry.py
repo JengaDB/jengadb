@@ -686,12 +686,21 @@ def standing_on_end(geometry, dims):
             and length <= 0.6 * dims.length_mm and (width is None or width <= 1.3 * dims.width_mm))
 
 
-def misplaced_on_pallet_reasons(geometry, tilt_deg, dims, max_tilt_deg=REORIENT_TILT_DEG):
+PALLET_YAW_TOLERANCE_DEG = 10.0   # a pallet block turned further than this from the row's long side is taken off (pushes cannot turn it)
+
+
+def misplaced_on_pallet_reasons(geometry, tilt_deg, dims, max_tilt_deg=REORIENT_TILT_DEG, row_long_deg=None,
+                                max_yaw_deg=PALLET_YAW_TOLERANCE_DEG):
     """A pallet block that must be taken off and laid flat again: not one block thick (on a neighbour, on its edge),
-    standing on its edge, or tilted. Only positive evidence counts here: pallet blocks touch, so their masks can be
-    trimmed, and a short footprint or an unmeasurable face is not a reason to disturb a good row."""
-    return [r for r in lying_flat_reasons(geometry, tilt_deg, dims, max_tilt_deg)
-            if r == "on_edge" or (r.startswith("height:") and r != "height:unknown") or (r.startswith("tilt:") and r != "tilt:unknown")]
+    standing on its edge, tilted, or (given row_long_deg) turned off the row's long side, e.g. rotated 90 deg or lying
+    diagonally. Only positive evidence counts here: pallet blocks touch, so their masks can be trimmed, and a short
+    footprint or an unmeasurable face is not a reason to disturb a good row."""
+    reasons = [r for r in lying_flat_reasons(geometry, tilt_deg, dims, max_tilt_deg)
+               if r == "on_edge" or (r.startswith("height:") and r != "height:unknown") or (r.startswith("tilt:") and r != "tilt:unknown")]
+    long_deg = geometry.get("base_long_side_deg")
+    if row_long_deg is not None and long_deg is not None and abs(wrap_90(long_deg - row_long_deg)) > max_yaw_deg:
+        reasons.append(f"rotated:{wrap_90(long_deg - row_long_deg):+.0f}deg")
+    return reasons
 
 
 def grip_tips_mm(block_height, claws_deg, params, block_thickness_mm=None):

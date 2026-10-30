@@ -93,6 +93,11 @@ class Reasons(unittest.TestCase):
         self.assertEqual(on_neighbour, ["height:30.0mm_not_one_block"])
         self.assertEqual(geom.misplaced_on_pallet_reasons(flat_geometry(height_above_table_mm=18.0), 12.0, self.dims), ["tilt:12.0deg"])
         self.assertIn("on_edge", geom.misplaced_on_pallet_reasons(flat_geometry(height_above_table_mm=25.0, flags=["possibly_on_edge"]), 0.5, self.dims))
+        # turned off the row (edge-case list: rotated 90, diagonal): the stacking stage needs the three parallel within 4 deg
+        self.assertEqual(geom.misplaced_on_pallet_reasons(flat_geometry(base_long_side_deg=2.0), 1.0, self.dims, row_long_deg=0.0), [])
+        self.assertEqual(geom.misplaced_on_pallet_reasons(flat_geometry(base_long_side_deg=-88.0), 1.0, self.dims, row_long_deg=0.0), ["rotated:-88deg"])
+        self.assertEqual(geom.misplaced_on_pallet_reasons(flat_geometry(base_long_side_deg=35.0), 1.0, self.dims, row_long_deg=0.0), ["rotated:+35deg"])
+        self.assertEqual(geom.misplaced_on_pallet_reasons(flat_geometry(base_long_side_deg=89.0), 1.0, self.dims, row_long_deg=-89.0), [])   # same direction
 
 
 

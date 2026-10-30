@@ -29,9 +29,6 @@ PICK_LIFT_MM = 100.0
 CLAW_THICKNESS_MM = 8.0           # Sam's; closed claws are two claws thick
 PUSH_START_GAP_MM = 5.0           # gap between the closed claws and the last block before the push starts
 PUSH_TIPS_MM = 7.0                # claw tips above the table while pushing (5 was 2 mm too low: operator, 30 Oct 19:22)
-ALIGN_PUSH_ATTEMPTS = 1           # end-alignment strokes per push phase: one stroke lines up every end (row_align_push)
-CENTRE_PUSH_ATTEMPTS = 1          # close-and-centre pushes per push phase; on 30 Oct the remaining 3-4 mm "gap" came from a
-                                  # block skewed 13 mm along its length, and five more pushes only slid the row 32 mm off
 DROP_HEIGHT_MM = 25.0             # a block to be laid flat is released with its bottom about this far above the drop spot
 DROP_CLEAR_MM = 60.0              # nothing else may lie within this of the drop spot (a 75 mm block landing any way round)
 DROP_FIND_MM = 70.0               # after the drop, the block is looked for within this of the spot
@@ -46,17 +43,18 @@ MAX_RESCANS = 2                   # consecutive re-captures without a placement 
 MAX_FILL_ROUNDS = 3               # pick-then-push rounds: a block lost on the way or knocked out is fetched again
 GRIP_WIDTH_EMPTY_MM = 0.5         # a reported opening at or below this after grab(): the claws met, nothing is held
 PLACE_SPACING_MM = 14.0           # extra pitch between consecutive pallet blocks at placement; the push closes it
-ROW_PRE_OFFSET_MM = 8.0           # the first pallet block goes this far past nominal, toward the open end of the row, so
-                                  # the single-direction push can bring the closed row back onto the pallet centre
+ROW_PRE_OFFSET_MM = 0.0           # the first pallet block goes on its nominal slot: the closing push (pallet_push_plan)
+                                  # pushes the others against it and no longer centres the row (was 8 for that, 30 Oct)
 ROW_LANE_HALF_WIDTH_MM = 20.0     # a released pallet block's centre lies within this of the row axis (along its long side)
 APPROACH_MM = 40.0                # the last part of every descent to the table is driven at approach_speed
 DEFAULT_ARM_SPEED_DEG_S = 180.0   # restore value when the operator gave no --arm-speed (the value used on 30 Oct)
 DEFAULT_APPROACH_SPEED_DEG_S = 40.0
 DEFAULT_PUSH_SPEED_DEG_S = 30.0
 DEFAULT_ALIGN_SPEED_DEG_S = 90.0  # wrist rotations when aligning the claws over a block or the row (45 felt slow: operator, 30 Oct)
-ROW_CENTRE_TOLERANCE_MM = 3.0
-ROW_ALIGN_TOLERANCE_MM = 5.0      # a pallet block whose ends stick out further than this gets pushed back along its length
-ROW_PUSH_ROUNDS = 6               # capture/push rounds for closing, centring and end alignment together
+ROW_ALIGN_TOLERANCE_MM = 2.0      # a pallet block whose end sticks out past the last block's by more is pushed back (spec, 30 Oct)
+LOW_TRAVEL_TIPS_MM = 30.0         # pallet push stage: closed claws travel this high, over 15 mm block tops with 15 to spare
+LOW_TRAVEL_MARGIN_MM = 10.0       # anything taller than LOW_TRAVEL_TIPS_MM minus this near the path is gone over, not through
+LOW_PATH_HALF_WIDTH_MM = 65.0     # path clearance: claw face half-width 22.5 + a block's half-length 37.5 + 5
 PUSH_SEGMENT_MM = 25.0            # a push stroke is planned in segments no longer than this (long constrained moves
                                   # stalled viam-server's heartbeat on 30 Oct: "Lost connection" during a 60 mm push)
 
@@ -70,23 +68,6 @@ def release_spacing_mm(grasp_style, finger, block_width_mm, base_spacing_mm):
         return base_spacing_mm
     sweep = (finger.open_gap_mm - block_width_mm) / 2 + finger.claw_thickness_mm + finger.margin_mm
     return max(base_spacing_mm, sweep)
-
-
-def row_push_plan(points, origin_xy, ax, ay, block_width_mm):
-    """Single-direction push arithmetic for a pallet row. points: block centres ordered along the row axis (ax, ay),
-    points[0] being the anchor the others are pushed against. Returns gaps (total open space between neighbours),
-    offset (how far the row centre must move along +a to sit on the origin), shift (the pushable part: how far the
-    closed row must still move toward the anchor, i.e. along -a) and unpushable (how far it would have to move the
-    other way, which a one-direction push cannot do)."""
-    if not points:
-        return {"gaps_mm": 0.0, "offset_mm": 0.0, "shift_mm": 0.0, "unpushable_mm": 0.0}
-    w = block_width_mm
-    gaps = sum(max(0.0, math.hypot(b[0] - a[0], b[1] - a[1]) - w) for a, b in zip(points, points[1:]))
-    centre = (sum(p[0] for p in points) / len(points), sum(p[1] for p in points) / len(points))
-    offset = (origin_xy[0] - centre[0]) * ax + (origin_xy[1] - centre[1]) * ay
-    closed_centre = (points[0][0] + (len(points) - 1) / 2 * w * ax, points[0][1] + (len(points) - 1) / 2 * w * ay)
-    after_close = (origin_xy[0] - closed_centre[0]) * ax + (origin_xy[1] - closed_centre[1]) * ay
-    return {"gaps_mm": gaps, "offset_mm": offset, "shift_mm": max(0.0, -after_close), "unpushable_mm": max(0.0, after_close)}
 
 
 def knock_plan(block_xy, top_long_deg, others_xy, avoid, dims, forbidden=None, clear_mm=KNOCK_CLEAR_MM):
@@ -122,49 +103,58 @@ def knock_plan(block_xy, top_long_deg, others_xy, avoid, dims, forbidden=None, c
     return None
 
 
-def row_align_push(points, long_deg, tolerance_mm, origin_xy, block_width_mm=25.0):
-    """One stroke that lines up every block's ends (operator request, 30 Oct: instead of one block per round). Pushing
-    from one end of the row's long axis brings every block back to the line of the block furthest back on that side;
-    the closed claws aim between the blocks that stick out, so both are pushed in the same move (claws 45 mm wide,
-    blocks 25 mm apart). Of the two sides, the one leaving the row centre closer to the pallet origin along the long
-    axis is chosen. Returns None when the ends are already within tolerance, else {sign, aim_xy, distance_mm, pushed,
-    line_mm}: the claws start beyond aim_xy on the +sign side and slide toward -sign."""
-    if len(points) < 2:
-        return None
-    a = math.radians(long_deg)
-    ux, uy = math.cos(a), math.sin(a)
-    vx, vy = -uy, ux
-    along = [p[0] * ux + p[1] * uy for p in points]
-    lateral = [p[0] * vx + p[1] * vy for p in points]
-    lo, hi = min(along), max(along)
-    if hi - lo <= tolerance_mm:
-        return None
-    origin_along = origin_xy[0] * ux + origin_xy[1] * uy
-    best = None
-    for sign, line, extreme in ((1.0, lo, hi), (-1.0, hi, lo)):
-        pushed = [i for i, v in enumerate(along) if abs(v - line) > tolerance_mm]
-        after = [line if i in pushed else v for i, v in enumerate(along)]
-        cost = abs(sum(after) / len(after) - origin_along)
-        if best is None or cost < best[0]:
-            best = (cost, sign, line, extreme, pushed)
-    _, sign, line, extreme, pushed = best
-    lat = sum(lateral[i] for i in pushed) / len(pushed)
-    return {"sign": sign, "aim_xy": (extreme * ux + lat * vx, extreme * uy + lat * vy),
-            "distance_mm": PUSH_START_GAP_MM + (hi - lo) - 1.0, "pushed": pushed, "line_mm": line}
+def point_segment_distance(p, a, b):
+    """Distance from point p to the segment a-b in the table plane (mm)."""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    n = dx * dx + dy * dy
+    t = 0.0 if n == 0 else max(0.0, min(1.0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / n))
+    return math.hypot(p[0] - (a[0] + t * dx), p[1] - (a[1] + t * dy))
 
 
-def row_align_plan(points, long_deg, tolerance_mm):
-    """End alignment of a pallet row: each block's offset along the row's long-side axis from the row median. Returns
-    the blocks that stick out by more than tolerance_mm as (index, offset_mm), largest first; a positive offset means
-    the block sits further along +long and must be pushed back from that end."""
+def pallet_push_plan(points, long_deg, block_dims, tolerance_mm=ROW_ALIGN_TOLERANCE_MM, face_width_mm=45.0):
+    """The pallet push stage from one look (Sam's procedure, 30 Oct spec). points: block centres ordered across the
+    row, points[0] the first block (the others are pushed against it), points[-1] the last (the end-alignment
+    reference, never pushed along its length).
+    Step 1, when the gaps exceed PUSH_IF_GAPS_OVER_MM: start beside the last block on the side away from the first
+    (5 mm gap to the claws), push toward the first by the gaps + 10 mm; afterwards the blocks touch and the first has
+    not moved. Step 2, for every other block whose end sticks out past the last block's by more than tolerance_mm,
+    furthest first: start just past that end (end + 5 mm gap + 8 mm to the claws' middle), push along the block by the
+    overhang + 5 mm so its end stops level with the last block's. A neighbour sticking out the same way by no more is
+    caught by the claw face (face_width_mm) and lined up in the same push. Positions after step 1 are predicted, not
+    measured: the closing push moves blocks across the row only, so their offsets along it are unchanged."""
+    w, length = block_dims.width_mm, block_dims.length_mm
+    a, l = math.radians(long_deg + 90.0), math.radians(long_deg)
+    ax, ay, lx, ly = math.cos(a), math.sin(a), math.cos(l), math.sin(l)
+    across = [p[0] * ax + p[1] * ay for p in points]
+    along = [p[0] * lx + p[1] * ly for p in points]
+    gaps = sum(max(0.0, math.hypot(q[0] - p[0], q[1] - p[1]) - w) for p, q in zip(points, points[1:]))
+    plan = {"gaps_mm": gaps, "push": None, "ends": [], "offsets_mm": []}
     if len(points) < 2:
-        return []
-    a = math.radians(long_deg)
-    ux, uy = math.cos(a), math.sin(a)
-    along = [p[0] * ux + p[1] * uy for p in points]
-    median = sorted(along)[len(along) // 2]
-    off = [(i, v - median) for i, v in enumerate(along) if abs(v - median) > tolerance_mm]
-    return sorted(off, key=lambda t: -abs(t[1]))
+        return plan
+    side = 1.0 if across[-1] >= across[0] else -1.0          # from the first block toward the last
+    after = list(across)
+    if gaps > PUSH_IF_GAPS_OVER_MM:
+        back = w / 2 + CLAW_THICKNESS_MM + PUSH_START_GAP_MM
+        plan["push"] = {"start_xy": (points[-1][0] + side * ax * back, points[-1][1] + side * ay * back),
+                        "direction": (-side * ax, -side * ay), "distance_mm": gaps + 2 * PUSH_START_GAP_MM}
+        after = [across[0] + side * w * j for j in range(len(points))]
+    offsets = [along[i] - along[-1] for i in range(len(points) - 1)]
+    plan["offsets_mm"] = offsets
+    done = set()
+    reach = face_width_mm / 2 + w / 2 - 1.0
+    for i in sorted((i for i, o in enumerate(offsets) if abs(o) > tolerance_mm), key=lambda i: -abs(offsets[i])):
+        if i in done:
+            continue
+        o = offsets[i]
+        s = 1.0 if o > 0 else -1.0
+        back = length / 2 + PUSH_START_GAP_MM + CLAW_THICKNESS_MM
+        at_along = along[i] + s * back
+        also = [j for j, oj in enumerate(offsets) if j != i and j not in done and (oj > 0) == (o > 0)
+                and abs(oj) <= abs(o) and abs(after[j] - after[i]) <= reach]
+        plan["ends"].append({"index": i, "offset_mm": o, "start_xy": (at_along * lx + after[i] * ax, at_along * ly + after[i] * ay),
+                             "direction": (-s * lx, -s * ly), "distance_mm": abs(o) + PUSH_START_GAP_MM, "also_lines_up": also})
+        done |= {i, *also}
+    return plan
 
 
 def grip_failed(state, grab_result):
@@ -651,14 +641,12 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
 
         reconcile_pallet(ctx, "start")
         if skip_if_complete and next_open_slot(target, filled) is None:
-            # The pallet already holds the full layer. If it is also tight, centred and aligned there is nothing to do;
-            # otherwise fall through to the push rounds (the pick loop ends at once since no slot is open).
+            # The pallet already holds the full layer. If it is also tight and its ends line up there is nothing to do;
+            # otherwise fall through to the push stage (the pick loop ends at once since no slot is open).
             row0 = row_blocks(ctx, 0)
             pts0 = [g["base_point_mm"] for g in row0]
-            across0 = math.radians(target.layer0_long_side_deg + 90.0)
-            plan0 = row_push_plan(pts0, tower_origin, math.cos(across0), math.sin(across0), calib.block.width_mm)
-            tight = plan0["gaps_mm"] <= PUSH_IF_GAPS_OVER_MM and plan0["shift_mm"] <= ROW_CENTRE_TOLERANCE_MM \
-                and not row_align_plan(pts0, target.layer0_long_side_deg, ROW_ALIGN_TOLERANCE_MM)
+            plan0 = pallet_push_plan(pts0, target.layer0_long_side_deg, calib.block, ROW_ALIGN_TOLERANCE_MM, calib.finger.finger_width_mm)
+            tight = plan0["push"] is None and not plan0["ends"]
             ep.event("flow", phase="layer_already_complete", filled=filled, pallet_count=len(row0), tight=tight, plan=plan0)
             print(f"Pallet already holds {len(row0)} blocks; {'nothing to assemble' if tight else 'row needs pushing together'}", flush=True)
             if tight:
@@ -966,33 +954,6 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 placed.append({"slot": slot["slot_id"], "candidate": pick["candidate_id"], "released_at": [round(rx, 1), round(ry, 1)], "grasp": grasp["style"]})
                 ep.event("flow", phase="placed", slot=slot["slot_id"], released_block_xy=[round(rx, 1), round(ry, 1)], aligned_at_pick=aligned)
 
-        async def push_row(edge_block_xy, ux, uy, distance, label):
-            """Closed claws come down just outside `edge_block_xy` on the side opposite to (ux, uy), then slide `distance`
-            at push_speed. The final descent is slow as well; the travel speed is restored before going home."""
-            w = calib.block.width_mm
-            back = w / 2 + CLAW_THICKNESS_MM + PUSH_START_GAP_MM
-            start = (edge_block_xy[0] - ux * back, edge_block_xy[1] - uy * back)
-            await bot.gripper.grab()
-            g = await bot.gripper_origin()
-            travel_z = g[2]
-            ep.event("flow", phase=f"push_{label}", start_xy=[round(v, 1) for v in start], direction=[round(ux, 2), round(uy, 2)],
-                     distance_mm=round(distance, 1), speed_deg_s=push_speed)
-            print(f"Push ({label}): {distance:.1f} mm along ({ux:.2f}, {uy:.2f}) at {push_speed} deg/s", flush=True)
-            await bot.move_delta(dx=start[0] - g[0], dy=start[1] - g[1])
-            await bot.align_claws(wrap_90(target.layer0_long_side_deg + 90.0), tolerance_deg=1.5, align_speed=align_speed, travel_speed=travel_speed)
-            g = await bot.gripper_origin()
-            await bot.move_delta(dx=start[0] - g[0], dy=start[1] - g[1])
-            ok = await bot.descend_to(table_z + PUSH_TIPS_MM - TIP_ABOVE_GRIPPER_FRAME_MM, approach_speed, travel_speed)
-            if ok:
-                await bot.set_speed(push_speed)
-                ok = await slide(ux, uy, distance)
-            await bot.set_speed(travel_speed)
-            g = await bot.gripper_origin()
-            await bot.move_delta(dz=travel_z - g[2], near_table=True)
-            await bot.gripper.open()
-            await bot.move_to(*home)
-            return ok
-
         async def slide(ux, uy, distance):
             """Push stroke along (ux, uy) in planner-friendly segments of at most PUSH_SEGMENT_MM."""
             remaining = distance
@@ -1004,41 +965,9 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 remaining -= step
             return True
 
-        async def push_block_end(plan, long_deg):
-            """Line up the row's ends in one stroke (row_align_push): closed claws come down just beyond the ends that
-            stick out, aimed between those blocks, and slide them back to the line of the block furthest back (minus a
-            margin so that block is not pushed)."""
-            a = math.radians(long_deg)
-            ux, uy = math.cos(a), math.sin(a)
-            sign, aim = plan["sign"], plan["aim_xy"]
-            back = calib.block.length_mm / 2 + CLAW_THICKNESS_MM + PUSH_START_GAP_MM
-            start = (aim[0] + sign * ux * back, aim[1] + sign * uy * back)
-            distance = plan["distance_mm"]
-            await bot.gripper.grab()
-            g = await bot.gripper_origin()
-            travel_z = g[2]
-            ep.event("flow", phase="push_align", aim_xy=[round(v, 1) for v in aim], pushed=plan["pushed"],
-                     start_xy=[round(v, 1) for v in start], direction=[round(-sign * ux, 2), round(-sign * uy, 2)], distance_mm=round(distance, 1))
-            print(f"Push (align): {len(plan['pushed'])} block(s) back {distance - PUSH_START_GAP_MM + 1.0:.1f} mm along their length "
-                  f"in one stroke", flush=True)
-            await bot.move_delta(dx=start[0] - g[0], dy=start[1] - g[1])
-            await bot.align_claws(wrap_90(long_deg), tolerance_deg=1.5, align_speed=align_speed, travel_speed=travel_speed)   # claws close along the length: faces square to the push
-            g = await bot.gripper_origin()
-            await bot.move_delta(dx=start[0] - g[0], dy=start[1] - g[1])
-            ok = await bot.descend_to(table_z + PUSH_TIPS_MM - TIP_ABOVE_GRIPPER_FRAME_MM, approach_speed, travel_speed)
-            if ok:
-                await bot.set_speed(push_speed)
-                ok = await slide(-sign * ux, -sign * uy, distance)
-            await bot.set_speed(travel_speed)
-            g = await bot.gripper_origin()
-            await bot.move_delta(dz=travel_z - g[2], near_table=True)
-            await bot.gripper.open()
-            await bot.move_to(*home)
-            return ok
-
         async def repair_pallet(fill_round):
-            """After the push rounds (needs drop_spot_xy): a pallet block that does not lie flat (resting on a neighbour,
-            tilted, on its edge) is picked and laid flat on the drop spot, highest first, one per fill round; the top-up
+            """After the push stage (needs drop_spot_xy): a pallet block that does not lie flat (resting on a neighbour,
+            tilted, on its edge) or is turned off the row's long side is picked and laid flat on the drop spot, highest first, one per fill round; the top-up
             then fetches a replacement and the next round checks again (operator request, 30 Oct: pick-and-drop rather
             than sweeping the pallet). Sets flow_stopped when the block cannot be gripped or the drop fails."""
             nonlocal obs, scene, ctx, queue, flow_stopped, pallet_count
@@ -1050,7 +979,8 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                                                                   or in_row_lane(c["geometry"], any_height=True)):
                     continue
                 tilt = candidate_tilt(scene, c)
-                checked.append((c, tilt, geom.misplaced_on_pallet_reasons(c["geometry"], tilt, calib.block)))
+                checked.append((c, tilt, geom.misplaced_on_pallet_reasons(c["geometry"], tilt, calib.block,
+                                                                         row_long_deg=target.layer0_long_side_deg)))
             bad = [t for t in checked if t[2]]
             ep.event("flow", phase="pallet_check", fill_round=fill_round, observation_id=obs["observation_id"],
                      blocks=[{"candidate": c["candidate_id"], "xy": [round(v, 1) for v in c["geometry"]["base_point_mm"][:2]],
@@ -1083,52 +1013,115 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 flow_stopped = True; return
             pallet_count = len(row_blocks(ctx, 0))
 
+        async def move_low(xy, obstacles, high_z):
+            """Closed claws to xy at LOW_TRAVEL_TIPS_MM above the table: straight down where they are, then sideways. If
+            anything taller than LOW_TRAVEL_TIPS_MM - LOW_TRAVEL_MARGIN_MM (stacked blocks, the tower) lies near the path,
+            go over it at high_z and come down at xy instead; refuse if such a thing lies where the claws come down."""
+            g = await bot.gripper_origin()
+            low_z = table_z + LOW_TRAVEL_TIPS_MM - TIP_ABOVE_GRIPPER_FRAME_MM
+            tall = [o for o in obstacles if o[1] > LOW_TRAVEL_TIPS_MM - LOW_TRAVEL_MARGIN_MM]
+            if any(math.dist(o[0], xy) < LOW_PATH_HALF_WIDTH_MM - 30.0 for o in tall):
+                ep.event("flow", phase="low_travel_refused", target_xy=[round(v, 1) for v in xy], note="something tall where the claws come down")
+                return False
+            if any(point_segment_distance(o[0], g[:2], xy) < LOW_PATH_HALF_WIDTH_MM for o in tall):
+                ep.event("flow", phase="low_travel_detour", target_xy=[round(v, 1) for v in xy],
+                         over=[[round(v, 1) for v in o[0]] + [round(o[1], 1)] for o in tall if point_segment_distance(o[0], g[:2], xy) < LOW_PATH_HALF_WIDTH_MM])
+                if g[2] < high_z - 1.0:
+                    ok, _ = await bot.move_delta(dz=high_z - g[2], near_table=True)
+                    if not ok:
+                        return False
+                ok, _ = await bot.move_delta(dx=xy[0] - g[0], dy=xy[1] - g[1])
+                if not ok:
+                    return False
+                g = await bot.gripper_origin()
+                return (await bot.move_delta(dz=low_z - g[2], near_table=True))[0]
+            if abs(g[2] - low_z) > 1.0:
+                ok, _ = await bot.move_delta(dz=low_z - g[2], near_table=True)
+                if not ok:
+                    return False
+            return (await bot.move_delta(dx=xy[0] - g[0], dy=xy[1] - g[1], near_table=True))[0]
+
+        async def low_stroke(start, claws_deg, direction, distance, turn):
+            """At start (already at low height), optionally turn the claws, correct the position, lower to PUSH_TIPS_MM,
+            push `distance` along `direction` at push speed, rise back to LOW_TRAVEL_TIPS_MM. Returns accepted."""
+            if turn:
+                await bot.align_claws(wrap_90(claws_deg), tolerance_deg=1.5, align_speed=align_speed, travel_speed=travel_speed)
+                g = await bot.gripper_origin()
+                ok, _ = await bot.move_delta(dx=start[0] - g[0], dy=start[1] - g[1], near_table=True)   # the turn shifts it a little
+                if not ok:
+                    return False
+            ok = await bot.descend_to(table_z + PUSH_TIPS_MM - TIP_ABOVE_GRIPPER_FRAME_MM, approach_speed, travel_speed)
+            if ok:
+                await bot.set_speed(push_speed)
+                ok = await slide(direction[0], direction[1], distance)
+            await bot.set_speed(travel_speed)
+            g = await bot.gripper_origin()
+            rise_ok, _ = await bot.move_delta(dz=table_z + LOW_TRAVEL_TIPS_MM - TIP_ABOVE_GRIPPER_FRAME_MM - g[2], near_table=True)
+            return ok and rise_ok
+
         async def push_phase():
-            """Close, centre and align the row with captures between pushes; returns the measured pallet count."""
+            """Sam's pallet procedure (30 Oct spec), one look then no further captures: 0. look from home; 1. push the row
+            together toward the first block; 2. line up every end with the last block's, furthest first; 3. go home.
+            The closed claws travel LOW_TRAVEL_TIPS_MM above the table between strokes. Returns the measured pallet count."""
             nonlocal pallet_count
             pallet_count = len([s for s in filled if s.startswith("L0")])
             layer0_only = not any(p["slot"].startswith("L1") for p in placed) and not any(s.startswith("L1") for s in filled)
-            if layer0_only and (placed or any(s.startswith("L0") for s in filled)):
-                # One push direction only: from the open end of the row toward the anchor block (the first one placed). One
-                # push closes the measured gaps and moves the closed row onto the pallet centre in the same stroke. The
-                # anchor was placed ROW_PRE_OFFSET_MM past nominal toward the open end so that shift is in the pushable
-                # direction; if the row ends up off-centre the other way it is reported, not pushed back.
-                across = math.radians(target.layer0_long_side_deg + 90.0)
-                ax, ay = math.cos(across), math.sin(across)
-                w = calib.block.width_mm
-                centre_pushes = align_pushes = 0
-                for _round in range(ROW_PUSH_ROUNDS):
-                    obs_m, scene_m = await scene_from_capture()
-                    ctx_m = proposal.build_context(scene_m, tower_origin_xy_mm=tower_origin, filled_slots=filled, dry_run=True, tower_gap_mm=gap_mm)
-                    row = row_blocks(ctx_m, 0)
-                    pallet_count = len(row)
-                    pts = [g["base_point_mm"] for g in row]
-                    plan = row_push_plan(pts, tower_origin, ax, ay, w)
-                    gaps, offset, shift, unpushable = plan["gaps_mm"], plan["offset_mm"], plan["shift_mm"], plan["unpushable_mm"]
-                    misaligned = row_align_plan(pts, target.layer0_long_side_deg, ROW_ALIGN_TOLERANCE_MM)
-                    ep.event("flow", phase="row_measured", blocks=len(row), row_gaps_mm=round(gaps, 1), centre_offset_along_row_mm=round(offset, 1),
-                             shift_after_close_mm=round(shift, 1), unpushable_mm=round(unpushable, 1), centres=[[round(p[0], 1), round(p[1], 1)] for p in pts],
-                             ends_misaligned=[{"index": i, "offset_mm": round(o, 1)} for i, o in misaligned])
-                    print(f"Row: {len(row)} block(s), gaps {gaps:.1f} mm, centre off by {offset:.1f} mm along the row "
-                          f"({'needs ' + format(shift, '.1f') + ' mm push' if shift > ROW_CENTRE_TOLERANCE_MM else 'centred'}"
-                          f"{'; ' + format(unpushable, '.1f') + ' mm off toward the anchor side, not pushable' if unpushable > ROW_CENTRE_TOLERANCE_MM else ''}); "
-                          f"ends {'aligned' if not misaligned else 'off by ' + ', '.join(format(o, '+.1f') for _, o in misaligned) + ' mm'}", flush=True)
-                    if len(row) < 2:
-                        break
-                    if (gaps > PUSH_IF_GAPS_OVER_MM or shift > ROW_CENTRE_TOLERANCE_MM) and centre_pushes < CENTRE_PUSH_ATTEMPTS:
-                        centre_pushes += 1
-                        await push_row(pts[-1], -ax, -ay, gaps + shift + PUSH_START_GAP_MM, "close_and_centre")
-                        continue
-                    # After the one centre push the ends get their turn even if a few mm of gap remain (a skewed block
-                    # reads as gap; pushing the row again does not close it). Previously this step never ran.
-                    align = row_align_push(pts, target.layer0_long_side_deg, ROW_ALIGN_TOLERANCE_MM, tower_origin, w) if misaligned else None
-                    if align and align_pushes < ALIGN_PUSH_ATTEMPTS:
-                        # Ends: one stroke lines up every block (the blue box only matters for assembly; the stacking
-                        # stage grips the measured row centre, layer_stack.at_source only uses the spot as a zone).
-                        align_pushes += 1
-                        await push_block_end(align, target.layer0_long_side_deg)
-                        continue
+            if not (layer0_only and (placed or any(s.startswith("L0") for s in filled))):
+                return pallet_count
+            # 0. Look
+            obs_m, scene_m = await scene_from_capture()
+            ctx_m = proposal.build_context(scene_m, tower_origin_xy_mm=tower_origin, filled_slots=filled, dry_run=True, tower_gap_mm=gap_mm)
+            row = row_blocks(ctx_m, 0)
+            pallet_count = len(row)
+            pts = [g["base_point_mm"] for g in row]
+            plan = pallet_push_plan(pts, target.layer0_long_side_deg, calib.block, ROW_ALIGN_TOLERANCE_MM, calib.finger.finger_width_mm)
+            obstacles = [(tuple(c["geometry"]["base_point_mm"][:2]), c["geometry"]["height_above_table_mm"]) for c in ctx_m["candidates"]
+                         if c["geometry"].get("base_point_mm") and c["geometry"].get("height_above_table_mm") is not None]
+            ep.event("flow", phase="row_measured", observation_id=obs_m["observation_id"], blocks=len(row), row_gaps_mm=round(plan["gaps_mm"], 1),
+                     centres=[[round(p[0], 1), round(p[1], 1)] for p in pts], end_offsets_mm=[round(o, 1) for o in plan["offsets_mm"]],
+                     push_mm=round(plan["push"]["distance_mm"], 1) if plan["push"] else None,
+                     end_pushes=[{"index": e["index"], "offset_mm": round(e["offset_mm"], 1), "also_lines_up": e["also_lines_up"]} for e in plan["ends"]])
+            print(f"Row: {len(row)} block(s), gaps {plan['gaps_mm']:.1f} mm; ends vs the last block "
+                  f"{', '.join(format(o, '+.1f') for o in plan['offsets_mm']) or '-'} mm; "
+                  f"{'push together ' + format(plan['push']['distance_mm'], '.1f') + ' mm' if plan['push'] else 'no push needed'}, "
+                  f"{len(plan['ends'])} end push(es)", flush=True)
+            if len(row) < 2 or (plan["push"] is None and not plan["ends"]):
+                return pallet_count
+            await bot.gripper.grab()                       # closed while still at home: a solid pusher
+            high_z = (await bot.gripper_origin())[2]
+            ok = True
+            if plan["push"]:
+                # 1. Push the row together
+                ok = await move_low(plan["push"]["start_xy"], obstacles, high_z)
+                if ok:
+                    ok = await low_stroke(plan["push"]["start_xy"], target.layer0_long_side_deg + 90.0, plan["push"]["direction"],
+                                          plan["push"]["distance_mm"], turn=True)
+                ep.event("flow", phase="push_together", start_xy=[round(v, 1) for v in plan["push"]["start_xy"]],
+                         direction=[round(v, 2) for v in plan["push"]["direction"]], distance_mm=round(plan["push"]["distance_mm"], 1), accepted=ok)
+                print(f"Push together: {plan['push']['distance_mm']:.1f} mm toward the first block", flush=True)
+            turned = False
+            for e in plan["ends"] if ok else []:
+                # 2. Line up the ends, furthest first; the claws turn a quarter turn the first time only
+                ok = await move_low(e["start_xy"], obstacles, high_z)
+                if ok:
+                    ok = await low_stroke(e["start_xy"], target.layer0_long_side_deg, e["direction"], e["distance_mm"], turn=not turned)
+                    turned = True
+                ep.event("flow", phase="push_align", index=e["index"], offset_mm=round(e["offset_mm"], 1), also_lines_up=e["also_lines_up"],
+                         start_xy=[round(v, 1) for v in e["start_xy"]], direction=[round(v, 2) for v in e["direction"]],
+                         distance_mm=round(e["distance_mm"], 1), accepted=ok)
+                print(f"Push (align): block {e['index']} end {e['offset_mm']:+.1f} mm past the last block's; pushed back"
+                      + (f" with block(s) {e['also_lines_up']}" if e["also_lines_up"] else ""), flush=True)
+                if not ok:
                     break
+            if not ok:
+                ep.event("flow", phase="push_refused", note="keeping the row as it is; the pallet check and stacking measure it")
+                print("A push move was refused; keeping the row as it is", flush=True)
+            # 3. Go home
+            g = await bot.gripper_origin()
+            if g[2] < high_z - 1.0:
+                await bot.move_delta(dz=high_z - g[2], near_table=True)
+            await bot.gripper.open()
+            await bot.move_to(*home)
             return pallet_count
 
         flow_stopped = False

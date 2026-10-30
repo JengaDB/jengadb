@@ -272,6 +272,32 @@ local/layer-stack-data/live/episodes/):
   full pallet. Untested live: the real topple, the knock height and whether a SAM mask of a standing block's end
   face gives a usable height on the D435.
 
+- Pallet push stage rewritten to Sam's procedure (30 Oct spec; extends his push_together in ViamPython jenga.py:773
+  with align_ends and low travel). 0. One look from home: blocks ordered across the row, total gaps, each end's
+  offset past the last block's. 1. Close the claws at home, travel 30 mm above the table (LOW_TRAVEL_TIPS_MM) to
+  beside the last block (5 mm gap), turn the face along the long sides, lower, push toward the first block by the
+  gaps + 10 mm. 2. Rise to 30 mm; for every block whose end sticks out past the last block's by more than 2 mm
+  (ROW_ALIGN_TOLERANCE_MM, was 5), furthest first: start at end + 5 mm + 8 mm, quarter turn the first time only,
+  lower, push by the overhang + 5 mm; a neighbour sticking out the same way by no more is caught by the 45 mm face
+  and skipped; the last block is never pushed. 3. Go home. No captures between strokes (positions after the closing
+  push are predicted: it moves blocks across the row only). `pallet_push_plan` is the pure plan. Deviations from the
+  spec: push height stays PUSH_TIPS_MM 7 (spec 5; 5 scraped, operator note); a low move with anything taller than
+  20 mm within 65 mm of its path (stacked blocks, the tower) goes over it at travel height, and one that would come
+  down within 35 mm of such a thing is refused. Removed: the multi-round push loop, the one-stroke row_align_push,
+  the centring push and its 8 mm anchor pre-offset (ROW_PRE_OFFSET_MM 0: the closed row now centres on the slot),
+  row_push_plan / row_align_plan (dead). The pallet check also takes off a block turned more than 10 deg off the
+  row's long side (`rotated`; the stacking stage needs parallel within 4 deg). Harness: spec run lines two blocks
+  up in one end push (block 0 also catches block 1) with no capture between strokes; a 60 mm object on the low path
+  is gone over and never touched. Untested live.
+- Edge-case list (30 Oct) against the code: picked block differs from the identified one: not checked directly;
+  the flow re-captures after every drop, knock and rescan, and palletize starts each cycle from a new capture.
+  Pickup fails: gripper report + bounded re-grip, then the pallet count after the push stage triggers a top-up
+  (reconcile_pallet, MAX_FILL_ROUNDS). Picked at a different position: the push stage. Picked/placed in a different
+  orientation: push stage, then the pallet check (tilted, on edge, on a neighbour, rotated) with pick-and-drop
+  (operator chose this over sweeping). Too tall in the heap: drop step and knock-over. Misaligned within margin: end
+  alignment; outside margin: pallet check pick-and-drop. Not handled: a block standing on end on the pallet (no
+  grasp; the run stops for the operator).
+
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot
 complete until it is changed; table height and camera offset are unverified; `--grip-lower-mm 3` is a single-run fix,
 not a calibration; source and base must be reachable (x <= ~600 mm worked) and both visible from the view pose.
