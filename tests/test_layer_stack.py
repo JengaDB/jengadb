@@ -175,3 +175,37 @@ class ClippedMasks(unittest.TestCase):
                               {"bbox": [10, 10, 50, 40], "geometry": {"base_point_mm": None}}]}
         out = ls._blocks(ctx, 1280, 720)
         self.assertEqual([b["clipped"] for b in out], [True, False])
+
+
+class VisibleExtent(unittest.TestCase):
+    # Camera pose and intrinsics as recorded on obs_cb99bc7f5df4440d (30 Oct, view flange 300,150,460): a wrist D435
+    # looking straight down from world z 446, image columns along -y, rows along -x.
+    OBS = {"camera": {"pose_in_world": {"status": "read", "translation_mm": [366.2, 182.1, 445.6],
+                                        "rotation": [[0.0, -1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, -1.0]]}},
+           "intrinsics": {"rgb": {"focal_x_px": 907.8, "focal_y_px": 906.6, "center_x_px": 638.0, "center_y_px": 372.8,
+                                  "width_px": 1280, "height_px": 720}}}
+
+    def test_projects_image_corners_onto_table(self):
+        seen = ls.visible_table_extent(self.OBS, table_z_mm=3.0, margin_px=0)
+        # height above the table 442.6 mm; the principal point is off-centre, so the extent is asymmetric:
+        # rows run along -x: top edge +372.8 px -> +182 mm, bottom edge -346.2 px -> -169 mm
+        # columns run along -y: left edge +638 px -> +311 mm, right edge -641 px -> -313 mm
+        self.assertAlmostEqual(seen["x_mm"][0], 366.2 - 169, delta=2)
+        self.assertAlmostEqual(seen["x_mm"][1], 366.2 + 182, delta=2)
+        self.assertAlmostEqual(seen["y_mm"][0], 182.1 - 313, delta=2)
+        self.assertAlmostEqual(seen["y_mm"][1], 182.1 + 311, delta=2)
+        # the tower on the blue square was in frame; Kazy's pick spot at x 656 was not
+        self.assertTrue(seen["x_mm"][0] < 435 < seen["x_mm"][1] and seen["y_mm"][0] < 203 < seen["y_mm"][1])
+        self.assertGreater(656, seen["x_mm"][1])
+
+    def test_empty_tower_zone_is_a_distinct_stop(self):
+        # run_layer_stack goes and looks at the tower origin only for this error, and only when it is out of frame
+        with self.assertRaises(ls.NoBaseLayer):
+            ls.split_scene(layer((440, 201), 2.0), (700, 200), 115.0)
+        self.assertTrue(issubclass(ls.NoBaseLayer, ls.LayerCheckError))
+
+    def test_missing_pose_or_upward_camera_gives_none(self):
+        self.assertIsNone(ls.visible_table_extent({"camera": {"pose_in_world": {"status": "unavailable"}}, "intrinsics": self.OBS["intrinsics"]}))
+        up = {"camera": {"pose_in_world": dict(self.OBS["camera"]["pose_in_world"], rotation=[[1, 0, 0], [0, 1, 0], [0, 0, 1]])},
+              "intrinsics": self.OBS["intrinsics"]}
+        self.assertIsNone(ls.visible_table_extent(up))

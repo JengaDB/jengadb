@@ -353,6 +353,9 @@ def wrap_90(angle):
 
 RELATIVE_TOLERANCES = (0.03, 0.02, 0.012, 0.008)   # of the median sampled depth; Sam's 15/8/5/4 mm at ~450 mm
 MIN_PLANE_INLIER_FRACTION = 0.5
+# The first fit uses only samples within this fraction of the median depth, so a region far off the table (floor past
+# the table edge, a laptop) cannot skew it; later iterations re-admit any sample within tolerance of the fitted plane.
+INITIAL_DEPTH_BAND = 0.1
 
 
 @dataclass(frozen=True)
@@ -429,7 +432,9 @@ def fit_table_plane(depth, invalid_value=0, step=4, tolerances_mm=None, min_samp
         tolerances_mm = tuple(r * median_depth for r in RELATIVE_TOLERANCES)
     a = np.column_stack([u / 1000.0, v / 1000.0, np.ones_like(u)])
     b = 1000.0 / d
-    inliers = np.ones(d.size, dtype=bool)
+    inliers = np.abs(d - median_depth) <= INITIAL_DEPTH_BAND * median_depth
+    if inliers.sum() < max(3, min_samples // 4):
+        inliers = np.ones(d.size, dtype=bool)
     coef = None
     for tol in tolerances_mm:
         if inliers.sum() < max(3, min_samples // 4):

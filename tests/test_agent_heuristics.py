@@ -291,6 +291,23 @@ class GeometryTests(unittest.TestCase):
                                         calib.block, True, "v", "s", calib.workspace)
         self.assertIn("gripper_too_narrow_for_ends", geom.evaluate_grasps(free, hm, narrow)[3]["reasons"])
 
+    def test_floor_past_the_table_edge_does_not_skew_the_plane(self):
+        # 30 Oct, overview from flange z 650 (obs_b174ec2236ec429a): the left 15% of the image was the floor at ~1400 mm
+        # while the table sat at ~633 mm; the fit seeded from all samples converged on 5% inliers (fitted_unreliable).
+        rgb, depth, masks, truth = self.synth.render("separated")
+        clean = geom.fit_table_plane(depth)
+        with_floor = depth.copy()
+        with_floor[:, : depth.shape[1] * 15 // 100] = 1400
+        plane = geom.fit_table_plane(with_floor)
+        self.assertTrue(plane.reliable)
+        self.assertGreater(plane.inlier_fraction, 0.75)
+        self.assertLess(plane.inlier_fraction, 0.9)       # the floor itself is correctly left out
+        h, w = depth.shape
+        for u, v in ((w // 2, h // 2), (w - 10, 10), (w // 4, h - 10)):
+            self.assertAlmostEqual(plane.depth_at(u, v), clean.depth_at(u, v), delta=1.0)   # same table, within 1 mm
+        far = np.full_like(depth, 1400)
+        self.assertIsNotNone(geom.fit_table_plane(far))   # a band that empties out falls back to every sample
+
     def test_noisy_table_makes_plane_unreliable_and_blocks_proposals(self):
         rgb, depth, masks, truth = self.synth.render("separated")
         rng = np.random.default_rng(1)

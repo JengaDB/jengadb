@@ -29,10 +29,20 @@ CENTER_TOLERANCE_MM = 3.0         # success: new layer centre within this of the
 YAW_TOLERANCE_DEG = 3.0           # success: new layer within this of exactly 90 deg to the base
 MIN_RUNS_FOR_OFFSET = 3
 MAX_OFFSET_SPREAD_MM = 2.0        # residual standard deviation above which a constant offset is not trusted
+EDGE_MARGIN_PX = 4                # a mask this close to the image border is cut off: its centre and angle are wrong
+# Default flange pose for the overview capture. live_executor.HOME (z 400) did not fit two layers 210 mm apart in one
+# image (Kazy, 29 Oct); z 460 did and saw x 199-546, y -128..491 mm of table (Kris, 30 Oct). Raise z or shift x/y with
+# --view to cover more table; coverage grows linearly with camera height, block masks shrink the same way (51 px wide
+# at z 460, 42 px at 560, 36 px at 650).
+OVERVIEW_POSE = (300.0, 150.0, 460.0)
 
 
 class LayerCheckError(ValueError):
     """A measured layer that must not be gripped or stacked on. The message is the operator-facing reason."""
+
+
+class NoBaseLayer(LayerCheckError):
+    """The tower zone held no blocks in this capture."""
 
 
 @dataclass
@@ -118,7 +128,7 @@ def split_scene(blocks, tower_origin_xy, zone_radius_mm, block_height_mm=15.0):
     if None in by_level:
         raise LayerCheckError("a block in the tower zone is between layer heights (tilted or resting on an edge?)")
     if not by_level:
-        raise LayerCheckError("no base layer in the tower zone")
+        raise NoBaseLayer("no base layer in the tower zone")
     top = max(by_level)
     return outside, by_level[top]
 
@@ -184,6 +194,30 @@ def blocks_left_behind(source, blocks, block_height_mm=15.0, radius_mm=15.0):
     return left
 
 
+def visible_table_extent(observation, table_z_mm=0.0, margin_px=None):
+    """World x/y bounds (mm) of the table area the capture could see: the image corners (inset by margin_px) projected
+    through the recorded camera pose onto the plane z = table_z_mm. None when the pose or intrinsics are missing or the
+    camera does not look down at the table. Tells the operator where a layer has to lie to be measurable."""
+    cam = (observation.get("camera") or {}).get("pose_in_world") or {}
+    intr = (observation.get("intrinsics") or {}).get("rgb") or {}
+    if cam.get("status") != "read" or not intr:
+        return None
+    margin_px = EDGE_MARGIN_PX if margin_px is None else margin_px
+    t, r = cam["translation_mm"], cam["rotation"]
+    fx, fy, cx, cy = intr["focal_x_px"], intr["focal_y_px"], intr["center_x_px"], intr["center_y_px"]
+    w, h = intr["width_px"], intr["height_px"]
+    pts = []
+    for u, v in ((margin_px, margin_px), (w - 1 - margin_px, margin_px), (margin_px, h - 1 - margin_px), (w - 1 - margin_px, h - 1 - margin_px)):
+        d = ((u - cx) / fx, (v - cy) / fy, 1.0)
+        dw = [sum(r[i][j] * d[j] for j in range(3)) for i in range(3)]
+        if dw[2] >= -1e-6:
+            return None  # ray does not reach the table
+        s = (table_z_mm - t[2]) / dw[2]
+        pts.append((t[0] + s * dw[0], t[1] + s * dw[1]))
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    return {"x_mm": [round(min(xs), 1), round(max(xs), 1)], "y_mm": [round(min(ys), 1), round(max(ys), 1)]}
+
+
 class ResidualLog:
     """Append-only per-setup record of verified placements. The fitted offset is a calibration, applied only on request."""
 
@@ -231,9 +265,6 @@ async def _open_client(config, direct_local):
     return await asyncio.wait_for(RobotClient.at_address(host.replace(".viam.cloud", ".local.viam.cloud") + ":8080", options), timeout=15)
 
 
-EDGE_MARGIN_PX = 4  # a mask this close to the image border is cut off: its centre and angle are wrong
-
-
 def _blocks(context, width, height):
     """Measured block geometries, each marked `clipped` when its mask touches the image border."""
     out = []
@@ -247,15 +278,18 @@ def _blocks(context, width, height):
 
 
 async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, seg_provider, direct_local=False,
-                          apply_offset=False, confirm=input, plan_only=False, view_pose=None, grip_lower_mm=0.0):
+                          apply_offset=False, confirm=input, plan_only=False, view_pose=None, grip_lower_mm=0.0,
+                          source_hint_xy=None):
     """One supervised stack. Returns 0 on a verified success, 1 otherwise. See module docstring.
-    plan_only: capture from the current pose, measure both layers and print the plan; no motion command is sent."""
+    plan_only: capture from the current pose, measure both layers and print the plan; no motion command is sent.
+    source_hint_xy: operator-supplied world x,y (mm) of the hand-built layer when it lies outside the overview image;
+    the run hovers there and measures it close up instead of requiring it in the overview."""
     if not plan_only:
         config.require_motion(operator)  # before any SDK import or connection
     from . import proposal, rgbd, segmentation
     from . import grasp_geometry as geom
     from .capture import capture_with_camera
-    from .live_executor import HOME, PICK_LIFT_MM, TIP_ABOVE_GRIPPER_FRAME_MM, Episode, Robot
+    from .live_executor import PICK_LIFT_MM, TIP_ABOVE_GRIPPER_FRAME_MM, Episode, Robot
     from .pipeline import candidate_id
     from .placement import TowerTarget, footprint_clearance_mm
     # The SDK builds resource clients only for APIs registered (imported) before connecting; see live_executor.run_flow.
@@ -275,6 +309,7 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
 
         size = [0, 0]  # width, height of the latest capture
         last_obs = [None]  # observation_id of the latest capture
+        last_doc = [None]  # observation record of the latest capture (camera pose, intrinsics)
 
         async def measure(label):
             obs = await capture_with_camera(config, data_dir, camera, episode_id, client=client)
@@ -291,12 +326,31 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
             ctx = proposal.build_context(scene, tower_origin_xy_mm=tower_origin, dry_run=True)
             if ctx["table_plane"].get("status") != "fitted":
                 raise LayerCheckError(f"{label}: table plane {ctx['table_plane'].get('status')}; heights are not trustworthy")
-            ep.event("stack", phase="measured", label=label, observation_id=obs["observation_id"], masks=len(masks),
-                     blocks=[{"xy": [round(b["base_point_mm"][0], 1), round(b["base_point_mm"][1], 1)], "long_deg": round(b["base_long_side_deg"], 1),
-                              "height": round(b["height_above_table_mm"], 1)} for b in _blocks(ctx, *size) if _usable(b)])
             size[:] = [rgb.shape[1], rgb.shape[0]]
             last_obs[0] = obs["observation_id"]
+            last_doc[0] = obs
+            seen = visible_table_extent(obs, calib.support_surface.z_in_robot_base_mm)
+            ep.event("stack", phase="measured", label=label, observation_id=obs["observation_id"], masks=len(masks), table_seen_mm=seen,
+                     blocks=[{"xy": [round(b["base_point_mm"][0], 1), round(b["base_point_mm"][1], 1)], "long_deg": round(b["base_long_side_deg"], 1),
+                              "height": round(b["height_above_table_mm"], 1)} for b in _blocks(ctx, *size) if _usable(b)])
+            if label == "overview" and seen:
+                print(f"Overview covers table x {seen['x_mm'][0]:.0f}..{seen['x_mm'][1]:.0f}, y {seen['y_mm'][0]:.0f}..{seen['y_mm'][1]:.0f} mm "
+                      f"(raise or shift --view to widen)")
             return ctx, calib
+
+        def source_from_overview(outside, table_z):
+            """The hand-built layer as seen in the overview, or the operator's hint when it is out of frame."""
+            try:
+                return summarize_layer(outside, dims.height_mm), None
+            except LayerCheckError as exc:
+                if source_hint_xy is not None and not plan_only:
+                    return None, f"overview did not show a usable source layer ({exc}); using --source {source_hint_xy}"
+                seen = visible_table_extent(last_doc[0], table_z) if last_doc[0] else None
+                where = (f"camera saw the table over x {seen['x_mm'][0]:.0f}..{seen['x_mm'][1]:.0f}, y {seen['y_mm'][0]:.0f}..{seen['y_mm'][1]:.0f} mm"
+                         if seen else "visible area unknown (camera pose missing)")
+                raise LayerCheckError(f"{exc}. Source layer: {where}; {len(outside)} block(s) outside the tower zone. Put the "
+                                      f"layer inside that area at least {zone:.0f} mm from the tower, raise --view, or pass "
+                                      f"--source x,y with its approximate position") from None
 
         async def hover_over(xy):
             g = await bot.gripper_origin()
@@ -312,7 +366,7 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
 
         if await bot.arm.is_moving():
             raise LayerCheckError("arm is moving; wait for it to stop")
-        view = tuple(view_pose) if view_pose else HOME   # flange pose for the overview capture
+        view = tuple(view_pose) if view_pose else OVERVIEW_POSE   # flange pose for the overview capture
         f = await bot.flange_pose()
         if plan_only and math.dist((f.x, f.y, f.z), view) > 5:
             raise LayerCheckError(f"plan-only measures from the view pose {view}; arm is at {f.x:.0f}, {f.y:.0f}, {f.z:.0f} and plan-only never moves it")
@@ -329,9 +383,35 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
         dims = calib.block
         table_z = calib.support_surface.z_in_robot_base_mm
         zone = footprint_clearance_mm(TowerTarget(tuple(tower_origin), calib.support_surface, dims, calib.finger))
-        outside, base_blocks = split_scene(_blocks(ctx, *size), tower_origin, zone, dims.height_mm)
-        source0 = summarize_layer(outside, dims.height_mm)
+        overview_blocks = _blocks(ctx, *size)
+        seen = visible_table_extent(last_doc[0], table_z) if last_doc[0] else None
+        in_view = bool(seen and seen["x_mm"][0] <= tower_origin[0] <= seen["x_mm"][1] and seen["y_mm"][0] <= tower_origin[1] <= seen["y_mm"][1])
+        where = (f"camera saw x {seen['x_mm'][0]:.0f}..{seen['x_mm'][1]:.0f}, y {seen['y_mm'][0]:.0f}..{seen['y_mm'][1]:.0f} mm"
+                 if seen else "visible area unknown")
+        look_at_tower = None   # reason to hover over the tower origin and measure the base from there
+        try:
+            outside, base_blocks = split_scene(overview_blocks, tower_origin, zone, dims.height_mm)
+            if any(b.get("clipped") for b in base_blocks):
+                look_at_tower = "the base layer is cut off by the overview image edge"
+        except NoBaseLayer as exc:
+            if in_view or plan_only:
+                raise LayerCheckError(f"{exc} at {tower_origin[0]:.0f}, {tower_origin[1]:.0f} ({where}); is --tower-origin the tower?") from None
+            look_at_tower = f"tower origin {tower_origin[0]:.0f}, {tower_origin[1]:.0f} is outside the overview image"
+            outside = [b for b in overview_blocks if _usable(b) and b["height_above_table_mm"] >= MIN_BLOCK_HEIGHT_FRACTION * dims.height_mm]
+        if look_at_tower and not plan_only:
+            # Keep the overview's source blocks; go and look at the tower from directly above.
+            note = f"{look_at_tower}; hovering over the tower origin to measure the base"
+            print(note)
+            ep.event("stack", phase="base_out_of_view", tower_origin=list(tower_origin), seen=seen, note=note)
+            await hover_over(tower_origin)
+            ctx_t, _ = await measure("base_find")
+            base_blocks = split_scene(_blocks(ctx_t, *size), tower_origin, zone, dims.height_mm)[1]
         base0 = summarize_layer(base_blocks, dims.height_mm)
+        source0, hint_note = source_from_overview(outside, table_z)
+        source0_xy = source0.center_xy if source0 else tuple(source_hint_xy)
+        if hint_note:
+            print(hint_note)
+            ep.event("stack", phase="source_hint", source_xy=list(source0_xy), note=hint_note)
         if plan_only:
             log = ResidualLog(data_dir, config.setup_id)
             offset, offset_note = log.fitted_offset()
@@ -351,9 +431,15 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
             raise LayerCheckError(f"base measured {math.dist(base.center_xy, base0.center_xy):.1f} mm apart in two captures")
         base_view = await bot.gripper_origin()
         base_view_claws_deg = await bot.close_direction_deg()  # wrist camera: viewpoint includes the claw angle
-        await hover_over(source0.center_xy)
+        await hover_over(source0_xy)
         ctx_s, _ = await measure("source_close")
-        source = summarize_layer(split_scene(_blocks(ctx_s, *size), tower_origin, zone, dims.height_mm)[0], dims.height_mm)
+        source_blocks = split_scene(_blocks(ctx_s, *size), tower_origin, zone, dims.height_mm)[0]
+        try:
+            source = summarize_layer(source_blocks, dims.height_mm)
+        except LayerCheckError as exc:
+            seen = visible_table_extent(last_doc[0], table_z) if last_doc[0] else None
+            where = f"; close-up saw x {seen['x_mm'][0]:.0f}..{seen['x_mm'][1]:.0f}, y {seen['y_mm'][0]:.0f}..{seen['y_mm'][1]:.0f} mm" if seen else ""
+            raise LayerCheckError(f"source close-up: {exc}{where}") from None
 
         log = ResidualLog(data_dir, config.setup_id)
         offset, offset_note = log.fitted_offset()
