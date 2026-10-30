@@ -610,11 +610,19 @@ MIN_GRIP_DEPTH_MM = 8.0           # the claws must reach at least this far below
 OBSTRUCTION_CLEARANCE_MM = 2.0    # tips stop this far above a low neighbour they would otherwise land on
 
 
-def resting_level_mm(block_top_mm, block_thickness_mm):
+ON_EDGE_TOP_MARGIN_MM = 6.0       # a top up to one block width + this is taken as resting on the table (on its edge)
+
+
+def resting_level_mm(block_top_mm, block_thickness_mm, block_width_mm=None):
     """Height of the surface a block rests on: 0 for the table, one thickness for a block lying on another, ... The
     level is the rounded count of thicknesses under the top, so a block on a tilted or edge-resting one is treated as
-    resting on the nearest whole level below it."""
+    resting on the nearest whole level below it. Given block_width_mm, a top no higher than one block width +
+    ON_EDGE_TOP_MARGIN_MM rests on the table: a block on its edge (25 mm tall, Jenga logo up) read 22-29 mm, which
+    rounds to "on a block at 15 mm", and the claws stopped 15 mm too high and missed it (30 Oct 20:15-20:21, six picks).
+    A lower block that is really there shows in the claw strips, and claw_obstruction raises the tips over it."""
     if not block_thickness_mm or block_top_mm is None:
+        return 0.0
+    if block_width_mm and block_top_mm <= block_width_mm + ON_EDGE_TOP_MARGIN_MM:
         return 0.0
     return max(0, round(block_top_mm / block_thickness_mm) - 1) * block_thickness_mm
 
@@ -723,12 +731,12 @@ def misplaced_on_pallet_reasons(geometry, tilt_deg, dims, max_tilt_deg=PALLET_TI
     return reasons
 
 
-def grip_tips_mm(block_height, claws_deg, params, block_thickness_mm=None):
+def grip_tips_mm(block_height, claws_deg, params, block_thickness_mm=None, block_width_mm=None):
     """How far above the table the claw tips go to grip a block whose top is block_height above the table (Sam's
     grip_tips_mm). The floor tips_min_mm is relative to the surface the block rests on, so a block on top of another
     in a heap is gripped with the same depth as one on the table, never with claws driven into the block below."""
     depth = params.grasp_depth_mm + (params.ends_extra_depth_mm if claws_deg == ALONG else 0.0)
-    return max(block_height - depth, resting_level_mm(block_height, block_thickness_mm) + params.tips_min_mm)
+    return max(block_height - depth, resting_level_mm(block_height, block_thickness_mm, block_width_mm) + params.tips_min_mm)
 
 
 def grip_points(params):
@@ -751,7 +759,7 @@ def claw_obstruction(height_map, est, shift_mm, claws_deg, calib, step_px=2):
     face_u, face_v = -close_v, close_u            # across each claw's face
     # Anything in the claw strips above where the tips will stop is an obstruction: for a block resting on another,
     # that includes the lower block if it lies under the strips.
-    limit = max(grip_tips_mm(est.height_above_table_mm, claws_deg, params, dims.height_mm), params.obstruction_min_mm)
+    limit = max(grip_tips_mm(est.height_above_table_mm, claws_deg, params, dims.height_mm, dims.width_mm), params.obstruction_min_mm)
     # Hard limit: the claws may stop on top of a lower neighbour as long as MIN_GRIP_DEPTH_MM of the block remains
     # below the tips (heap: a block lying across two others). Anything higher than that is a real obstruction.
     hard_limit = max(est.height_above_table_mm - MIN_GRIP_DEPTH_MM, limit)
@@ -810,8 +818,8 @@ def evaluate_grasps(est, height_map, calib, styles=("middle", "side", "ends")):
             if est.pixel_center is None or est.mm_per_px is None or est.height_above_table_mm is None:
                 opt["reasons"].append("geometry_unavailable")
             if not opt["reasons"]:
-                opt["tips_above_table_mm"] = grip_tips_mm(est.height_above_table_mm, claws_deg, params, dims.height_mm)
-                opt["resting_level_mm"] = resting_level_mm(est.height_above_table_mm, dims.height_mm)
+                opt["tips_above_table_mm"] = grip_tips_mm(est.height_above_table_mm, claws_deg, params, dims.height_mm, dims.width_mm)
+                opt["resting_level_mm"] = resting_level_mm(est.height_above_table_mm, dims.height_mm, dims.width_mm)
                 clearance = claw_obstruction(height_map, est, shift, claws_deg, calib)
                 opt["clearance"] = clearance
                 if clearance["status"] != "clear":

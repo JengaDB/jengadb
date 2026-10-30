@@ -356,6 +356,19 @@ local/layer-stack-data/live/episodes/):
   block (`pick_missed` event). Tests: today's numbers, and a harness run where a block missed by any grip across it
   is tried a second way, then skipped, and the pallet is filled from other blocks. Untested live.
 
+- 30 Oct 20:20-20:22 UTC, seventh cycle (@fd8998c): the block the ends grip had missed four times was picked with a
+  side grip and placed; a block on its edge was missed by an ends grip, detected as missed in the next capture and
+  skipped (first live use of the miss rule); then nothing pickable remained (packed heap, no clear sweep) and the
+  run stopped. The last two captures had an operator's hand/arm over the pallet (counts 1, then 0).
+  Operator: a block turned 90 deg, thinnest side up, was grabbed instead of swept and the claws stopped too high;
+  every block with the Jenga logo up is on its edge (25 mm tall), not flat.
+- Cause: resting_level_mm rounds the top (22-29 mm for those blocks) to "on a block at 15 mm", so the claws stopped
+  15 mm too high (six picks 20:15-20:21: tops 23.7-28.9, tips 15.0-20.3; four missed). Change: a top up to one block
+  width + 6 mm (31 mm) rests on the table (grip_tips_mm, claw_obstruction and the heap order); a real lower block
+  under the claws still raises the tips (claw_obstruction). Known risk: a flat block lying exactly on top of an
+  aligned flat block (top ~30 mm, nothing in the claw strips) would be gripped from the table, i.e. both blocks.
+  The sweep was not used because every direction had neighbours under the claws, in the path or at the landing.
+
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot
 complete until it is changed; table height and camera offset are unverified; `--grip-lower-mm 3` is a single-run fix,
 not a calibration; source and base must be reachable (x <= ~600 mm worked) and both visible from the view pose.

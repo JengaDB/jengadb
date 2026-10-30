@@ -132,6 +132,22 @@ class OnEdge(unittest.TestCase):
         self.assertEqual(geom.upright_kind({"height_above_table_mm": 74.0, "length_mm": 24.0, "width_mm": 14.0, "flags": []}, self.dims), "standing")
 
 
+class OnEdgeGripHeight(unittest.TestCase):
+    def test_a_block_on_its_edge_is_gripped_from_the_table(self):
+        # 30 Oct 20:21:21: on its edge (Jenga logo up) at (270.8, 92.4), top 23.7 mm; read as "resting on a block at 15 mm"
+        # the claws stopped at 15.0 mm and missed. Tops 22-29 mm (six picks that run) now rest on the table.
+        dims = geom.BlockDimensions()
+        params = geom.GraspParams(grasp_depth_mm=8.0 + 15.0, tips_min_mm=0.0)          # --grip-lower-mm 15 --tips-floor-mm 0
+        self.assertEqual(geom.resting_level_mm(23.7, dims.height_mm), 15.0)               # without the width: the old reading
+        for top in (22.1, 23.7, 27.6, 28.9):
+            self.assertEqual(geom.resting_level_mm(top, dims.height_mm, dims.width_mm), 0.0, top)
+        self.assertEqual(geom.grip_tips_mm(23.7, geom.ALONG, params, dims.height_mm, dims.width_mm), 0.0)
+        self.assertEqual(geom.grip_tips_mm(23.7, geom.ALONG, params, dims.height_mm), 15.0)
+        # a block clearly on top of others keeps its level
+        self.assertEqual(geom.resting_level_mm(38.6, dims.height_mm, dims.width_mm), 30.0)
+        self.assertEqual(geom.resting_level_mm(44.0, dims.height_mm, dims.width_mm), 30.0)
+
+
 class KnockPlan(unittest.TestCase):
     dims = geom.BlockDimensions()
 
