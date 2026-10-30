@@ -524,6 +524,67 @@ class RunFlowHarness(unittest.TestCase):
         self.assertEqual(len([e for e in events if e.get("phase") == "row_ends_not_aligned"]), 1)
         self.assertTrue([e for e in events if e.get("phase") == "final_validation"])     # carries on to the pallet check
 
+    def run_with_pallet_mishap(self, mishap, **flow_kw):
+        """Run with FakeGripper.open patched: mishap(gripper, block, n) runs after the n-th block released on the pallet."""
+        orig_open = FakeGripper.open
+        on_pallet = []
+
+        async def open_(gripper):
+            b = gripper.w.held[0] if gripper.w.held is not None else None
+            await orig_open(gripper)
+            if b is not None and math.hypot(b[1] - self.PALLET[0], b[2] - self.PALLET[1]) < 200 and b not in on_pallet:
+                on_pallet.append(b)
+                mishap(gripper, b, len(on_pallet))
+        with mock.patch.object(FakeGripper, "open", open_):
+            return self.run_flow(self.world_for_pallet, **flow_kw)
+
+    def test_double_pick_extra_block_is_taken_off(self):
+        # Operator, 30 Oct: double picks happen; check the pallet after every placement and make it whole and square.
+        self.world_for_pallet = World([("F", 360.0, 40.0, 30.0, 0), ("G", 330.0, 170.0, 10.0, 0), ("H", 470.0, 260.0, 90.0, 0),
+                                       ("K", 420.0, 330.0, -20.0, 0), ("Q", 460.0, 120.0, 60.0, 0)])
+
+        def double_pick(gripper, b, n):
+            if n == 3:                                         # the third placement brings a second block along
+                k = next(x for x in gripper.w.blocks if x[0] == "K")
+                k[1], k[2], k[3], k[4] = b[1], b[2] + 25.0, b[3], 0
+        rc, events = self.run_with_pallet_mishap(double_pick, drop_spot_xy=(500.0, 120.0))
+        checks = [e for e in events if e.get("phase") == "pallet_check"]
+        self.assertEqual([c["count"] for c in checks if c["label"].startswith("after_place")], [1, 2, 4, 3])
+        repair = [e for e in events if e.get("phase") == "pallet_repair"]
+        self.assertEqual([r["misplaced"] for r in repair], [["extra_block"]])
+        self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
+        k = next(b for b in self.world_for_pallet.blocks if b[0] == "K")
+        self.assertLess(math.dist(k[1:3], (500.0, 120.0)), 10.0)                 # the outermost one went to the drop spot
+        first_push = next(i for i, e in enumerate(events) if e.get("phase") == "push_together")
+        self.assertLess(events.index(repair[0]), first_push)                     # fixed before any pushing
+
+    def test_block_landing_turned_is_put_back_square(self):
+        self.world_for_pallet = self.flat_heap()
+
+        def turned(gripper, b, n):
+            if n == 2:
+                b[3] += 15.0
+        rc, events = self.run_with_pallet_mishap(turned)
+        fixes = [e for e in events if e.get("phase") == "pallet_replace"]
+        self.assertEqual(len(fixes), 1)
+        self.assertTrue(fixes[0]["misplaced"][0].startswith("rotated:+15"))
+        self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
+        for b in self.world_for_pallet.blocks:
+            if math.hypot(b[1] - self.PALLET[0], b[2] - self.PALLET[1]) < 200:
+                self.assertLess(abs(((b[3] + 90.0) % 180.0) - 90.0), 2.0)     # all square to the row
+
+    def test_top_layer_is_picked_first_not_swept(self):
+        # Operator, 30 Oct: prioritise the top layer; the sweep need not flatten every layer first.
+        world = World([("LOW", 360.0, 60.0, 30.0, 0), ("TOP", 360.0, 60.0, 120.0, 1), ("A", 430.0, 250.0, -40.0, 0),
+                       ("C", 470.0, 120.0, 10.0, 0), ("UP", 330.0, 200.0, 0.0, 0)])
+        rc, events = self.run_flow(world, flatten_sweeps=2, flatten_seed=3)
+        self.assertFalse(any(e.get("phase") == "flatten_sweep" for e in events))
+        self.assertEqual([e["reason"] for e in events if e.get("phase") == "flatten_done"], ["top_layer_pickable"])
+        first = next(e for e in events if e.get("phase") == "plan_block")
+        self.assertLess(math.dist(first["pick_xy"], (360.0, 60.0)), 5.0)
+        self.assertGreater(first["block_top_mm"], 25.0)                         # the block lying on LOW
+        self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
+
     def test_no_flatten_sweeps_on_a_flat_heap(self):
         rc, events = self.run_flow(self.flat_heap(), flatten_sweeps=3)
         self.assertFalse(any(e.get("phase") == "flatten_sweep" for e in events))
@@ -579,10 +640,12 @@ class RunFlowHarness(unittest.TestCase):
         self.assertLessEqual(len(m_picks), 2)                                     # never a third time
         self.assertEqual(len({p["grasp"] for p in m_picks}), len(m_picks))         # never the same grip twice
         self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
-        # Operator, 30 Oct: no pushing or aligning until three blocks are on the pallet. The missed first block leaves two;
-        # the push stage waits, the top-up fills the empty first place (the end would be outside the row's lane).
-        self.assertIn(2, [e["blocks"] for e in events if e.get("phase") == "push_waits_for_full_row"])
-        self.assertIn("before_first", [e["where"] for e in events if e.get("phase") == "fill_row_gap"])
+        # Operator, 30 Oct: look at the pallet after every placement, and push or align only with three blocks there. The
+        # missed first block is seen at once (nothing on the pallet), and its slot is filled by the next pick.
+        checks = [e for e in events if e.get("phase") == "pallet_check" and e["label"].startswith("after_place")]
+        self.assertEqual(checks[0]["count"], 0)
+        placed_slots = [e["slot"] for e in events if e.get("phase") == "placed"]
+        self.assertEqual(placed_slots[:2], ["L0S0", "L0S0"])
         for i, e in enumerate(events):
             if e.get("phase") in ("push_together", "push_align"):
                 looks = [x for x in events[:i] if x.get("phase") in ("row_measured", "row_remeasured", "row_alignment_check")]

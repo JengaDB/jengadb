@@ -515,6 +515,37 @@ class PickRefine(unittest.TestCase):
         self.assertIs(match_block(planned, [flipped]), flipped)                          # same long side, measured the other way
 
 
+class PalletAudit(unittest.TestCase):
+    """Whole and square (operator, 30 Oct): double picks happen; check the pallet after every placement and fix it."""
+    LINE = (440.0, 170.0)      # first slot centre; the row runs along +y, block long sides along x (0 deg)
+
+    def audit(self, rows):
+        from robot_hackathon.live_executor import pallet_audit
+        return pallet_audit([{"xy": (x, y), "long_deg": a, "flat_reasons": f} for x, y, a, f in rows], 0.0, self.LINE)
+
+    def test_square_row_needs_nothing(self):
+        a = self.audit([(441.0, 170.0, 0.5, []), (438.0, 195.0, -1.0, []), (440.0, 220.0, 2.0, [])])
+        self.assertTrue(a["square"])
+        self.assertEqual((a["extra"], a["fix"]), ([], []))
+
+    def test_double_pick_leaves_the_outermost_block_extra(self):
+        a = self.audit([(440.0, 170.0, 0.0, []), (440.0, 247.5, 0.0, []), (440.0, 325.0, 0.0, []), (440.0, 350.0, 0.0, [])])
+        self.assertEqual(a["extra"], [3])                                          # the one furthest from the first slot
+        self.assertFalse(a["square"])
+
+    def test_turned_off_line_and_not_flat_blocks_are_fixed(self):
+        # run 13 (21:28): a block 37.7 mm off the row's line; and one turned 6 deg, one resting on a neighbour
+        a = self.audit([(441.4, 166.6, 0.4, []), (477.7, 231.9, 1.0, []), (434.5, 255.8, 6.0, [])])
+        fixes = dict(a["fix"])
+        self.assertEqual(sorted(fixes), [1, 2])
+        self.assertTrue(fixes[1][0].startswith("off_line:+38"))
+        self.assertTrue(fixes[2][0].startswith("rotated:+6"))
+        a = self.audit([(440.0, 170.0, 0.0, []), (440.0, 195.0, 0.0, ["height:29.7mm_not_one_block"]), (440.0, 220.0, 0.0, []),
+                        (440.0, 245.0, 0.0, [])])
+        self.assertEqual(a["extra"], [1])                                          # with one too many, the bad one goes
+        self.assertEqual(a["fix"], [])
+
+
 class MissedPicks(unittest.TestCase):
     def test_a_block_still_where_it_was_picked_from_was_missed(self):
         from robot_hackathon.live_executor import missed_attempts

@@ -606,6 +606,57 @@ local/layer-stack-data/live/episodes/):
   - Harness: a missed first block leaves two on the pallet; the push stage waits, the top-up fills the first
     place, and every push and end push follows a look showing three blocks. 188 tests pass. Untested live.
 
+- 30 Oct 21:25-21:29 UTC, thirteenth cycle (@87006af, operator stopped it with Ctrl-C during the second end-alignment
+  round).
+  - The carried-over row was not on the pallet, so the run started from an empty pallet.
+  - Flatten: 3 sweeps (the first started 229.5 mm from the base, inside the new reach band). Blocks above 18 mm went
+    4, 3, 3, 2, but pickable blocks went 2, 2, 1, 0.
+  - `out_of_work_area` excluded a block at (239.8, -68.1), 249 mm from the base: the 40 mm photo-edge margin cuts
+    x < ~250 on the robot side, where the photo starts at x ~210.
+  - X sweep: one stroke (220 mm toward 295 deg), the other line not clear; then 3 blocks were pickable.
+  - Picks:
+    - Block 1: middle, close-up 4.3 mm, held 221, placed 10 s after the grab (153 mm carry; run 11: 13.8 s for
+      164 mm).
+    - Block 2: middle, close-up 8.3 mm, read 456 (~48 mm: probably two blocks side by side), placed.
+    - Block 3: a tilted block sent to the drop spot; the close-up found no block within 20 mm (it had gone with
+      block 2), read 824 (empty), "dropped".
+  - The pallet then counted 3 blocks, one 35 mm off the row line.
+  - Push stage (three blocks, as now required): the closing push was 84.1 mm, from centre-to-centre gaps of
+    74.1 mm. Across the row they were ~40 mm (the off-line block inflates them), so it over-pushed.
+  - Push stage, after the closing push: the off-line block ended up last, at x 485; the end alignment lines up
+    with the last block, so it pushed the other two toward it.
+  - Alignment check 1: spread 21.9 mm, over 5 mm, so round 2 ran; then Ctrl-C.
+  - Next (to decide): treat a middle/side grip reading far above ~220 as wrong (two blocks); gaps measured across
+    the row, not centre to centre; end alignment against the row's typical end, not an outlier last block;
+    reconsider the photo-edge margin on the robot side.
+- Change (operator: double picks happen; whenever a block is placed, check how many are on the pallet and make it
+  whole and square, re-picking and re-placing at the right angle if need be): `square_pallet`, which replaces
+  `repair_pallet`.
+  - It runs after every placement and after the push stage. It goes home, captures, and `pallet_audit` decides.
+  - The blocks that best fit the row are kept: flat first, then least turned and nearest the row's line. Any more
+    are extra; equally good blocks lose the one furthest along the row.
+  - A kept block needs fixing when it is not flat, turned more than `PALLET_SQUARE_DEG` (4, the stack's parallel
+    limit), or its centre is more than `PALLET_LINE_MM` (20, the stack's stagger limit) off the row's line.
+  - One fix per look, then look again, at most `MAX_PALLET_FIXES` (6) per run:
+    - a block that is not flat, then an extra one, goes to the drop spot (`take_off`; without `--drop-spot` it is
+      only reported);
+    - a turned or off-line block is picked and put back square into the row's next free place (`re_place`, via
+      `row_destination`).
+  - After the push stage, a fix triggers another push stage.
+  - Placement and row destination are shared helpers (`release_at`, `row_destination`).
+- Change (operator: prioritise the top layer when picking; the sweep need not flatten every layer):
+  - The pick queue is ordered by measured top height in half-block steps, highest first. It was resting level,
+    but a block lying on another measured 20.7 mm wide (run 13, top 27.7) and the narrow-top rule took it for one
+    on its edge on the table.
+  - Flatten sweeps never target, and never pass through, a block that is pickable and lies flat. When only such
+    blocks stand above the sweep height, there are no sweeps (`top_layer_pickable`).
+- Tests:
+  - Audit: square, double pick, run 13's off-line block, turned, not flat.
+  - Harness: a double pick on the third placement takes the outermost block to the drop spot before any push
+    (counts 1, 2, 4, 3); a block landing turned 15 deg is put back square; a block lying on another is picked
+    first and not swept; a missed first placement is seen at once and its slot refilled.
+  - 194 tests pass. Untested live.
+
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot
 complete until it is changed; table height and camera offset are unverified; `--grip-lower-mm 3` is a single-run fix,
 not a calibration; source and base must be reachable (x <= ~600 mm worked) and both visible from the view pose.

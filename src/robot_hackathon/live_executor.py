@@ -95,6 +95,11 @@ ROW_ALIGN_TOLERANCE_MM = 2.0      # a pallet block whose end sticks out past the
 END_ALIGN_CHECK_MM = 5.0          # after the end pushes, a look from home: the ends must lie within this of each other,
                                   # else the end alignment runs again (operator, 30 Oct)...
 MAX_ALIGN_ROUNDS = 3              # ...up to this many rounds in all, then on to the pallet check and stacking
+PALLET_SQUARE_DEG = 4.0           # a pallet block turned further than this from the row's long side is put back square:
+                                  # the stack refuses a bundle whose blocks differ more (layer_stack.PARALLEL_TOLERANCE_DEG)
+PALLET_LINE_MM = 20.0             # ...or whose centre lies further than this from the row's line along its long side (the
+                                  # stack refuses ends staggered more: 75 - MIN_SHARED_CONTACT_MM 55; run 13: 37.7 mm)
+MAX_PALLET_FIXES = 6              # pallet corrections (take a block off, or put one back square) per run
 ALIGN_START_GAP_MM = 10.0         # end alignment: the claws come down this far past the block's end (5 was too close: operator, 30 Oct)
 LOW_TRAVEL_TIPS_MM = 30.0         # pallet push stage: closed claws travel this high, over 15 mm block tops with 15 to spare
 LOW_TRAVEL_MARGIN_MM = 10.0       # anything taller than LOW_TRAVEL_TIPS_MM minus this near the path is gone over, not through
@@ -199,7 +204,7 @@ def knock_plan(block_xy, top_long_deg, obstacles, avoid, dims, forbidden=None, u
     return None
 
 
-def flatten_sweep_plan(rng, targets, obstacles, avoid, dims, forbidden=None, tries=FLATTEN_TRIES, allowed=within_reach):
+def flatten_sweep_plan(rng, targets, obstacles, avoid, dims, forbidden=None, tries=FLATTEN_TRIES, allowed=within_reach, protect=()):
     """One random sweep through the heap to knock blocks flat (operator request, 30 Oct: after going home, sweep a few
     times at random so the heap is flatter). Each draw takes a random block centre from `targets` and a random
     direction. The closed claws come down on bare table behind it: the nearest spot, 10 to FLATTEN_MAX_BACK_MM back,
@@ -233,6 +238,12 @@ def flatten_sweep_plan(rng, targets, obstacles, avoid, dims, forbidden=None, tri
             continue
         if allowed is not None and not (allowed(start) and allowed(reach)):   # claws and carried blocks within reach
             continue
+        if protect:
+            # Blocks that can be picked as they lie (the heap's top layer first, operator 30 Oct) are not swept away.
+            mid = ((start[0] + reach[0]) / 2, (start[1] + reach[1]) / 2)
+            path = (mid[0], mid[1], u_deg, math.dist(start, reach) / 2 + CLAW_THICKNESS_MM, CLAW_FACE_WIDTH_MM / 2 + KNOCK_PATH_MARGIN_MM)
+            if any(_rects_overlap(path, block_footprint(o["xy"], o["long_deg"], o["size"])) for o in protect):
+                continue
         return {"target_xy": tuple(t), "u_deg": u_deg, "start_xy": start, "end_xy": end, "distance_mm": back + FLATTEN_PAST_MM,
                 "tips_mm": tips}
     return None
@@ -511,6 +522,39 @@ def pallet_push_plan(points, long_deg, block_dims, tolerance_mm=ROW_ALIGN_TOLERA
                              "face_off_block_mm": face - after[i]})
         done |= {i, *also}
     return plan
+
+
+def pallet_audit(blocks, row_long_deg, line_xy, blocks_per_layer=3):
+    """What it takes to make the pallet whole and square (operator, 30 Oct: double picks happen; check the pallet after
+    every placement and re-pick and re-place a misplaced block at the right angle). blocks: the blocks measured on the
+    pallet as {"xy", "long_deg", "flat_reasons"} (flat_reasons: misplaced_on_pallet_reasons without the yaw check).
+    The blocks_per_layer that best fit the row are kept (lying flat first, then least turned and nearest the row's line
+    through line_xy); any more are `extra` (a double pick). A kept block needs fixing when it does not lie flat, is
+    turned more than PALLET_SQUARE_DEG from row_long_deg, or its centre lies more than PALLET_LINE_MM from the line
+    along its long side. Returns {"keep": [i], "extra": [i], "fix": [(i, reasons)], "reasons": [...], "square": bool};
+    square means nothing extra and nothing to fix (it may still be short of blocks)."""
+    lx, ly = math.cos(math.radians(row_long_deg)), math.sin(math.radians(row_long_deg))
+    reasons = []
+    for b in blocks:
+        r = list(b.get("flat_reasons") or [])
+        yaw = wrap_90(b["long_deg"] - row_long_deg)
+        if abs(yaw) > PALLET_SQUARE_DEG:
+            r.append(f"rotated:{yaw:+.1f}deg")
+        off = (b["xy"][0] - line_xy[0]) * lx + (b["xy"][1] - line_xy[1]) * ly
+        if abs(off) > PALLET_LINE_MM:
+            r.append(f"off_line:{off:+.0f}mm")
+        reasons.append(r)
+
+    def badness(i):
+        # equally good blocks (a double pick placed square): the one furthest out along the row from line_xy is extra
+        b = blocks[i]
+        off = (b["xy"][0] - line_xy[0]) * lx + (b["xy"][1] - line_xy[1]) * ly
+        return ((1000.0 if b.get("flat_reasons") else 0.0) + abs(wrap_90(b["long_deg"] - row_long_deg)) + abs(off) / 5.0
+                + math.dist(b["xy"], line_xy) / 1000.0)
+    order = sorted(range(len(blocks)), key=badness)
+    keep, extra = sorted(order[:blocks_per_layer]), order[blocks_per_layer:]
+    fix = [(i, reasons[i]) for i in keep if reasons[i]]
+    return {"keep": keep, "extra": extra, "fix": fix, "reasons": reasons, "square": not extra and not fix}
 
 
 def grip_failed(state, grab_result):
@@ -1020,10 +1064,11 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
             from the top: blocks resting on others come before blocks on the table (stable within a level)."""
             q = [proposal.candidate_entry(context, r["candidate_id"]) for r in context["ranking"]]
             thickness = scene_["calibration"].block.height_mm
-            dims_ = scene_["calibration"].block
-            q.sort(key=lambda c: -geom.resting_level_mm(
-                c["geometry"].get("height_above_table_mm"), thickness,
-                dims_.width_mm if geom.narrow_top(c["geometry"].get("flags"), c["geometry"].get("width_mm"), dims_) else None))
+            # The top layer first (operator, 30 Oct): highest measured top first, in half-block steps so the ranking order
+            # holds among blocks at one level. Not by resting level: a block lying on another measured 20.7 mm wide (run 13,
+            # top 27.7 mm), and the narrow-top rule took it for one on its edge on the table.
+            step = thickness / 2
+            q.sort(key=lambda c: -round((c["geometry"].get("height_above_table_mm") or 0.0) / step) * step)
             if keep_out_xy is not None:
                 radius = footprint_clearance_mm(target)
                 kept_out = [c for c in q if c["geometry"].get("base_point_mm")
@@ -1132,6 +1177,39 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 ep.state["pallet_count"] = len(row0)
                 ep.save()
                 return 0
+        def row_destination(row_pts, pitch, long_deg):
+            """Where the next block of a partly filled pallet row goes, given the centres of the blocks on it: into a gap
+            between two of them, else one pitch after the last, else one pitch before the first (the first anchors the
+            closing push), whichever first lies inside the row's lane. Returns (where, (x, y))."""
+            across = math.radians(long_deg + 90.0)
+            ux, uy = math.cos(across), math.sin(across)
+            now = sorted(((p[0] * ux + p[1] * uy, p) for p in row_pts), key=lambda t: t[0])
+            options = [("gap", (a[1][0] + pitch * ux, a[1][1] + pitch * uy)) for a, b in zip(now, now[1:]) if b[0] - a[0] >= 2 * pitch - 1.0]
+            options += [("after_last", (now[-1][1][0] + pitch * ux, now[-1][1][1] + pitch * uy)),
+                        ("before_first", (now[0][1][0] - pitch * ux, now[0][1][1] - pitch * uy))]
+            return next(((w, p) for w, p in options if in_row_lane({"base_point_mm": p}, any_height=True)), options[-2])
+
+        async def release_at(sx, sy, long_deg, support_z, grasp, tips, resting, held, travel_z):
+            """Carry the held block over (sx, sy), turn it so its long side lies along long_deg, put its bottom
+            PLACE_DROP_MM above support_z (at the pick the tips were tips - resting above its bottom), let go and rise
+            to travel height. Returns the released block centre (x, y), or None when the descent was refused (still held)."""
+            g = await bot.gripper_origin()
+            await bot.move_delta(dx=sx - g[0], dy=sy - g[1])
+            await bot.align_claws(wrap_90(long_deg + grasp["claws_deg_to_long_side"]), tolerance_deg=1.5, align_speed=align_speed, travel_speed=travel_speed)
+            hx, hy, _ = await bot.point_in_world("gripper", x=held[0], y=held[1])
+            await bot.move_delta(dx=sx - hx, dy=sy - hy)
+            release_z = support_z + (tips - resting) + PLACE_DROP_MM - TIP_ABOVE_GRIPPER_FRAME_MM
+            ok = await bot.descend_to(release_z, approach_speed, travel_speed)
+            if not ok:
+                await bot.set_speed(travel_speed)
+                return None
+            rx, ry, _ = await bot.point_in_world("gripper", x=held[0], y=held[1])
+            await bot.gripper.open()
+            await bot.set_speed(travel_speed)
+            g = await bot.gripper_origin()
+            await bot.move_delta(dz=travel_z - g[2], near_table=True)
+            return rx, ry
+
         async def look_closer(geo, label, candidate_id, what):
             """The block measured again from straight above, when it lies more than REFINE_BEYOND_MM from where the
             planning photo looked: the camera is moved over it, a capture is taken, and match_block finds it there.
@@ -1367,21 +1445,30 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 return bool(geom.upright_kind(c["geometry"], calib.block)) or not any(r.startswith("implausible_") for r in c["rejection_reasons"])
 
             def taller_heap_blocks():
+                """(every block, sweep targets, blocks to keep): the heap's top layer is picked, not swept (operator,
+                30 Oct): a block with a usable grip now is never a target and no stroke may pass through it."""
                 blocks = [c["geometry"] for c in ctx["candidates"] if c["geometry"].get("base_point_mm")]
-                tall = [tuple(c["geometry"]["base_point_mm"][:2]) for c in ctx["candidates"] if c["geometry"].get("base_point_mm")
+                # pickable and lying flat (a block on its edge or tilted would only be dropped flat: that is what sweeping is for)
+                pickable = {c["candidate_id"] for c in queue if any(g["eligible"] for g in c["grasps"])
+                            and not geom.upright_kind(c["geometry"], calib.block) and not geom.reorient_reasons(c["geometry"], candidate_tilt(scene, c))}
+                tall = [c for c in ctx["candidates"] if c["geometry"].get("base_point_mm")
                         and (c["geometry"].get("height_above_table_mm") or 0.0) > tips and not in_row_lane(c["geometry"], any_height=True)
                         and all(math.dist(c["geometry"]["base_point_mm"][:2], o) >= r for o, r in avoid)
                         and in_work_area(c["geometry"]["base_point_mm"][:2]) and looks_like_block(c)]
-                return blocks, tall
+                keep = [block_obstacle(c["geometry"]) for c in ctx["candidates"] if c["candidate_id"] in pickable and c["geometry"].get("base_point_mm")]
+                targets = [tuple(c["geometry"]["base_point_mm"][:2]) for c in tall if c["candidate_id"] not in pickable]
+                return blocks, targets, keep, len(tall) - len(targets)
 
             for i in range(1, sweeps + 1):
-                blocks, tall = taller_heap_blocks()
+                blocks, tall, keep, tall_pickable = taller_heap_blocks()
                 if not tall:
-                    ep.event("flow", phase="flatten_done", sweeps_done=i - 1, reason="nothing_above_sweep_height", tips_mm=tips, seed=seed)
-                    print(f"Flatten: nothing in the heap stands above {tips:.0f} mm; {i - 1} sweep(s) done", flush=True)
+                    reason = "top_layer_pickable" if tall_pickable else "nothing_above_sweep_height"
+                    ep.event("flow", phase="flatten_done", sweeps_done=i - 1, reason=reason, tips_mm=tips, seed=seed, pickable_above=tall_pickable)
+                    print(f"Flatten: {'the blocks standing above ' + format(tips, '.0f') + ' mm can be picked as they lie' if tall_pickable else 'nothing in the heap stands above ' + format(tips, '.0f') + ' mm'}; "
+                          f"{i - 1} sweep(s) done", flush=True)
                     return None
                 plan = flatten_sweep_plan(rng, tall, [block_obstacle(g) for g in blocks], avoid, calib.block,
-                                          forbidden=lambda xy: in_row_lane({"base_point_mm": xy}, any_height=True))
+                                          forbidden=lambda xy: in_row_lane({"base_point_mm": xy}, any_height=True), protect=keep)
                 if plan is None:
                     ep.event("flow", phase="flatten_done", sweeps_done=i - 1, reason="no_clear_sweep", taller_than_sweep=len(tall), seed=seed)
                     print(f"Flatten: no random sweep clears the pallet, tower and drop spot with bare table to come down on; "
@@ -1710,18 +1797,11 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                     # lane (where pallet blocks are counted).
                     row_now = row_blocks(ctx, 0)
                     if slot["layer"] == 0 and row_now and len(row_now) == len([s for s in filled if s.startswith("L0")]):
-                        ux, uy = math.cos(across), math.sin(across)
-                        now = sorted(((g_["base_point_mm"][0] * ux + g_["base_point_mm"][1] * uy, g_["base_point_mm"]) for g_ in row_now),
-                                     key=lambda t: t[0])
-                        options = [("gap", (a[1][0] + pitch * ux, a[1][1] + pitch * uy)) for a, b in zip(now, now[1:]) if b[0] - a[0] >= 2 * pitch - 1.0]
-                        options += [("after_last", (now[-1][1][0] + pitch * ux, now[-1][1][1] + pitch * uy)),
-                                    ("before_first", (now[0][1][0] - pitch * ux, now[0][1][1] - pitch * uy))]
-                        where, xy = next(((w, p) for w, p in options if in_row_lane({"base_point_mm": p}, any_height=True)),
-                                         options[-2])
-                        sx, sy = xy
+                        where, (sx, sy) = row_destination([g_["base_point_mm"] for g_ in row_now], pitch, slot["long_side_deg"])
                         if where != "after_last":
                             ep.event("flow", phase="fill_row_gap", slot=slot["slot_id"], where=where, dest_xy=[round(sx, 1), round(sy, 1)],
-                                     row=[[round(v, 1) for v in t[1][:2]] for t in now], pitch_mm=round(pitch, 1))
+                                     row=[[round(g_["base_point_mm"][0], 1), round(g_["base_point_mm"][1], 1)] for g_ in row_now],
+                                     pitch_mm=round(pitch, 1))
                 # Already includes grip_lower_mm and the floor relative to the block's resting level (see scene_from_capture).
                 tips = grasp["tips_above_table_mm"]
                 resting = grasp.get("resting_level_mm", 0.0)
@@ -1747,26 +1827,18 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                         flow_stopped = True; break
                     continue   # the slot is still open; the next pick comes from this fresh capture
                 # --- place
-                g = await bot.gripper_origin()
-                ok, _ = await bot.move_delta(dx=sx - g[0], dy=sy - g[1])
-                await bot.align_claws(wrap_90(slot["long_side_deg"] + grasp["claws_deg_to_long_side"]), tolerance_deg=1.5, align_speed=align_speed, travel_speed=travel_speed)
-                hx, hy, _ = await bot.point_in_world("gripper", x=held[0], y=held[1])
-                ok, _ = await bot.move_delta(dx=sx - hx, dy=sy - hy)
-                # At the pick the tips were (tips - resting) above the block's bottom; put that bottom PLACE_DROP_MM above the slot.
-                release_z = slot["support_z_mm"] + (tips - resting) + PLACE_DROP_MM - TIP_ABOVE_GRIPPER_FRAME_MM
-                ok = await bot.descend_to(release_z, approach_speed, travel_speed)
-                if not ok:
-                    await bot.set_speed(travel_speed)
+                released = await release_at(sx, sy, slot["long_side_deg"], slot["support_z_mm"], grasp, tips, resting, held, travel_z)
+                if released is None:
                     flow_stopped = True; ep.event("flow", phase="stop", reason="place_descend_refused", note="block still held; use live-step abort-up/open"); break
-                rx, ry, _ = await bot.point_in_world("gripper", x=held[0], y=held[1])
-                await bot.gripper.open()
-                await bot.set_speed(travel_speed)
-                g = await bot.gripper_origin()
-                await bot.move_delta(dz=travel_z - g[2], near_table=True)
+                rx, ry = released
                 last_pose = (rx, ry, slot["long_side_deg"])
                 filled.append(slot["slot_id"])
                 placed.append({"slot": slot["slot_id"], "candidate": pick["candidate_id"], "released_at": [round(rx, 1), round(ry, 1)], "grasp": grasp["style"]})
                 ep.event("flow", phase="placed", slot=slot["slot_id"], released_block_xy=[round(rx, 1), round(ry, 1)], aligned_at_pick=aligned)
+                # Look at the pallet after every placement: a double pick, or a block that landed turned, off the line or
+                # on a neighbour, is fixed now, before the next pick (operator, 30 Oct).
+                if await square_pallet(f"after_place_{slot['slot_id']}") == "stop":
+                    flow_stopped = True; break
 
         async def slide(ux, uy, distance):
             """Push stroke along (ux, uy): one continuous move with sessions off (operator, 30 Oct: the sweep went in slow
@@ -1780,59 +1852,126 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 remaining -= step
             return True
 
-        async def repair_pallet(fill_round):
-            """After the push stage (needs drop_spot_xy): a pallet block that does not lie flat (resting on a neighbour,
-            tilted, on its edge) or is turned off the row's long side is picked and laid flat on the drop spot, highest first, one per fill round; the top-up
-            then fetches a replacement and the next round checks again (operator request, 30 Oct: pick-and-drop rather
-            than sweeping the pallet). Sets flow_stopped when the block cannot be gripped or the drop fails."""
-            nonlocal obs, scene, ctx, queue, flow_stopped, pallet_count
-            obs, scene = await scene_from_capture()
-            ctx = await context_for(scene, filled)
-            checked = []
-            for c in ctx["candidates"]:
-                if not c["geometry"].get("base_point_mm") or not ("in_tower_zone" in c["rejection_reasons"]
-                                                                  or in_row_lane(c["geometry"], any_height=True)):
-                    continue
-                tilt = candidate_tilt(scene, c)
-                checked.append((c, tilt, geom.misplaced_on_pallet_reasons(c["geometry"], tilt, calib.block,
-                                                                         row_long_deg=target.layer0_long_side_deg)))
-            bad = [t for t in checked if t[2]]
-            ep.event("flow", phase="pallet_check", fill_round=fill_round, observation_id=obs["observation_id"],
-                     blocks=[{"candidate": c["candidate_id"], "xy": [round(v, 1) for v in c["geometry"]["base_point_mm"][:2]],
-                              "height": c["geometry"].get("height_above_table_mm"), "tilt_deg": None if t is None else round(t, 1),
-                              "misplaced": r} for c, t, r in checked])
-            if not bad:
-                return
-            c, tilt, reasons = max(bad, key=lambda b: b[0]["geometry"].get("height_above_table_mm") or 0.0)
-            print(f"Pallet check: block at ({c['geometry']['base_point_mm'][0]:.0f}, {c['geometry']['base_point_mm'][1]:.0f}) "
-                  f"{', '.join(reasons)}; taking it off to lay it flat", flush=True)
-            # Pallet blocks are excluded from picking by the zone; grasps come from a context of the same capture without it.
+        def pallet_grasp(c, found):
+            """A grasp for a block on the pallet. Pallet blocks are excluded from picking by the zone, so grasps come from
+            a context of the same capture without it; no ends grip next to a neighbour (ends are flush after alignment
+            and an ends grip clamps touching blocks too: 30 Oct 20:11 one repair lifted two). Returns (entry, grasp|None)."""
             entry = proposal.candidate_entry(proposal.build_context(scene, filled_slots=filled, dry_run=True), c["candidate_id"])
             styles = list(proposal.grasp_order(None))
             cxy = c["geometry"]["base_point_mm"][:2]
-            if any(o is not c and math.dist(o["geometry"]["base_point_mm"][:2], cxy) < calib.block.width_mm + 15.0 for o, _, _ in checked):
-                # Pallet ends are flush after alignment: an ends grip on one block clamps its touching neighbours too
-                # (30 Oct 20:11: one repair lifted two blocks and the pallet count fell from 3 to 1).
+            if any(o is not c and math.dist(o["geometry"]["base_point_mm"][:2], cxy) < calib.block.width_mm + 15.0 for o in found):
                 styles = [st for st in styles if st != "ends"]
-            grasp = next((g for style in styles for g in entry["grasps"] if g["style"] == style and g["eligible"]), None)
-            blocker = drop_spot_blocked(ctx, c["candidate_id"])
+            return entry, next((g for style in styles for g in entry["grasps"] if g["style"] == style and g["eligible"]), None)
+
+        async def take_off(c, reasons, found, label):
+            """Pick a pallet block up and lay it flat on the drop spot (it is a heap block again): one that does not lie
+            flat, or one too many after a double pick. Returns "stop" (event recorded) or None."""
+            entry, grasp = pallet_grasp(c, found)
+            blocker = drop_spot_blocked(ctx, c["candidate_id"]) if drop_spot_xy is not None else "no --drop-spot"
             if grasp is None or blocker:
-                flow_stopped = True
-                why = "no clear grasp" if grasp is None else f"drop spot occupied by {blocker}"
+                why = "no clear grasp" if grasp is None else f"drop spot occupied by {blocker}" if drop_spot_xy is not None else "no --drop-spot"
                 ep.event("flow", phase="stop", reason="pallet_repair_impossible", candidate=c["candidate_id"], misplaced=reasons,
                          detail=why, note="straighten or remove the block by hand, then rerun")
-                print(f"Pallet repair not possible ({why}); straighten or remove the block by hand, then rerun", flush=True)
-                return
+                print(f"Pallet: cannot take the block off ({why}); straighten or remove it by hand, then rerun", flush=True)
+                return "stop"
             tips, resting = grasp["tips_above_table_mm"], grasp.get("resting_level_mm", 0.0)
-            ep.event("flow", phase="pallet_repair", candidate=c["candidate_id"], misplaced=reasons, grasp=grasp["style"],
+            ep.event("flow", phase="pallet_repair", label=label, candidate=c["candidate_id"], misplaced=reasons, grasp=grasp["style"],
                      tips_above_table_mm=round(tips, 1), resting_level_mm=resting)
+            print(f"Pallet: block at ({c['geometry']['base_point_mm'][0]:.0f}, {c['geometry']['base_point_mm'][1]:.0f}) "
+                  f"{', '.join(reasons)}; taking it off to the drop spot", flush=True)
             stop_reason, _, travel_z, attempt, _ = await grab_block(entry, grasp, tips, "repair")
             if stop_reason:
-                flow_stopped = True; ep.event("flow", phase="stop", reason=stop_reason, candidate=c["candidate_id"], attempts=attempt); return
+                ep.event("flow", phase="stop", reason=stop_reason, candidate=c["candidate_id"], attempts=attempt)
+                return "stop"
             await bot.move_delta(dz=PICK_LIFT_MM, near_table=True)
             if await drop_and_check(entry, reasons, tips, resting, travel_z, "repair"):
-                flow_stopped = True; return
-            pallet_count = len(row_blocks(ctx, 0))
+                return "stop"
+            return None
+
+        async def re_place(c, reasons, good_xy, found, label):
+            """Pick a pallet block that is turned or off the row's line and put it back square (operator, 30 Oct: re-pick
+            and place again, correcting the angle): into the row's next free place beside the good blocks (row_destination),
+            or the first slot when there are none, its long side along the row. Returns "stop" (event recorded) or None."""
+            entry, grasp = pallet_grasp(c, found)
+            if grasp is None:
+                ep.event("flow", phase="pallet_fix_skipped", label=label, candidate=c["candidate_id"], misplaced=reasons, reason="no clear grasp")
+                print("Pallet: no clear grasp to put the block back square; leaving it", flush=True)
+                return None
+            tips, resting = grasp["tips_above_table_mm"], grasp.get("resting_level_mm", 0.0)
+            slot0 = target.slots()[0]
+            pitch = calib.block.width_mm + gap_mm + release_spacing_mm(grasp["style"], calib.finger, calib.block.width_mm, place_spacing_mm)
+            where, (sx, sy) = row_destination(good_xy, pitch, slot0["long_side_deg"]) if good_xy else ("first_slot", tuple(slot0["block_center_mm"][:2]))
+            ep.event("flow", phase="pallet_replace", label=label, candidate=c["candidate_id"], misplaced=reasons, grasp=grasp["style"],
+                     from_xy=[round(v, 1) for v in c["geometry"]["base_point_mm"][:2]], dest_xy=[round(sx, 1), round(sy, 1)], where=where)
+            print(f"Pallet: block at ({c['geometry']['base_point_mm'][0]:.0f}, {c['geometry']['base_point_mm'][1]:.0f}) "
+                  f"{', '.join(reasons)}; putting it back square at ({sx:.0f}, {sy:.0f})", flush=True)
+            stop_reason, held, travel_z, attempt, _ = await grab_block(entry, grasp, tips, "replace")
+            if stop_reason:
+                ep.event("flow", phase="stop", reason=stop_reason, candidate=c["candidate_id"], attempts=attempt)
+                return "stop"
+            await bot.move_delta(dz=PICK_LIFT_MM, near_table=True)
+            released = await release_at(sx, sy, slot0["long_side_deg"], slot0["support_z_mm"], grasp, tips, resting, held, travel_z)
+            if released is None:
+                ep.event("flow", phase="stop", reason="place_descend_refused", note="block still held; use live-step abort-up/open")
+                return "stop"
+            ep.event("flow", phase="pallet_replaced", label=label, released_block_xy=[round(v, 1) for v in released])
+            return None
+
+        async def square_pallet(label):
+            """Look at the pallet and make it whole and square (operator, 30 Oct: double picks happen; after every
+            placement check how many blocks are there and fix them, re-picking if need be). pallet_audit decides; one fix
+            per look, then look again: a block that does not lie flat, then a block too many, goes to the drop spot
+            (take_off); a block turned or off the row's line is put back square (re_place). At most MAX_PALLET_FIXES
+            fixes per run. Returns the number of fixes made in this call, or "stop"."""
+            nonlocal obs, scene, ctx, queue, pallet_count, last_pose, pallet_fixes
+            fixes = 0
+            while True:
+                ok, _ = await bot.move_to(*home)
+                if not ok:
+                    ep.event("flow", phase="stop", reason="view_pose_refused_before_pallet_check")
+                    return "stop"
+                obs, scene = await scene_from_capture()
+                ctx = await context_for(scene, filled)
+                found = [c for c in ctx["candidates"] if c["geometry"].get("base_point_mm") and c["geometry"].get("base_long_side_deg") is not None
+                         and ("in_tower_zone" in c["rejection_reasons"] or in_row_lane(c["geometry"], any_height=True))]
+                blocks = [{"xy": tuple(c["geometry"]["base_point_mm"][:2]), "long_deg": c["geometry"]["base_long_side_deg"],
+                           "flat_reasons": geom.misplaced_on_pallet_reasons(c["geometry"], candidate_tilt(scene, c), calib.block)} for c in found]
+                audit = pallet_audit(blocks, target.layer0_long_side_deg, target.slots()[0]["block_center_mm"][:2], target.blocks_per_layer)
+                pallet_count = reconcile_pallet(ctx, label)
+                queue = build_queue(ctx, obs, scene, label)
+                ep.event("flow", phase="pallet_check", label=label, observation_id=obs["observation_id"], count=len(found),
+                         blocks=[{"candidate": c["candidate_id"], "xy": [round(v, 1) for v in b["xy"]], "long_deg": round(b["long_deg"], 1),
+                                  "height": c["geometry"].get("height_above_table_mm"), "misplaced": audit["reasons"][i]}
+                                 for i, (c, b) in enumerate(zip(found, blocks))],
+                         extra=[found[i]["candidate_id"] for i in audit["extra"]], fix=[found[i]["candidate_id"] for i, _ in audit["fix"]],
+                         square=audit["square"])
+                if audit["square"]:
+                    return fixes
+                if pallet_fixes >= MAX_PALLET_FIXES:
+                    ep.event("flow", phase="pallet_not_square", label=label, fixes=pallet_fixes, note="carrying on; fix the pallet by hand if the stack refuses it")
+                    print(f"Pallet still not whole and square after {pallet_fixes} fixes; carrying on", flush=True)
+                    return fixes
+                not_flat = [i for i, _ in audit["fix"] if blocks[i]["flat_reasons"]]
+                to_take = not_flat + audit["extra"][::-1]                        # extras are ordered best first
+                turned = [(i, r) for i, r in audit["fix"] if not blocks[i]["flat_reasons"]]
+                if to_take and drop_spot_xy is None:
+                    # Taking a block off needs somewhere to put it; without --drop-spot only re-placing is possible.
+                    ep.event("flow", phase="pallet_fix_needs_drop_spot", label=label, blocks=[found[i]["candidate_id"] for i in to_take])
+                    to_take = []
+                if not to_take and not turned:
+                    return fixes
+                pallet_fixes += 1
+                fixes += 1
+                if to_take:
+                    i = to_take[0]
+                    status = await take_off(found[i], audit["reasons"][i] or ["extra_block"], found, label)
+                else:
+                    i, reasons = turned[0]
+                    good = [blocks[j]["xy"] for j in audit["keep"] if j != i and not audit["reasons"][j]]
+                    status = await re_place(found[i], reasons, good, found, label)
+                if status == "stop":
+                    return "stop"
+                last_pose = None
 
         async def move_low(xy, obstacles, high_z):
             """Closed claws to xy at LOW_TRAVEL_TIPS_MM above the table: straight down where they are, then sideways. If
@@ -2032,6 +2171,7 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
         knock_spots = []
         x_sweeps_used = 0
         push_outs_used = 0
+        pallet_fixes = 0
         rescans_without_progress = 0
         placed_at_last_scan = 0
         pallet_count = len([s for s in filled if s.startswith('L0')])
@@ -2045,8 +2185,12 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
             ok, _ = await bot.move_to(*home)
             ep.event("flow", phase="home", accepted=ok, placed=placed, pose=list(home), fill_round=fill_round)
             await push_phase()
-            if drop_spot_xy is not None and not flow_stopped:
-                await repair_pallet(fill_round)
+            if not flow_stopped:
+                fixed = await square_pallet(f"after_push_{fill_round}")
+                if fixed == "stop":
+                    flow_stopped = True
+                elif fixed and pallet_count >= target.blocks_per_layer:
+                    await push_phase()                     # a block was put back square: close and line up the row again
             if flow_stopped or pallet_count >= target.blocks_per_layer or len(placed) >= max_blocks:
                 break
             # Fewer blocks on the pallet than placed (a drop, a knock-out): the measured count frees the slots again and
