@@ -1,0 +1,37 @@
+{
+  "_comment": "Local viam-server config for development on this Mac with a second RealSense D435. No cloud section: reachable only at localhost:8080, no API key (MACHINE_AUTH=none). A cloud-less server cannot fetch registry modules, so the module is a local executable downloaded once with `viam module download --id viam:realsense --platform darwin/arm64` into ~/.viam/packages-local. Fill serial_number from realsense:discovery or the camera label. align_color_depth=true makes the module align depth to the color frame; the operator still records the alignment verdict with rgbd-calibration after an overlay check.",
+  "network": {
+    "bind_address": "localhost:8080"
+  },
+  "modules": [
+    {
+      "type": "local",
+      "name": "viam_realsense",
+      "executable_path": "/Users/kris/.viam/packages-local/realsense/0.22.6-darwin-arm64/viam-camera-realsense"
+    }
+  ],
+  "components": [
+    {
+      "name": "cam",
+      "namespace": "rdk",
+      "type": "camera",
+      "model": "viam:camera:realsense",
+      "attributes": {
+        "sensors": [
+          "color",
+          "depth"
+        ],
+        "serial_number": "241122072318",
+        "align_color_depth": true
+      }
+    }
+  ],
+  "services": [
+    {
+      "name": "realsense-discovery",
+      "namespace": "rdk",
+      "type": "discovery",
+      "model": "viam:realsense:discovery"
+    }
+  ]
+}

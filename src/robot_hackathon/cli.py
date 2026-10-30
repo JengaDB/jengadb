@@ -5,18 +5,23 @@ import logging
 from pathlib import Path
 from .config import Config, ConfigError
 from .local_store import LocalStore
+from . import rgbd_cli
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Robot attempt logger. Offline by default; no physical actions.")
-    parser.add_argument("command", nargs="?", default="mock-demo", choices=("mock-demo", "report", "viam-check", "mongo-ping", "mongo-index", "flush"))
+    parser.add_argument("command", nargs="?", default="mock-demo",
+                        choices=("mock-demo", "report", "viam-check", "mongo-ping", "mongo-index", "flush") + rgbd_cli.COMMANDS)
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--report", type=Path, default=None)
     parser.add_argument("--allow-cloud", action="store_true")
     parser.add_argument("--confirm-write", action="store_true", help="Use only after authorization for this test database")
+    rgbd_cli.add_arguments(parser)
     args = parser.parse_args(argv)
     try:
         config = Config.from_env()
+        if args.command in rgbd_cli.COMMANDS:
+            return rgbd_cli.run(args, config)
         if args.command in ("mock-demo", "report"):
             from .report import render
             store = LocalStore(args.data_dir, config.mode)
@@ -59,8 +64,8 @@ def main(argv=None):
     except ConfigError as exc:
         print(f"Configuration: {exc}")
         return 2
-    except ImportError:
-        print("Optional SDK unavailable. See README; offline demo remains available.")
+    except ImportError as exc:
+        print(f"Optional dependency unavailable ({exc.name}). See docs/SETUP.md; offline demo remains available.")
         return 2
     except Exception:
         print("Operation failed; diagnostic details suppressed to protect secrets. Local records retained.")
