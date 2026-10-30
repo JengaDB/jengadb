@@ -36,8 +36,13 @@ MAX_REORIENT_DROPS = 2            # drops per run before the flow stops and asks
 KNOCK_TIPS_FRACTION = 0.6         # sweep with the claw tips at this fraction of the block's height (45 mm for one standing
                                   # on end, 16 mm for one on its edge: never below one block + 1 mm, clear of flat neighbours)
 KNOCK_PAST_MM = 30.0              # stroke past first contact: the top must move ~15 mm before a 15 mm-thick block tips
-KNOCK_CLEAR_MM = 55.0             # no other block centre within this of where the knocked block lands
-MAX_KNOCKS = 2                    # knock-overs per run before the flow stops and asks the operator
+KNOCK_START_GAP_MM = 20.0         # the claws come down this far from the swept block's face (5 was too close: operator, 30 Oct)
+KNOCK_LOWER_MARGIN_MM = 10.0      # where the claws come down, nothing else may lie within this of their footprint
+KNOCK_PATH_MARGIN_MM = 5.0        # along the sweep, nothing the claws would hit may lie within this of their path
+KNOCK_LANDING_MARGIN_MM = 5.0     # the fallen block's footprint plus this must be clear of other blocks
+MAX_KNOCKS = 6                    # sweeps per run
+MAX_KNOCKS_PER_SPOT = 2           # sweeps of the block at one place before the flow stops and asks the operator
+CLAW_FACE_WIDTH_MM = 45.0         # closed claws: face width across the push, two claws (16 mm) along it
 PUSH_EXTRA_MM = 8.0               # shove past the point where the gaps have closed
 ADJACENT_CLEARANCE_MM = 1.5       # placing exactly one pitch away nudged the neighbour; leave this much and push later
 MAX_RESCANS = 2                   # consecutive re-captures without a placement before the flow gives up on the layer
@@ -71,40 +76,75 @@ def release_spacing_mm(grasp_style, finger, block_width_mm, base_spacing_mm):
     return max(base_spacing_mm, sweep)
 
 
-def knock_plan(block_xy, top_long_deg, others_xy, avoid, dims, forbidden=None, clear_mm=KNOCK_CLEAR_MM, upright="standing"):
+def _rects_overlap(a, b):
+    """Oriented rectangles (cx, cy, angle_deg, half_length, half_width) overlap, by the separating axis test."""
+    def corners(r):
+        cx, cy, ang, hl, hw = r
+        c, s_ = math.cos(math.radians(ang)), math.sin(math.radians(ang))
+        return [(cx + c * x - s_ * y, cy + s_ * x + c * y) for x, y in ((hl, hw), (hl, -hw), (-hl, hw), (-hl, -hw))]
+    ca, cb = corners(a), corners(b)
+    for ang in (a[2], a[2] + 90.0, b[2], b[2] + 90.0):
+        ux, uy = math.cos(math.radians(ang)), math.sin(math.radians(ang))
+        pa = [x * ux + y * uy for x, y in ca]
+        pb = [x * ux + y * uy for x, y in cb]
+        if max(pa) < min(pb) or max(pb) < min(pa):
+            return False
+    return True
+
+
+def block_footprint(xy, long_deg, size, margin=0.0):
+    """Oriented rectangle of a block's footprint on the table: size (length, width) along/across long_deg."""
+    return (xy[0], xy[1], long_deg, size[0] / 2 + margin, size[1] / 2 + margin)
+
+
+def knock_plan(block_xy, top_long_deg, obstacles, avoid, dims, forbidden=None, upright="standing"):
     """Sweep that tips an upright block onto clear table (operator requests, 30 Oct: knock a standing block over;
-    sweep rather than drop a block on its edge). upright "standing" (on its end, end face 25 x 15): across the thin
-    15 mm side it tips onto its wide face (lies flat), so those two directions come first; across the 25 mm side it
-    lands on its edge (swept again later). upright "on_edge" (on its narrow side, 25 mm tall, 15 mm on top): only
-    across the thin side, which lays it on its wide face. The claw tips sweep at KNOCK_TIPS_FRACTION of the block's
-    height. A direction is usable when the landing centre has no other block centre within clear_mm, lies outside
-    every (centre, radius) in avoid and is not forbidden(xy), and nothing lies within 30 mm of where the closed claws
-    come down. Among usable directions of the better kind, the one with the most room wins.
-    Returns {u_deg, start_xy, distance_mm, landing_xy, onto, tips_mm} or None."""
-    def room(xy):
-        d = [math.dist(xy, o) for o in others_xy] + [math.dist(xy, c) - r for c, r in avoid]
-        return min(d) if d else float("inf")
+    sweep rather than drop a block on its edge; come down further from it and do not hit other blocks).
+    upright "standing" (on its end, end face 25 x 15): across the thin 15 mm side it tips onto its wide face, so those
+    two directions come first; across the 25 mm side it lands on its edge. upright "on_edge" (on its narrow side,
+    25 mm tall): only across the thin side, which lays it on its wide face. The claw tips sweep at KNOCK_TIPS_FRACTION
+    of its height. obstacles: other blocks as {"xy", "long_deg", "size": (length, width), "top"}. A direction is usable
+    when (1) the claws' footprint where they come down (KNOCK_START_GAP_MM from the block's face), grown by
+    KNOCK_LOWER_MARGIN_MM, overlaps no other block of any height; (2) the path they sweep overlaps no block taller than
+    the tips minus KNOCK_PATH_MARGIN_MM; (3) the fallen block's footprint, grown by KNOCK_LANDING_MARGIN_MM, overlaps no
+    other block, lies outside every (centre, radius) in avoid and is not forbidden(xy). Among usable directions of the
+    better kind, the one whose landing has the most room wins.
+    Returns {u_deg, start_xy, distance_mm, landing_xy, onto, tips_mm, room_mm} or None."""
     if upright == "on_edge":
         height, options = dims.width_mm, (("wide_face", top_long_deg + 90.0, dims.height_mm / 2),)
     else:
         height, options = dims.length_mm, (("wide_face", top_long_deg + 90.0, dims.height_mm / 2), ("edge", top_long_deg, dims.width_mm / 2))
     tips = max(KNOCK_TIPS_FRACTION * height, dims.height_mm + 1.0)
+    rects = [(o, block_footprint(o["xy"], o["long_deg"], o["size"])) for o in obstacles]
     for onto, base_deg, half in options:
         best = None
         for u_deg in (base_deg, base_deg + 180.0):
             ux, uy = math.cos(math.radians(u_deg)), math.sin(math.radians(u_deg))
+            back = half + KNOCK_START_GAP_MM + CLAW_THICKNESS_MM
+            start = (block_xy[0] - ux * back, block_xy[1] - uy * back)
+            distance = KNOCK_START_GAP_MM + half + KNOCK_PAST_MM
             # it pivots on its bottom edge (half the footprint out) and falls its height outward
             landing = (block_xy[0] + ux * (half + height / 2), block_xy[1] + uy * (half + height / 2))
-            back = half + CLAW_THICKNESS_MM + PUSH_START_GAP_MM
-            start = (block_xy[0] - ux * back, block_xy[1] - uy * back)
-            if any(math.dist(landing, o) < clear_mm for o in others_xy) or any(math.dist(landing, c) < r for c, r in avoid):
+            if upright == "on_edge":
+                fallen = block_footprint(landing, top_long_deg, (dims.length_mm, dims.width_mm), KNOCK_LANDING_MARGIN_MM)
+            else:
+                # a standing block falls with its length along the sweep, onto its wide face (25 wide) or its edge (15)
+                fallen = block_footprint(landing, u_deg, (dims.length_mm, dims.width_mm if onto == "wide_face" else dims.height_mm),
+                                         KNOCK_LANDING_MARGIN_MM)
+            lower = (start[0], start[1], u_deg, CLAW_THICKNESS_MM + KNOCK_LOWER_MARGIN_MM, CLAW_FACE_WIDTH_MM / 2 + KNOCK_LOWER_MARGIN_MM)
+            mid = (start[0] + ux * distance / 2, start[1] + uy * distance / 2)
+            path = (mid[0], mid[1], u_deg, distance / 2 + CLAW_THICKNESS_MM, CLAW_FACE_WIDTH_MM / 2 + KNOCK_PATH_MARGIN_MM)
+            if any(_rects_overlap(lower, r) for _, r in rects):
+                continue
+            if any(o["top"] > tips - KNOCK_PATH_MARGIN_MM and _rects_overlap(path, r) for o, r in rects):
+                continue
+            if any(_rects_overlap(fallen, r) for _, r in rects) or any(math.dist(landing, c) < r for c, r in avoid):
                 continue
             if forbidden is not None and forbidden(landing):
                 continue
-            if any(math.dist(start, o) < 30.0 for o in others_xy):
-                continue
-            plan = {"u_deg": u_deg % 360.0, "start_xy": start, "distance_mm": PUSH_START_GAP_MM + half + KNOCK_PAST_MM,
-                    "landing_xy": landing, "onto": onto, "room_mm": room(landing), "tips_mm": tips}
+            room = min([math.dist(landing, o["xy"]) for o in obstacles] + [math.dist(landing, c) - r for c, r in avoid] or [float("inf")])
+            plan = {"u_deg": u_deg % 360.0, "start_xy": start, "distance_mm": distance, "landing_xy": landing, "onto": onto,
+                    "room_mm": room, "tips_mm": tips}
             if best is None or plan["room_mm"] > best["room_mm"]:
                 best = plan
         if best is not None:
@@ -759,6 +799,15 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 return "reorient_failed"
             return None
 
+        def block_obstacle(g):
+            """A measured block as a sweep obstacle: its footprint by kind (standing 25 x 15, on its edge 75 x 15, else
+            75 x 25; partial masks are not trusted for size) and its top height."""
+            kind = geom.upright_kind(g, calib.block)
+            b = calib.block
+            size = (b.width_mm, b.height_mm) if kind == "standing" else (b.length_mm, b.height_mm) if kind == "on_edge" else (b.length_mm, b.width_mm)
+            return {"xy": tuple(g["base_point_mm"][:2]), "long_deg": g.get("base_long_side_deg") or 0.0, "size": size,
+                    "top": g.get("height_above_table_mm") if g.get("height_above_table_mm") is not None else b.height_mm}
+
         def find_upright(context):
             """A block standing on its end or on its edge on the table, away from the pallet, its row lane and the
             keep-out (the tower)."""
@@ -782,18 +831,23 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
             bxy = tuple(g["base_point_mm"][:2])
             kind = geom.upright_kind(g, calib.block) or "on_edge"
             what = "standing on end" if kind == "standing" else "on its edge"
-            others = [tuple(o["geometry"]["base_point_mm"][:2]) for o in ctx["candidates"]
-                      if o is not c and o["geometry"].get("base_point_mm")]
+            others = [block_obstacle(o["geometry"]) for o in ctx["candidates"]
+                      if o is not c and o["geometry"].get("base_point_mm") and math.dist(o["geometry"]["base_point_mm"][:2], bxy) > 5.0]
             clear = footprint_clearance_mm(target) + 10.0
             avoid = [(tuple(tower_origin), clear)] + ([(tuple(keep_out_xy), clear)] if keep_out_xy is not None else []) \
                 + ([(tuple(drop_spot_xy), DROP_CLEAR_MM)] if drop_spot_xy is not None and math.dist(bxy, drop_spot_xy) >= DROP_CLEAR_MM else [])
+            if sum(1 for xy in knock_spots if math.dist(xy, bxy) < 25.0) >= MAX_KNOCKS_PER_SPOT:
+                ep.event("flow", phase="knock_not_possible", slot=label, candidate=c["candidate_id"], block_xy=list(bxy),
+                         note=f"already swept {MAX_KNOCKS_PER_SPOT} times here")
+                return "not_possible", "swept_here_already"
             plan = knock_plan(bxy, g["base_long_side_deg"], others, avoid, calib.block,
                               forbidden=lambda xy: in_row_lane({"base_point_mm": xy}, any_height=True), upright=kind)
             if plan is None:
                 ep.event("flow", phase="knock_not_possible", slot=label, candidate=c["candidate_id"], block_xy=list(bxy),
-                         note="no direction with clear table to fall onto")
-                print(f"{label}: block {what} at ({bxy[0]:.0f}, {bxy[1]:.0f}) has no clear side to fall onto; leaving it", flush=True)
-                return "not_possible", "no_clear_side"
+                         note="no direction where the claws come down on bare table, sweep past no other block and the block lands clear")
+                print(f"{label}: block {what} at ({bxy[0]:.0f}, {bxy[1]:.0f}): no sweep that clears the other blocks; leaving it", flush=True)
+                return "not_possible", "no_clear_sweep"
+            knock_spots.append(bxy)
             ux, uy = math.cos(math.radians(plan["u_deg"])), math.sin(math.radians(plan["u_deg"]))
             sx, sy = plan["start_xy"]
             ep.event("flow", phase="knock_over", slot=label, candidate=c["candidate_id"], block_xy=[round(v, 1) for v in bxy],
@@ -838,7 +892,7 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                      landed_height_mm=landed["geometry"].get("height_above_table_mm") if landed else None, knocks_used=knocks_used)
             print(f"{label}: after the sweep the block is {'STILL ' + what.upper() if still_here else 'down'}"
                   + (f" (top {landed['geometry']['height_above_table_mm']:.0f} mm near the landing spot)" if landed and not still_here else ""), flush=True)
-            if still_here and knocks_used >= MAX_KNOCKS:
+            if still_here and (knocks_used >= MAX_KNOCKS or sum(1 for xy in knock_spots if math.dist(xy, bxy) < 25.0) >= MAX_KNOCKS_PER_SPOT):
                 ep.event("flow", phase="stop", reason="knock_failed", knocks_used=knocks_used, note="lay the block down by hand, then rerun")
                 print(f"{label}: still {what} after {knocks_used} sweep(s); lay it down by hand and rerun", flush=True)
                 return "stop", "knock_failed"
@@ -1157,6 +1211,7 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
         flow_stopped = False
         drops_used = 0
         knocks_used = 0
+        knock_spots = []
         rescans_without_progress = 0
         placed_at_last_scan = 0
         pallet_count = len([s for s in filled if s.startswith('L0')])

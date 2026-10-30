@@ -132,44 +132,59 @@ class OnEdge(unittest.TestCase):
 class KnockPlan(unittest.TestCase):
     dims = geom.BlockDimensions()
 
-    def plan(self, others=(), avoid=(), forbidden=None):
+    @staticmethod
+    def flat(x, y, deg=0.0, top=15.0):
+        return {"xy": (x, y), "long_deg": deg, "size": (75.0, 25.0), "top": top}
+
+    def plan(self, obstacles=(), avoid=(), forbidden=None, upright="standing", xy=(350.0, 0.0)):
         from robot_hackathon.live_executor import knock_plan
         # end face's long side (25 mm) along x: the thin 15 mm side faces +y/-y
-        return knock_plan((350.0, 0.0), 0.0, list(others), list(avoid), self.dims, forbidden=forbidden)
+        return knock_plan(xy, 0.0, list(obstacles), list(avoid), self.dims, forbidden=forbidden, upright=upright)
 
     def test_prefers_tipping_onto_the_wide_face_with_room(self):
-        from robot_hackathon.live_executor import PUSH_START_GAP_MM, KNOCK_PAST_MM
-        plan = self.plan(others=[(350.0, 70.0)])                      # a block lies where a +y fall would land
+        from robot_hackathon.live_executor import KNOCK_START_GAP_MM, KNOCK_PAST_MM, CLAW_THICKNESS_MM
+        plan = self.plan(obstacles=[self.flat(350.0, 75.0)])            # a block lies where a +y fall would land
         self.assertEqual(plan["onto"], "wide_face")
-        self.assertAlmostEqual(plan["u_deg"], 270.0)                   # falls toward -y, away from it
+        self.assertAlmostEqual(plan["u_deg"], 270.0)                     # falls toward -y, away from it
         self.assertAlmostEqual(plan["landing_xy"][1], -(7.5 + 37.5))
-        self.assertAlmostEqual(plan["start_xy"][1], 7.5 + 8.0 + PUSH_START_GAP_MM)   # claws start on the far side
-        self.assertAlmostEqual(plan["distance_mm"], PUSH_START_GAP_MM + 7.5 + KNOCK_PAST_MM)
+        # operator, 30 Oct: come down further from the block (20 mm from its face, was 5)
+        self.assertAlmostEqual(plan["start_xy"][1], 7.5 + KNOCK_START_GAP_MM + CLAW_THICKNESS_MM)
+        self.assertAlmostEqual(plan["distance_mm"], KNOCK_START_GAP_MM + 7.5 + KNOCK_PAST_MM)
+
+    def test_never_comes_down_on_another_block(self):
+        # A flat block whose centre is 36 mm from where the claws would come down on the +y side, but whose body lies
+        # under them: the old centre-distance check (30 mm) let the claws come down on it (operator: "don't hit other
+        # blocks"). Now that side is out and the claws come down on the -y side.
+        import math as m
+        from robot_hackathon.live_executor import KNOCK_START_GAP_MM, CLAW_THICKNESS_MM
+        start_plus_y = (350.0, 7.5 + KNOCK_START_GAP_MM + CLAW_THICKNESS_MM)
+        self.assertGreater(m.dist(start_plus_y, (380.0, 55.0)), 30.0)
+        plan = self.plan(obstacles=[self.flat(380.0, 55.0)], upright="on_edge")
+        self.assertAlmostEqual(plan["u_deg"], 90.0)                        # claws on the -y side, sweeping toward +y
+        self.assertLess(plan["start_xy"][1], 0.0)
+        self.assertIsNone(self.plan(obstacles=[self.flat(380.0, 55.0), self.flat(380.0, -55.0)], upright="on_edge"))
 
     def test_falls_back_to_the_edge_then_gives_up(self):
-        blocked_y = [(350.0, 50.0), (350.0, -50.0)]
-        plan = self.plan(others=blocked_y)
-        self.assertEqual(plan["onto"], "edge")                          # along x instead; the drop step lays it flat later
+        blocked_y = [self.flat(350.0, 60.0), self.flat(350.0, -60.0)]
+        plan = self.plan(obstacles=blocked_y)
+        self.assertEqual(plan["onto"], "edge")                            # along x instead
         self.assertIn(round(plan["u_deg"]), (0, 180))
-        self.assertIsNone(self.plan(others=blocked_y + [(400.0, 0.0), (300.0, 0.0)]))
+        self.assertIsNone(self.plan(obstacles=blocked_y + [self.flat(440.0, 0.0, deg=90.0), self.flat(260.0, 0.0, deg=90.0)]))
         # the tower's keep-out and the pallet lane count as occupied too
         self.assertIsNone(self.plan(avoid=[((350.0, 0.0), 120.0)]))
         self.assertIsNone(self.plan(forbidden=lambda xy: True))
 
     def test_on_edge_tips_across_its_thin_side_only(self):
-        from robot_hackathon.live_executor import knock_plan, PUSH_START_GAP_MM, KNOCK_PAST_MM
-        # on its edge, length along x: it can only tip across y; it falls its 25 mm height outward, landing 20 mm over
-        plan = knock_plan((300.0, 330.0), 0.0, [], [], self.dims, upright="on_edge")
+        from robot_hackathon.live_executor import KNOCK_START_GAP_MM, KNOCK_PAST_MM
+        plan = self.plan(upright="on_edge", xy=(300.0, 330.0))
         self.assertEqual(plan["onto"], "wide_face")
         self.assertIn(round(plan["u_deg"]), (90, 270))
         self.assertAlmostEqual(math.dist(plan["landing_xy"], (300.0, 330.0)), 7.5 + 12.5)
-        self.assertAlmostEqual(plan["tips_mm"], 16.0)                                # above flat 15 mm neighbours
-        self.assertAlmostEqual(plan["distance_mm"], PUSH_START_GAP_MM + 7.5 + KNOCK_PAST_MM)
-        standing = knock_plan((300.0, 330.0), 0.0, [], [], self.dims)
-        self.assertAlmostEqual(standing["tips_mm"], 45.0)
-        # both thin-side directions blocked: an on-edge block has no other way to tip
-        self.assertIsNone(knock_plan((300.0, 330.0), 0.0, [(300.0, 350.0), (300.0, 310.0)], [], self.dims, upright="on_edge"))
-
+        self.assertAlmostEqual(plan["tips_mm"], 16.0)                      # above flat 15 mm neighbours
+        self.assertAlmostEqual(plan["distance_mm"], KNOCK_START_GAP_MM + 7.5 + KNOCK_PAST_MM)
+        self.assertAlmostEqual(self.plan()["tips_mm"], 45.0)
+        both = [self.flat(300.0, 375.0), self.flat(300.0, 285.0)]
+        self.assertIsNone(self.plan(obstacles=both, upright="on_edge", xy=(300.0, 330.0)))
 
 if __name__ == "__main__":
     unittest.main()

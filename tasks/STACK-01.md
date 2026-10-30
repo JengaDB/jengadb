@@ -315,6 +315,21 @@ local/layer-stack-data/live/episodes/):
   on-edge sweep plan (thin side only, 16 mm, 20 mm landing, refused when both sides are blocked), and a harness run
   where an on-edge block is swept flat (no drop) and picked to a full pallet. Untested live.
 
+- 30 Oct 20:02-20:04 UTC, fourth cycle (@06d12de, same command): first live sweeps. 20:02:20 the block left on its
+  edge at the drop spot, (292, 325), 22.2 mm, was swept at 16 mm toward -x and landed flat (13.3 mm) at (272, 326).
+  20:02:36 a block standing on end at (326, 119), 74.7 mm, was swept at 45 mm; afterwards not standing, but nothing
+  was found near the expected landing. That used MAX_KNOCKS (2 per run). Two flat blocks were then placed; for the
+  third the heap (photo obs_aa12084ad7e64661) was packed side by side (no clear grasp) and the only candidate, on
+  its edge and tilted 18.1 deg, could neither be swept (limit) nor dropped (spot "occupied" by the swept block, which
+  lay at x 272, inside the strip the claws hide in the overview, so it was never pickable). Stopped 2 of 3.
+  Operator: when lowering to sweep, be further from the target block and do not hit other blocks.
+- Changes: the claws come down KNOCK_START_GAP_MM 20 from the swept block's face (was 5); knock_plan checks
+  footprints, not centres: the claws' footprint where they come down (+10 mm) must overlap no other block of any
+  height, the sweep path no block taller than the tips - 5 mm, and the fallen block's footprint (+5 mm) no other
+  block. Limits: MAX_KNOCKS_PER_SPOT 2 (same place) and MAX_KNOCKS 6 per run (was 2 per run). Next run: a drop spot
+  out of the claw-hidden strip, e.g. --drop-spot 340,340 (176 mm from the pallet, off its lane). Not addressed: a
+  heap packed side by side with no clear grasp (the team's "shuffle the bottom layer" case). Untested live.
+
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot
 complete until it is changed; table height and camera offset are unverified; `--grip-lower-mm 3` is a single-run fix,
 not a calibration; source and base must be reachable (x <= ~600 mm worked) and both visible from the view pose.
