@@ -579,6 +579,14 @@ class RunFlowHarness(unittest.TestCase):
         self.assertLessEqual(len(m_picks), 2)                                     # never a third time
         self.assertEqual(len({p["grasp"] for p in m_picks}), len(m_picks))         # never the same grip twice
         self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
+        # Operator, 30 Oct: no pushing or aligning until three blocks are on the pallet. The missed first block leaves two;
+        # the push stage waits, the top-up fills the empty first place (the end would be outside the row's lane).
+        self.assertIn(2, [e["blocks"] for e in events if e.get("phase") == "push_waits_for_full_row"])
+        self.assertIn("before_first", [e["where"] for e in events if e.get("phase") == "fill_row_gap"])
+        for i, e in enumerate(events):
+            if e.get("phase") in ("push_together", "push_align"):
+                looks = [x for x in events[:i] if x.get("phase") in ("row_measured", "row_remeasured", "row_alignment_check")]
+                self.assertEqual(looks[-1]["blocks"], 3)
 
     def refused_before_picking(self, spot, reason):
         rc, events = self.run_flow(self.flat_heap(), drop_spot_xy=spot)

@@ -594,6 +594,17 @@ local/layer-stack-data/live/episodes/):
   - Events: `row_alignment_check` (round, offsets, spread, aligned); `push_align` carries its round.
   - Harness: one push aligns (one check); a first push that falls short is repeated (spread over 5 mm, then within);
     pushes that always fall short stop after three rounds and the flow carries on. 188 tests pass. Untested live.
+- Change (operator: don't move to the alignment step until there are three blocks): the push stage (push-together
+  and end alignment) runs only when the look shows the layer's three blocks on the pallet. With fewer
+  (`push_waits_for_full_row`), it returns and the fill loop fetches the missing block first. A look after the
+  closing push or an alignment round that finds fewer also stops aligning until the row is refilled.
+  - Side effect fixed: unpushed, the row keeps the gap of a block that was missed or taken off, and the top-up used
+    to add one pitch after the last block, outside the row's lane (harness: y 357-358, lane to 317.5), where it
+    was not counted.
+  - When the capture shows every placed block (a top-up), the block now goes into a gap between two blocks, else
+    one pitch after the last, else one pitch before the first, whichever lies inside the lane (`fill_row_gap`).
+  - Harness: a missed first block leaves two on the pallet; the push stage waits, the top-up fills the first
+    place, and every push and end push follows a look showing three blocks. 188 tests pass. Untested live.
 
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot
 complete until it is changed; table height and camera offset are unverified; `--grip-lower-mm 3` is a single-run fix,

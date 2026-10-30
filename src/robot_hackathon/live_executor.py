@@ -1703,6 +1703,25 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                     spacing = release_spacing_mm(grasp["style"], calib.finger, slot["block_dimensions_mm"][1], place_spacing_mm)
                     pitch = slot["block_dimensions_mm"][1] + gap_mm + spacing
                     sx, sy = last_pose[0] + pitch * math.cos(across), last_pose[1] + pitch * math.sin(across)
+                    # The row is only pushed once all its blocks are there (operator, 30 Oct), so a refilled row keeps the
+                    # gap where a block was taken off or missed. With the capture showing every block placed so far (a
+                    # top-up), the block goes into a gap between two blocks, else one pitch after the last, else one pitch
+                    # before the first (the first block anchors the closing push), whichever first lies inside the row's
+                    # lane (where pallet blocks are counted).
+                    row_now = row_blocks(ctx, 0)
+                    if slot["layer"] == 0 and row_now and len(row_now) == len([s for s in filled if s.startswith("L0")]):
+                        ux, uy = math.cos(across), math.sin(across)
+                        now = sorted(((g_["base_point_mm"][0] * ux + g_["base_point_mm"][1] * uy, g_["base_point_mm"]) for g_ in row_now),
+                                     key=lambda t: t[0])
+                        options = [("gap", (a[1][0] + pitch * ux, a[1][1] + pitch * uy)) for a, b in zip(now, now[1:]) if b[0] - a[0] >= 2 * pitch - 1.0]
+                        options += [("after_last", (now[-1][1][0] + pitch * ux, now[-1][1][1] + pitch * uy)),
+                                    ("before_first", (now[0][1][0] - pitch * ux, now[0][1][1] - pitch * uy))]
+                        where, xy = next(((w, p) for w, p in options if in_row_lane({"base_point_mm": p}, any_height=True)),
+                                         options[-2])
+                        sx, sy = xy
+                        if where != "after_last":
+                            ep.event("flow", phase="fill_row_gap", slot=slot["slot_id"], where=where, dest_xy=[round(sx, 1), round(sy, 1)],
+                                     row=[[round(v, 1) for v in t[1][:2]] for t in now], pitch_mm=round(pitch, 1))
                 # Already includes grip_lower_mm and the floor relative to the block's resting level (see scene_from_capture).
                 tips = grasp["tips_above_table_mm"]
                 resting = grasp.get("resting_level_mm", 0.0)
@@ -1889,7 +1908,13 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                   f"{', '.join(format(o, '+.1f') for o in plan['offsets_mm']) or '-'} mm; "
                   f"{'push together ' + format(plan['push']['distance_mm'], '.1f') + ' mm' if plan['push'] else 'no push needed'}, "
                   f"{len(plan['ends'])} end push(es)", flush=True)
-            if len(row) < 2 or (plan["push"] is None and not plan["ends"]):
+            if len(row) < target.blocks_per_layer:
+                # Operator, 30 Oct: no pushing or aligning until the layer's blocks are all on the pallet; the fill loop
+                # fetches the missing ones first.
+                ep.event("flow", phase="push_waits_for_full_row", blocks=len(row), needed=target.blocks_per_layer)
+                print(f"Pallet shows {len(row)} of {target.blocks_per_layer} blocks; no pushing or aligning until all are there", flush=True)
+                return pallet_count
+            if plan["push"] is None and not plan["ends"]:
                 return pallet_count
             await bot.gripper.grab()                       # closed while still at home: a solid pusher
             high_z = (await bot.gripper_origin())[2]
@@ -1930,7 +1955,8 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                              end_pushes=[{"index": e["index"], "offset_mm": round(e["offset_mm"], 1), "also_lines_up": e["also_lines_up"]} for e in ends])
                     print(f"Row after the push: {len(row)} block(s), gaps {plan2['gaps_mm']:.1f} mm; ends vs the last block "
                           f"{', '.join(format(o, '+.1f') for o in plan2['offsets_mm']) or '-'} mm; {len(ends)} end push(es)", flush=True)
-                    if len(row) < 2:
+                    if len(row) < target.blocks_per_layer:   # one was pushed out of the row: refill before aligning
+                        ep.event("flow", phase="push_waits_for_full_row", blocks=len(row), needed=target.blocks_per_layer)
                         ends = []
                 else:
                     ep.event("flow", phase="row_remeasure_refused", note="no end pushes without a look after the closing push")
@@ -1975,7 +2001,10 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                          limit_mm=END_ALIGN_CHECK_MM, aligned=aligned)
                 print(f"Alignment check {align_round}: ends within {spread:.1f} mm of each other "
                       f"({'OK' if aligned else 'over ' + format(END_ALIGN_CHECK_MM, '.0f') + ' mm'})", flush=True)
-                if aligned or len(row) < 2:
+                if len(row) < target.blocks_per_layer:          # one left the row: refill before aligning again
+                    ep.event("flow", phase="push_waits_for_full_row", blocks=len(row), needed=target.blocks_per_layer)
+                    break
+                if aligned:
                     break
                 if align_round >= MAX_ALIGN_ROUNDS:
                     ep.event("flow", phase="row_ends_not_aligned", rounds=align_round, end_spread_mm=round(spread, 1),
@@ -2022,7 +2051,7 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 break
             # Fewer blocks on the pallet than placed (a drop, a knock-out): the measured count frees the slots again and
             # another block is fetched, as long as the placement budget allows.
-            print(f"Pallet shows {pallet_count} of {target.blocks_per_layer} after pushing; fetching another block", flush=True)
+            print(f"Pallet shows {pallet_count} of {target.blocks_per_layer}; fetching another block", flush=True)
             ep.event("flow", phase="top_up", fill_round=fill_round, pallet_count=pallet_count, placed=len(placed))
             obs, scene = await scene_from_capture()
             ctx = await context_for(scene, filled)
