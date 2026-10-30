@@ -99,6 +99,37 @@ local/layer-stack-data/live/episodes/):
   updated on each verified placement; the run prints the count at overview, close-up and after verification.
   Tips floor -6 with table z 3.0 means tips commanded ~3 mm below the touch-off table; the claws reached the blocks
   only at this setting, so the real claw-tip offset or table z is off by several mm: measure it. 2 tests added.
+- `live-run` (heap -> packed layer, live_executor.run_flow) given the same knobs so it can build the layer on "1":
+  `--grip-lower-mm` / `--tips-floor-mm` lower the pick tips (release follows, relative), `--keep-out x,y` skips
+  candidates within the footprint clearance of a second tower, `--view` moves to a capture pose first and returns
+  there instead of HOME, `--direct-local` dials the LAN. Untested live as of this note.
+- 17:22 capture (obs_a3e022054049411c): tower "2" measures 74.8 mm = 5 layers; three loose blocks lay in the heap
+  area ((420,67), (371,41), (317,48), angles -49/89/28 deg) and layer-stack rightly refused them as a source layer.
+  New `palletize` command (`run_palletize`): per cycle, run_flow assembles the layer on `--source` (the pallet spot)
+  from the loose blocks with `--tower-origin` as a keep-out, then run_layer_stack moves it onto the tower. Stops when
+  the pallet ends with fewer than three blocks or the stack adds no verified layer; `--cycles N` repeats; `--layers`
+  advances automatically after each verified stack. Untested live as of this note.
+- 17:32 palletize, cycle 1 assembly stage: picked and placed two heap blocks (L0S0 middle grasp at (316,47) 27 deg;
+  L0S1 ends grasp at (419,66) -49 deg) at tips -6, pushed the row tight (gaps 9.4 -> 1.3 -> 0.0 mm) and centred it
+  (offset 18.7 -> 35.3 -> 2.4 mm), final row (441,180)/(437,205). The third heap block ((371,41), standing at 89 deg)
+  had `no_eligible_grasp` in the single start capture because the (419,66) block lay in the claws' sweep; the flow
+  never re-looked after that neighbour was gone, so L0S2 stopped with no_candidate_with_required_grasp and the
+  pallet ended 2 of 3 (correctly refused for stacking). Fixes: run_flow rescans from the view pose when its queue
+  has no candidate for the slot (up to MAX_RESCANS=2 consecutive rescans without a placement); palletize carries an
+  incomplete row into the next run (`pallet_incomplete` state) instead of building over it; state.json of
+  robot-live-8 marked accordingly by hand. The first two pushes show the row push works but over-corrects at
+  first (18.7 mm off -> 35.3 mm the other way), converging on round 3.
+- 17:37 rerun: the pallet had been cleared by hand; the carried row was declared and not seen -> stop. palletize
+  now drops a carried-over row that is not on the pallet (`filled_slots_dropped`) and starts empty.
+- Operator requests (Kris, 10:44): (a) consecutive pallet blocks are released `--place-spacing-mm` (default 10)
+  further apart than one pitch so the release cannot nudge the neighbour; the push rounds measure the real gaps and
+  close them as before. (b) Grip check from the gripper's own report: `Robot.grip_state()` reads
+  `is_holding_something` (+meta), `get_current_inputs` (opening) or `do_command` position queries, whichever the
+  module supports; `grip_failed()` = grab() false, holding false, or opening <= 0.5 mm. On failure the pick
+  movement (hover, align, descend, grab) is repeated up to `--grip-retries` (default 1) times in live-run and in
+  layer-stack. This is a deliberate, operator-requested, bounded exception to the "no automatic motion retry" rule;
+  the gripper report fields the robot's gripper module actually returns are unknown until the first live run (the
+  event `grab` records `gripper.source`).
 
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot
 complete until it is changed; table height and camera offset are unverified; `--grip-lower-mm 3` is a single-run fix,

@@ -138,6 +138,13 @@ class SplitAndPlan(unittest.TestCase):
         self.assertAlmostEqual(lower.pick_tips_above_table_mm, -3.0)   # operator lowered the floor
         self.assertAlmostEqual(lower.release_tips_above_table_mm, 15 + 15 - 18.0 + 1)
 
+    def test_palletize_gates_on_motion_and_cycles(self):
+        with self.assertRaises(ConfigError):
+            asyncio.run(ls.run_palletize(Config.from_env({"MODE": "live"}), Path(tempfile.gettempdir()), "Kris", "ep1", (550, 0), (440, 195), None))
+        config = Config.from_env({"MODE": "live", "ENABLE_MOTION": "true"})
+        with self.assertRaises(ls.LayerCheckError):
+            asyncio.run(ls.run_palletize(config, Path(tempfile.gettempdir()), "Kris", "ep1", (550, 0), (440, 195), None, cycles=0))
+
     def test_tips_floor_is_bounded(self):
         config = Config.from_env({"MODE": "live", "ENABLE_MOTION": "true"})
         with self.assertRaises(ls.LayerCheckError):
@@ -200,6 +207,18 @@ class LiftCheck(unittest.TestCase):
         self.assertEqual(ls.blocks_left_behind(src, layer((448, 201), 6.8)), 0)
         held = [dict(b, height_above_table_mm=110.0) for b in layer((570, 213), 2.5)]   # bundle in the air is not on the table
         self.assertEqual(ls.blocks_left_behind(src, held), 0)
+
+
+class GripReport(unittest.TestCase):
+    def test_empty_grip_detection_from_gripper_report(self):
+        from robot_hackathon.live_executor import grip_failed
+        self.assertTrue(grip_failed({"holding": None, "width": None}, False))            # grab() itself said no
+        self.assertTrue(grip_failed({"holding": False, "width": None}, True))            # is_holding_something false
+        self.assertTrue(grip_failed({"holding": True, "width": 0.0}, True))              # claws fully closed: nothing between them
+        self.assertTrue(grip_failed({"holding": None, "width": 0.4}, True))
+        self.assertFalse(grip_failed({"holding": None, "width": None}, True))            # nothing readable: trust grab()
+        self.assertFalse(grip_failed({"holding": True, "width": 74.0}, True))
+        self.assertFalse(grip_failed({"holding": None, "width": 24.5}, True))
 
 
 class MotionGate(unittest.TestCase):

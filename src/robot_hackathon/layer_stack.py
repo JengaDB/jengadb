@@ -302,7 +302,7 @@ def _blocks(context, width, height):
 
 async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, seg_provider, direct_local=False,
                           apply_offset=False, confirm=input, plan_only=False, view_pose=None, grip_lower_mm=0.0,
-                          source_hint_xy=None, tips_floor_mm=None, expected_layers=None):
+                          source_hint_xy=None, tips_floor_mm=None, expected_layers=None, grip_retries=1):
     """One supervised stack. Returns 0 on a verified success, 1 otherwise. See module docstring.
     plan_only: capture from the current pose, measure both layers and print the plan; no motion command is sent.
     source_hint_xy: operator-supplied world x,y (mm) of the hand-built layer when it lies outside the overview image;
@@ -323,7 +323,7 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
     from . import proposal, rgbd, segmentation
     from . import grasp_geometry as geom
     from .capture import capture_with_camera
-    from .live_executor import PICK_LIFT_MM, TIP_ABOVE_GRIPPER_FRAME_MM, Episode, Robot
+    from .live_executor import PICK_LIFT_MM, TIP_ABOVE_GRIPPER_FRAME_MM, Episode, Robot, grip_failed
     from .pipeline import candidate_id
     from .placement import TowerTarget, footprint_clearance_mm
     # The SDK builds resource clients only for APIs registered (imported) before connecting; see live_executor.run_flow.
@@ -517,21 +517,36 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
         await asyncio.to_thread(confirm, "Press Enter to pick and stack (Ctrl-C to stop) ")
 
         # 3. Pick: centre, align claws across the bundle, recentre (rotation moves the gripper origin), descend, grip.
-        await hover_over(source.center_xy)
-        aligned, align_log = await bot.align_claws(plan.claws_close_at_pick_deg, tolerance_deg=1.5)
-        if not aligned:
-            raise LayerCheckError(f"claws did not align for the pick: errors {align_log}")
-        await hover_over(source.center_xy)
-        travel_z = (await bot.gripper_origin())[2]
-        await move_z_to(plan.pick_tips_above_table_mm, table_z)
+        # The gripper's own report (grab() result, is_holding_something, opening width) is the grip check; an empty
+        # grip repeats the same movement up to grip_retries times (operator request, 30 Oct 2026).
         sx, sy = source.center_xy
-        held = await bot.world_to_frame("gripper", sx, sy, table_z + source.height_above_table_mm)
-        holding = await bot.gripper.grab()
-        ep.event("stack", phase="grab", gripper_reports_holding=bool(holding), bundle_in_gripper_frame=[round(v, 2) for v in held])
-        if not holding:
+        travel_z = (await bot.gripper_origin())[2]
+        attempt = 0
+        while True:
+            attempt += 1
+            await hover_over(source.center_xy)
+            aligned, align_log = await bot.align_claws(plan.claws_close_at_pick_deg, tolerance_deg=1.5)
+            if not aligned:
+                raise LayerCheckError(f"claws did not align for the pick: errors {align_log}")
+            await hover_over(source.center_xy)
+            await move_z_to(plan.pick_tips_above_table_mm, table_z)
+            held = await bot.world_to_frame("gripper", sx, sy, table_z + source.height_above_table_mm)
+            got = await bot.gripper.grab()
+            state = await bot.grip_state()
+            failed = grip_failed(state, got)
+            holding = not failed
+            ep.event("stack", phase="grab", attempt=attempt, gripper_reports_holding=bool(got), gripper=state, failed=failed,
+                     bundle_in_gripper_frame=[round(v, 2) for v in held])
+            print(f"Grab {'ok' if got else 'FALSE'}; gripper reports holding={state['holding']} width={state['width']} ({state['source']}) "
+                  f"-> {'FAILED' if failed else 'held'}", flush=True)
+            if not failed:
+                break
             await bot.gripper.open()
-            await move_z_to(plan.pick_tips_above_table_mm + 30.0, table_z)
-            raise LayerCheckError("gripper reports nothing held; stopped without retry")
+            g = await bot.gripper_origin()
+            await bot.move_delta(dz=travel_z - g[2], near_table=True)
+            if attempt > grip_retries:
+                raise LayerCheckError(f"gripper reports nothing held after {attempt} attempt(s); stopped")
+            print(f"Retrying the pick ({attempt}/{grip_retries} retries used)", flush=True)
         ok, _ = await bot.move_delta(dz=PICK_LIFT_MM, near_table=True)
         if not ok:
             raise LayerCheckError("planner refused the lift; bundle still held")
@@ -626,3 +641,62 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
         raise
     finally:
         await asyncio.wait_for(client.close(), timeout=5)
+
+
+async def run_palletize(config, data_dir, operator, episode_id, tower_origin, pallet_xy, seg_provider, cycles=1, max_blocks=3,
+                        direct_local=False, view_pose=None, grip_lower_mm=0.0, tips_floor_mm=None, expected_layers=None,
+                        confirm=input, apply_offset=False, arm_speed=None, arm_accel=None, place_spacing_mm=None, grip_retries=1):
+    """Full flow, `cycles` times: build a packed three-block layer on the pallet spot from the loose blocks in view
+    (live_executor.run_flow: pick one at a time, place back to back, push the row tight and centre it), then grip that
+    layer as a bundle and stack it on the tower (run_layer_stack). The tower is a keep-out for the picking stage. The
+    stacking stage keeps its Enter hold point unless `confirm` is replaced. Stops at the first stage that does not
+    complete: fewer than three blocks on the pallet, or a stack that did not add a verified layer."""
+    from .live_executor import Episode, run_flow
+    config.require_motion(operator)
+    if cycles < 1:
+        raise LayerCheckError("--cycles must be at least 1")
+    pallet_xy, tower_origin = tuple(pallet_xy), tuple(tower_origin)
+    for cycle in range(1, cycles + 1):
+        ep = Episode(data_dir, episode_id, operator)
+        # A row left incomplete by the previous palletize run is continued, not built over; run_flow verifies that the
+        # declared slots are actually occupied and stops otherwise, after which the next run starts from an empty pallet.
+        carry = [s for s in ep.state.get("filled", []) if s.startswith("L0")] if ep.state.get("pallet_incomplete") else []
+        ep.state.pop("filled", None)
+        ep.state["pallet_incomplete"] = False
+        ep.save()
+        ep.event("palletize", phase="assemble_start", cycle=cycle, cycles=cycles, pallet_xy=list(pallet_xy), tower_origin=list(tower_origin),
+                 continuing_row=carry)
+        print(f"\n=== Cycle {cycle}/{cycles}: assemble a layer on the pallet at ({pallet_xy[0]:.0f}, {pallet_xy[1]:.0f}) from the loose blocks"
+              + (f", continuing the row {carry}" if carry else "") + " ===", flush=True)
+        rc = await run_flow(config, data_dir, operator, episode_id, pallet_xy, carry, 0.0, max_blocks, seg_provider,
+                            arm_speed=arm_speed, arm_accel=arm_accel, grip_lower_mm=grip_lower_mm, tips_floor_mm=tips_floor_mm,
+                            keep_out_xy=tower_origin, view_pose=view_pose, direct_local=direct_local, drop_unseen_filled=True,
+                            grip_retries=grip_retries, **({"place_spacing_mm": place_spacing_mm} if place_spacing_mm is not None else {}))
+        ep = Episode(data_dir, episode_id, operator)
+        filled = [s for s in ep.state.get("filled", []) if s.startswith("L0")]
+        if rc != 0 or len(filled) < BLOCKS_PER_LAYER:
+            ep.state["pallet_incomplete"] = bool(filled)
+            ep.save()
+            ep.event("palletize", phase="stop", cycle=cycle, reason="pallet_incomplete", filled=filled, flow_rc=rc)
+            print(f"\nSTOPPED: the pallet has {len(filled)} of {BLOCKS_PER_LAYER} blocks after the assembly stage; nothing stacked. "
+                  + ("Add loose blocks in view and rerun; the row is continued from these slots." if filled else
+                     "Check the loose blocks (lying flat, clear of each other, in view) and rerun."))
+            return 1
+        before = Episode(data_dir, episode_id, operator).state.get("layers_stacked", 0)
+        print(f"\n=== Cycle {cycle}/{cycles}: stack the pallet onto the tower at ({tower_origin[0]:.0f}, {tower_origin[1]:.0f}) ===", flush=True)
+        rc = await run_layer_stack(config, data_dir, operator, episode_id, tower_origin, seg_provider, direct_local=direct_local,
+                                   apply_offset=apply_offset, confirm=confirm, view_pose=view_pose, grip_lower_mm=grip_lower_mm,
+                                   source_hint_xy=pallet_xy, tips_floor_mm=tips_floor_mm, expected_layers=expected_layers,
+                                   grip_retries=grip_retries)
+        state = Episode(data_dir, episode_id, operator).state
+        if state.get("layers_stacked", 0) <= before:
+            ep.event("palletize", phase="stop", cycle=cycle, reason="stack_not_verified", stack_rc=rc)
+            print("\nSTOPPED: the stacking stage did not add a verified layer; see the reason above.")
+            return 1
+        if expected_layers is not None:
+            expected_layers = state.get("tower_layers", expected_layers + 1)
+        ep.event("palletize", phase="cycle_done", cycle=cycle, tower_layers=state.get("tower_layers"), stack_rc=rc,
+                 within_tolerance=(rc == 0))
+        print(f"=== Cycle {cycle}/{cycles} done: tower has {state.get('tower_layers')} layers"
+              + ("" if rc == 0 else " (last layer outside the 3 mm / 3 deg tolerance; stacked nonetheless)") + " ===", flush=True)
+    return 0
