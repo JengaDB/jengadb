@@ -46,5 +46,14 @@
     "owner": "Kazy",
     "evidence": "73 offline tests pass including cache reuse and existing sync retry; pipeline-owner review and live validation pending.",
     "updated_at": "2026-10-29T23:27:30.587221+00:00"
+  },
+  {
+    "id": "POLICY-01",
+    "role": "vision",
+    "title": "Replay pick policy on saved observations",
+    "status": "in_progress",
+    "card": "tasks/POLICY-01.md",
+    "owner": "Kazy",
+    "evidence": "92 tests pass; real saved-scene Atlas comparisons and deterministic offline replay verified; geometry unavailable so policy abstains."
   }
 ]
