@@ -466,6 +466,20 @@ class RunFlowHarness(unittest.TestCase):
         self.assertAlmostEqual(length, push[0]["distance_mm"], delta=0.5)
         self.assertIn("after_push_out_1", [e.get("label") for e in events if e.get("phase") == "scene"])
 
+    def test_blocks_out_of_reach_are_neither_swept_nor_picked(self):
+        # Run 12 (21:10): a detection beyond the table was swept at; the stroke was out of reach (no IK solution) and the
+        # run stopped. A block lying on another 591 mm from the base stands above the sweep height but is out of reach.
+        world = World([("A", 430.0, 60.0, 30.0, 0), ("C", 470.0, 250.0, -40.0, 0), ("K", 360.0, 40.0, 30.0, 0),
+                       ("LOW", 520.0, 280.0, 0.0, 0), ("TOP", 520.0, 280.0, 90.0, 1)])
+        rc, events = self.run_flow(world, flatten_sweeps=2)
+        out = [e for e in events if e.get("phase") == "out_of_work_area"]
+        self.assertTrue(out and all(math.hypot(*xy) > 580.0 for xy in out[0]["xy"]))
+        self.assertFalse(any(e.get("phase") == "flatten_sweep" for e in events))
+        self.assertEqual([e["reason"] for e in events if e.get("phase") == "flatten_done"], ["nothing_above_sweep_height"])
+        self.assertFalse(any(math.dist(e["pick_xy"], (520.0, 280.0)) < 20 for e in events if e.get("phase") == "plan_block"))
+        self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
+        self.assertEqual([b[1:3] for b in world.blocks if b[0] in ("LOW", "TOP")], [[520.0, 280.0], [520.0, 280.0]])   # untouched
+
     def test_no_flatten_sweeps_on_a_flat_heap(self):
         rc, events = self.run_flow(self.flat_heap(), flatten_sweeps=3)
         self.assertFalse(any(e.get("phase") == "flatten_sweep" for e in events))

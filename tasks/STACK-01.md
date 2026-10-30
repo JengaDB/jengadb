@@ -556,6 +556,34 @@ local/layer-stack-data/live/episodes/):
     a harness run: two empty looks, then one edge-on 70 mm stroke into the middle block. The simulator pushes with a
     45 mm face, so the result on the blocks is unproven. 183 tests pass. Untested live.
 
+- 30 Oct 21:09-21:11 UTC, twelfth cycle (@4c39c3d, `--flatten-sweeps 3 --push-outs 2 --x-sweeps 2 --no-pause
+  --cycles 2`): stopped during the third flatten sweep.
+  - The speed bands were set ([100, 60], [40, 20]).
+  - Flatten sweeps 1 and 2 ran: blocks taller than 18 mm went 5, 4, 4; eligible picks went 3, 2, 5.
+  - Sweep 3 aimed at a detection at (453, 546), 32 px from the photo's left edge, beyond the table on the floor
+    area. It was not in the start capture, so something entered the frame. Its stroke would have started 659 mm
+    and ended 766 mm from the robot base.
+  - The planner returned "zero IK solutions ... physically unreachable" (GRPCError) and palletize stopped, no
+    retry. The error came at planning, before motion.
+  - Cause: `flatten_sweep_plan` targets any detection taller than 18 mm outside the pallet, tower and drop spot. It
+    checks neither that the target looks like a block nor that it lies on the table within reach. Every detection
+    is `workspace_unchecked`: this setup's calibration defines no work area.
+  - Furthest point reached so far: 572 mm from the base (run 9 push start at (428.9, 379.0)).
+  - Next: flatten targets must be plausible blocks inside the photo's table area away from its edges, and every
+    sweep, push and X stroke must start and end within reach.
+- Change (operator: yes, fix it): a work area.
+  - `within_reach`: 220-580 mm from the robot base. Today's working points were 234-572 mm; run 12's refused start
+    was 659 mm.
+  - Every stroke planner refuses a plan whose start or carried end (knock landing, push-out far end) is outside it:
+    `knock_plan`, `flatten_sweep_plan`, `cross_sweep_plan`, `push_out_plan` (`allowed=within_reach`).
+  - In the flow, `in_work_area` (within reach and 40 mm inside the table area the latest photo saw) filters pick
+    candidates (event `out_of_work_area`), knock-over targets, flatten targets, and the heap the X sweep and
+    push-outs work on.
+  - Flatten targets must also look like a block: standing or on its edge, or with no implausible length or width.
+  - Tests: today's closest and furthest points pass and run 12's start does not; run 12's target gets no flatten
+    or knock plan; a row out there gets no push-out; harness: a block lying on another 591 mm out is neither swept
+    nor picked and the pallet fills from the rest. 185 tests pass. Untested live.
+
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot
 complete until it is changed; table height and camera offset are unverified; `--grip-lower-mm 3` is a single-run fix,
 not a calibration; source and base must be reachable (x <= ~600 mm worked) and both visible from the view pose.

@@ -58,6 +58,11 @@ XSWEEP_ARM_MM = 70.0              # an X-sweep stroke runs from at least this fa
 XSWEEP_MAX_BACK_MM = 100.0        # its claws come down on bare table at most this much further out than the arm
 XSWEEP_BOUNDS_MARGIN_MM = 10.0    # stroke start and carried blocks stay this far inside the table area the photo saw
 XSWEEP_TURNS_DEG = (0.0, 15.0, -15.0, 30.0, -30.0, 45.0)   # X orientations tried, from 45 deg to the blocks' long side
+REACH_MIN_MM = 220.0              # targets and stroke ends lie this far or more from the robot base (world origin)...
+REACH_MAX_MM = 580.0              # ...and this far or less (30 Oct: 234-572 mm worked at table height; run 12's sweep
+                                  # start 659 mm out had no IK solution and stopped the run)
+TARGET_EDGE_MARGIN_MM = 40.0      # a target lies this far inside the table area the photo saw (run 12: a detection 32 px
+                                  # from the photo's edge, beyond the table, was taken for a block to sweep)
 ROW_PITCH_RANGE_MM = (21.0, 30.0) # flat blocks this far apart (centre to centre, across) lie side by side...
 ROW_PARALLEL_DEG = 6.0            # ...when parallel within this...
 ROW_END_OFFSET_MM = 15.0          # ...and their ends are within this of each other ("perfectly adjacent", operator 30 Oct)
@@ -108,6 +113,11 @@ def release_spacing_mm(grasp_style, finger, block_width_mm, base_spacing_mm):
     return max(base_spacing_mm, sweep)
 
 
+def within_reach(xy):
+    """Inside the band of distances from the robot base where the arm has worked at table height."""
+    return REACH_MIN_MM <= math.hypot(xy[0], xy[1]) <= REACH_MAX_MM
+
+
 def _rects_overlap(a, b):
     """Oriented rectangles (cx, cy, angle_deg, half_length, half_width) overlap, by the separating axis test."""
     def corners(r):
@@ -129,7 +139,7 @@ def block_footprint(xy, long_deg, size, margin=0.0):
     return (xy[0], xy[1], long_deg, size[0] / 2 + margin, size[1] / 2 + margin)
 
 
-def knock_plan(block_xy, top_long_deg, obstacles, avoid, dims, forbidden=None, upright="standing"):
+def knock_plan(block_xy, top_long_deg, obstacles, avoid, dims, forbidden=None, upright="standing", allowed=within_reach):
     """Sweep that tips an upright block onto clear table (operator requests, 30 Oct: knock a standing block over;
     sweep rather than drop a block on its edge; come down further from it and do not hit other blocks).
     upright "standing" (on its end, end face 25 x 15): across the thin 15 mm side it tips onto its wide face, so those
@@ -174,6 +184,8 @@ def knock_plan(block_xy, top_long_deg, obstacles, avoid, dims, forbidden=None, u
                 continue
             if forbidden is not None and forbidden(landing):
                 continue
+            if allowed is not None and not (allowed(start) and allowed(landing)):   # within the arm's reach
+                continue
             room = min([math.dist(landing, o["xy"]) for o in obstacles] + [math.dist(landing, c) - r for c, r in avoid] or [float("inf")])
             plan = {"u_deg": u_deg % 360.0, "start_xy": start, "distance_mm": distance, "landing_xy": landing, "onto": onto,
                     "room_mm": room, "tips_mm": tips}
@@ -184,7 +196,7 @@ def knock_plan(block_xy, top_long_deg, obstacles, avoid, dims, forbidden=None, u
     return None
 
 
-def flatten_sweep_plan(rng, targets, obstacles, avoid, dims, forbidden=None, tries=FLATTEN_TRIES):
+def flatten_sweep_plan(rng, targets, obstacles, avoid, dims, forbidden=None, tries=FLATTEN_TRIES, allowed=within_reach):
     """One random sweep through the heap to knock blocks flat (operator request, 30 Oct: after going home, sweep a few
     times at random so the heap is flatter). Each draw takes a random block centre from `targets` and a random
     direction. The closed claws come down on bare table behind it: the nearest spot, 10 to FLATTEN_MAX_BACK_MM back,
@@ -216,12 +228,14 @@ def flatten_sweep_plan(rng, targets, obstacles, avoid, dims, forbidden=None, tri
         if forbidden is not None and any(forbidden((start[0] + (reach[0] - start[0]) * k / 20, start[1] + (reach[1] - start[1]) * k / 20))
                                          for k in range(21)):
             continue
+        if allowed is not None and not (allowed(start) and allowed(reach)):   # claws and carried blocks within reach
+            continue
         return {"target_xy": tuple(t), "u_deg": u_deg, "start_xy": start, "end_xy": end, "distance_mm": back + FLATTEN_PAST_MM,
                 "tips_mm": tips}
     return None
 
 
-def cross_sweep_plan(heap, obstacles, line_deg, avoid, forbidden=None, bounds=None):
+def cross_sweep_plan(heap, obstacles, line_deg, avoid, forbidden=None, bounds=None, allowed=within_reach):
     """One stroke of the X sweep of a packed heap's bottom layer (operator request, 30 Oct: if two looks find nothing to
     pick, sweep the bottom layer in an X). heap: the loose blocks as {"xy", "long_deg", "size", "top"}; the stroke runs
     along line_deg (either way) through their mean centre with the claw tips PUSH_TIPS_MM above the table, so it pushes
@@ -266,6 +280,8 @@ def cross_sweep_plan(heap, obstacles, line_deg, avoid, forbidden=None, bounds=No
             continue
         if not (inside(start) and inside(reach)):
             continue
+        if allowed is not None and not (allowed(start) and allowed(reach)):
+            continue
         room = min([math.dist(reach, c) - r for c, r in avoid] or [float("inf")])
         plan = {"u_deg": u_deg % 360.0, "start_xy": start, "end_xy": end, "centre_xy": (cx, cy),
                 "distance_mm": math.dist(start, end), "tips_mm": PUSH_TIPS_MM, "room_mm": room}
@@ -274,12 +290,12 @@ def cross_sweep_plan(heap, obstacles, line_deg, avoid, forbidden=None, bounds=No
     return best
 
 
-def x_sweep_line(heap, obstacles, base_deg, avoid, forbidden=None, bounds=None):
+def x_sweep_line(heap, obstacles, base_deg, avoid, forbidden=None, bounds=None, allowed=within_reach):
     """The X's first line (the second is 90 deg to it): of base_deg turned by each of XSWEEP_TURNS_DEG, the first with
     the most strokes cross_sweep_plan finds clear now. Returns (line_deg, strokes_clear)."""
     best = (base_deg, 0)
     for turn in XSWEEP_TURNS_DEG:
-        n = sum(1 for k in (0, 1) if cross_sweep_plan(heap, obstacles, base_deg + turn + 90.0 * k, avoid, forbidden, bounds))
+        n = sum(1 for k in (0, 1) if cross_sweep_plan(heap, obstacles, base_deg + turn + 90.0 * k, avoid, forbidden, bounds, allowed))
         if n > best[1]:
             best = (base_deg + turn, n)
         if n == 2:
@@ -333,7 +349,7 @@ def side_by_side_rows(blocks, block_height_mm=15.0):
     return rows
 
 
-def push_out_plan(row, obstacles, avoid, dims, forbidden=None, bounds=None):
+def push_out_plan(row, obstacles, avoid, dims, forbidden=None, bounds=None, allowed=within_reach):
     """Pushes that slide the middle blocks of a side-by-side row out along their length (operator, 30 Oct: "sweep them so
     that the gripper moves into the ends of the middle ones"). row: the row's blocks in order across, as
     {"xy", "long_deg", "size", "top"}; obstacles: every block, the row's included. For each middle block, sides
@@ -367,6 +383,8 @@ def push_out_plan(row, obstacles, avoid, dims, forbidden=None, bounds=None):
             if any(point_segment_distance(c, moved, far) < r for c, r in avoid):
                 continue
             if forbidden is not None and (forbidden(moved) or forbidden(far)):
+                continue
+            if allowed is not None and not (allowed(start) and allowed(far)):
                 continue
             if bounds is not None:
                 (x0, x1), (y0, y1) = bounds
@@ -970,6 +988,18 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
             return (abs(dx * math.cos(a) + dy * math.sin(a)) <= ROW_LANE_HALF_WIDTH_MM
                     and abs(-dx * math.sin(a) + dy * math.cos(a)) <= lane_half_len)
 
+        def in_work_area(xy):
+            """Somewhere the arm may act on: within reach of its base and TARGET_EDGE_MARGIN_MM inside the table area the
+            latest photo saw (run 12: a detection beyond the table, at the photo's edge, was swept at and was out of reach)."""
+            if not within_reach(xy):
+                return False
+            from .layer_stack import visible_table_extent
+            seen = visible_table_extent(obs, table_z) if obs is not None else None
+            if not seen:
+                return True
+            m = TARGET_EDGE_MARGIN_MM
+            return seen["x_mm"][0] + m <= xy[0] <= seen["x_mm"][1] - m and seen["y_mm"][0] + m <= xy[1] <= seen["y_mm"][1] - m
+
         if drop_spot_xy is not None:
             a = math.radians(target.layer0_long_side_deg)
             dx, dy = drop_spot_xy[0] - tower_origin[0], drop_spot_xy[1] - tower_origin[1]
@@ -997,6 +1027,11 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                             and math.hypot(c["geometry"]["base_point_mm"][0] - keep_out_xy[0], c["geometry"]["base_point_mm"][1] - keep_out_xy[1]) < radius]
                 q = [c for c in q if c not in kept_out]
                 ep.event("flow", phase="keep_out", centre=list(keep_out_xy), radius_mm=round(radius, 1), excluded=[c["candidate_id"] for c in kept_out])
+            outside = [c for c in q if c["geometry"].get("base_point_mm") and not in_work_area(c["geometry"]["base_point_mm"][:2])]
+            if outside:
+                q = [c for c in q if c not in outside]
+                ep.event("flow", phase="out_of_work_area", label=label, excluded=[c["candidate_id"] for c in outside],
+                         xy=[[round(v, 1) for v in c["geometry"]["base_point_mm"][:2]] for c in outside])
             # Missed picks (operator, 30 Oct): after one miss that grip style is ruled out for the block, so it is tried
             # another way (across instead of along); after MAX_MISSES_PER_BLOCK misses, or with no other grip, it is skipped.
             for c in list(q):
@@ -1269,6 +1304,8 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                     continue
                 if keep_out_xy is not None and math.dist(p[:2], keep_out_xy) < footprint_clearance_mm(target):
                     continue
+                if not in_work_area(p[:2]):
+                    continue
                 if geom.upright_kind(g, calib.block):
                     return c
             return None
@@ -1321,11 +1358,17 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
             avoid = [(tuple(tower_origin), clear)] + ([(tuple(keep_out_xy), clear)] if keep_out_xy is not None else []) \
                 + ([(tuple(drop_spot_xy), DROP_CLEAR_MM)] if drop_spot_xy is not None else [])
 
+            def looks_like_block(c):
+                """Standing or on its edge, or measured with a block's length and width (run 12: a detection beyond the
+                table was taken for one)."""
+                return bool(geom.upright_kind(c["geometry"], calib.block)) or not any(r.startswith("implausible_") for r in c["rejection_reasons"])
+
             def taller_heap_blocks():
                 blocks = [c["geometry"] for c in ctx["candidates"] if c["geometry"].get("base_point_mm")]
-                tall = [tuple(g["base_point_mm"][:2]) for g in blocks
-                        if (g.get("height_above_table_mm") or 0.0) > tips and not in_row_lane(g, any_height=True)
-                        and all(math.dist(g["base_point_mm"][:2], c) >= r for c, r in avoid)]
+                tall = [tuple(c["geometry"]["base_point_mm"][:2]) for c in ctx["candidates"] if c["geometry"].get("base_point_mm")
+                        and (c["geometry"].get("height_above_table_mm") or 0.0) > tips and not in_row_lane(c["geometry"], any_height=True)
+                        and all(math.dist(c["geometry"]["base_point_mm"][:2], o) >= r for o, r in avoid)
+                        and in_work_area(c["geometry"]["base_point_mm"][:2]) and looks_like_block(c)]
                 return blocks, tall
 
             for i in range(1, sweeps + 1):
@@ -1376,6 +1419,7 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
             from .layer_stack import visible_table_extent
             geos = [c["geometry"] for c in ctx["candidates"] if c["geometry"].get("base_point_mm") and c["geometry"].get("base_long_side_deg") is not None]
             heap = [g for g in geos if not in_row_lane(g, any_height=True) and not geom.upright_kind(g, calib.block)
+                    and in_work_area(g["base_point_mm"][:2])
                     and all(math.dist(g["base_point_mm"][:2], c) >= r for c, r in avoid)]
             heap_obs = [block_obstacle(g) for g in heap]
             other_obs = [block_obstacle(g) for g in geos if not any(g is h for h in heap)]
@@ -1445,7 +1489,7 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
             strokes = 0
             for k in range(2):
                 blocks = [c["geometry"] for c in ctx["candidates"] if c["geometry"].get("base_point_mm")]
-                heap = [block_obstacle(g) for g in blocks if not in_row_lane(g, any_height=True)
+                heap = [block_obstacle(g) for g in blocks if not in_row_lane(g, any_height=True) and in_work_area(g["base_point_mm"][:2])
                         and all(math.dist(g["base_point_mm"][:2], c) >= r for c, r in avoid)]
                 obstacles = [block_obstacle(g) for g in blocks]
                 seen = visible_table_extent(obs, table_z)

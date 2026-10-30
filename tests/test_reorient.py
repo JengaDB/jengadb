@@ -346,6 +346,22 @@ class FlattenSweepPlan(unittest.TestCase):
         # never into the pallet's clearance
         self.assertEqual(push_out_plan(three, three, [(three[1]["xy"], 150.0)], self.dims), [])
 
+    def test_nothing_is_planned_out_of_reach(self):
+        # run 12 (21:10): a detection beyond the table at (453, 546) was swept at; the stroke's start, 659 mm from the base,
+        # had no IK solution and stopped the run
+        import random
+        from robot_hackathon.live_executor import flatten_sweep_plan, knock_plan, push_out_plan, within_reach
+        self.assertTrue(within_reach((428.9, 379.0)))         # furthest point that worked (run 9 push start, 572 mm)
+        self.assertTrue(within_reach((231.3, -38.5)))         # closest (run 10 sweep end, 234 mm)
+        self.assertFalse(within_reach((404.6, 520.8)))        # run 12's refused sweep start
+        far = {"xy": (453.3, 546.4), "long_deg": 0.0, "size": (75.0, 25.0), "top": 30.0}
+        self.assertIsNone(flatten_sweep_plan(random.Random(1), [far["xy"]], [far], [], self.dims))
+        self.assertIsNone(knock_plan(far["xy"], 0.0, [], [], self.dims, upright="on_edge"))
+        out_there = self.row(3, centre=(453.3, 500.0))
+        self.assertEqual(push_out_plan(out_there, out_there, [], self.dims), [])
+        near = dict(far, xy=(330.0, 60.0))                     # the same block within reach is swept
+        self.assertIsNotNone(flatten_sweep_plan(random.Random(1), [near["xy"]], [near], [], self.dims))
+
     def test_x_sweep_refuses_when_no_way_is_clear(self):
         from robot_hackathon.live_executor import cross_sweep_plan
         heap = [{"xy": (330.0, 0.0), "long_deg": 0.0, "size": (75.0, 25.0), "top": 14.0}]
