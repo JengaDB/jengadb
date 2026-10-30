@@ -153,6 +153,25 @@ def knock_plan(block_xy, top_long_deg, obstacles, avoid, dims, forbidden=None, u
     return None
 
 
+MISS_MATCH_MM = 15.0              # a block this close to an earlier pick's spot, at the same height and direction, was not picked
+MISS_MATCH_HEIGHT_MM = 6.0
+MISS_MATCH_DEG = 15.0
+MAX_MISSES_PER_BLOCK = 2          # after this many missed picks of one block it is skipped (operator, 30 Oct)
+
+
+def missed_attempts(geometry, attempts, observation_id):
+    """Earlier pick attempts that missed this block: made before this capture, at the same place, height and
+    direction. The gripper's own report cannot tell (30 Oct 20:15-20:17: four ends grips reported holding at widths
+    675-776 and none moved its block), so a block still lying where it was picked from means the pick missed. A block
+    that was under the picked one differs in height and does not match."""
+    p, h, a = geometry.get("base_point_mm"), geometry.get("height_above_table_mm"), geometry.get("base_long_side_deg")
+    if not p:
+        return []
+    return [t for t in attempts if t["observation_id"] != observation_id and math.dist(p[:2], t["xy"]) <= MISS_MATCH_MM
+            and (h is None or t["top"] is None or abs(h - t["top"]) <= MISS_MATCH_HEIGHT_MM)
+            and (a is None or t["long_deg"] is None or abs(wrap_90(a - t["long_deg"])) <= MISS_MATCH_DEG)]
+
+
 def point_segment_distance(p, a, b):
     """Distance from point p to the segment a-b in the table plane (mm)."""
     dx, dy = b[0] - a[0], b[1] - a[1]
@@ -615,6 +634,8 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                       "choose a spot off the row's axis. Nothing moved.", flush=True)
                 return 1
 
+        pick_attempts = []   # every heap pick that reported a grip: where, how high, which way, which grip, from which capture
+
         def build_queue(context, observation, scene_, label):
             """Ranked pickable candidates from a context, minus anything inside the keep-out circle. A heap is taken
             from the top: blocks resting on others come before blocks on the table (stable within a level)."""
@@ -627,6 +648,24 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                             and math.hypot(c["geometry"]["base_point_mm"][0] - keep_out_xy[0], c["geometry"]["base_point_mm"][1] - keep_out_xy[1]) < radius]
                 q = [c for c in q if c not in kept_out]
                 ep.event("flow", phase="keep_out", centre=list(keep_out_xy), radius_mm=round(radius, 1), excluded=[c["candidate_id"] for c in kept_out])
+            # Missed picks (operator, 30 Oct): after one miss that grip style is ruled out for the block, so it is tried
+            # another way (across instead of along); after MAX_MISSES_PER_BLOCK misses, or with no other grip, it is skipped.
+            for c in list(q):
+                missed = missed_attempts(c["geometry"], pick_attempts, observation["observation_id"])
+                if not missed:
+                    continue
+                styles = sorted({t["style"] for t in missed})
+                for g in c["grasps"]:
+                    if g["style"] in styles and g["eligible"]:
+                        g["eligible"] = False
+                        g["reasons"].append("missed_before")
+                skip = len(missed) >= MAX_MISSES_PER_BLOCK or not any(g["eligible"] for g in c["grasps"])
+                if skip:
+                    q.remove(c)
+                ep.event("flow", phase="pick_missed", label=label, candidate=c["candidate_id"], missed_styles=styles, misses=len(missed),
+                         action="skip_block" if skip else "other_grip")
+                print(f"Pick missed before at ({c['geometry']['base_point_mm'][0]:.0f}, {c['geometry']['base_point_mm'][1]:.0f}) "
+                      f"with {'/'.join(styles)} grip: " + ("skipping this block" if skip else "trying another grip"), flush=True)
             in_lane = [c for c in q if in_row_lane(c["geometry"])]
             if in_lane:
                 q = [c for c in q if c not in in_lane]
@@ -1012,6 +1051,8 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 stop_reason, held, travel_z, attempt, aligned = await grab_block(pick, grasp, tips, slot["slot_id"])
                 if stop_reason:
                     flow_stopped = True; ep.event("flow", phase="stop", reason=stop_reason, candidate=pick["candidate_id"], attempts=attempt); break
+                pick_attempts.append({"xy": (bx, by), "top": geo.get("height_above_table_mm"), "long_deg": geo.get("base_long_side_deg"),
+                                      "style": grasp["style"], "observation_id": obs["observation_id"], "candidate": pick["candidate_id"]})
                 ok, _ = await bot.move_delta(dz=PICK_LIFT_MM, near_table=True)
                 if reorient:
                     if await drop_and_check(pick, reorient, tips, resting, travel_z, slot["slot_id"]):

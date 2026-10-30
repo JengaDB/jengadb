@@ -276,6 +276,22 @@ class PalletPushPlan(unittest.TestCase):
         self.assertAlmostEqual(plan["ends"][0]["start_xy"][1], 195.0)                # block 1 now 25 mm from the first
         self.assertEqual(self.plan([(440, 170)])["ends"], [])
 
+class MissedPicks(unittest.TestCase):
+    def test_a_block_still_where_it_was_picked_from_was_missed(self):
+        from robot_hackathon.live_executor import missed_attempts
+        # 30 Oct 20:15:33: ends pick at (315.7, 0.3), top 27.6; the next capture still had a block at (315.8, -1.6), 28.9
+        attempts = [{"xy": (315.7, 0.3), "top": 27.6, "long_deg": 84.0, "style": "ends", "observation_id": "obs_1"}]
+        same = {"base_point_mm": (315.8, -1.6, 30.0), "height_above_table_mm": 28.9, "base_long_side_deg": 86.0}
+        self.assertEqual(len(missed_attempts(same, attempts, "obs_2")), 1)
+        self.assertEqual(missed_attempts(same, attempts, "obs_1"), [])            # the capture the pick came from
+        under = dict(same, height_above_table_mm=14.0)                           # the block it was lying on
+        self.assertEqual(missed_attempts(under, attempts, "obs_2"), [])
+        turned = dict(same, base_long_side_deg=40.0)                             # moved: a different block now
+        self.assertEqual(missed_attempts(turned, attempts, "obs_2"), [])
+        away = dict(same, base_point_mm=(340.0, 20.0, 30.0))
+        self.assertEqual(missed_attempts(away, attempts, "obs_2"), [])
+
+
 class GripReport(unittest.TestCase):
     def test_empty_grip_detection_from_gripper_report(self):
         from robot_hackathon.live_executor import grip_failed

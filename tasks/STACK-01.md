@@ -343,6 +343,19 @@ local/layer-stack-data/live/episodes/):
   safe grip -> stop for the operator); end alignment starts ALIGN_START_GAP_MM 10 past the block's end (was 5) and
   pushes 5 mm further, so ends still stop level. Untested live.
 
+- 30 Oct 20:15-20:17 UTC, sixth cycle (@e9b4f72), stopped (`reorient_failed`) with 1 block on the pallet. Every ends
+  grip missed (operator: the claws missed the block) while the gripper reported holding (widths 710, 734, 675, 776);
+  both middle/side grips (220) delivered. The flow picked the same flat-topped block with the same ends grip twice,
+  fixed another block, then went back and missed it the same way again. Sweeps refused twice (no clear sweep in the
+  packed heap). Push stage and pallet check not reached. For the first missed block the top-band centre was 4.6 mm
+  from its mask's bbox centre (the ends grip has ~14.5 mm per side), so the aim point is not explained yet.
+- Change (operator: after one failed end pickup try a different pickup direction, then a different block):
+  `missed_attempts` treats a block still lying where it was picked from (within 15 mm, 6 mm in height, 15 deg) in a
+  later capture as a missed pick, since the gripper report cannot tell. One miss rules out that grip style for the
+  block (tried across instead of along, or vice versa); MAX_MISSES_PER_BLOCK 2 misses, or no other grip, skips the
+  block (`pick_missed` event). Tests: today's numbers, and a harness run where a block missed by any grip across it
+  is tried a second way, then skipped, and the pallet is filled from other blocks. Untested live.
+
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot
 complete until it is changed; table height and camera offset are unverified; `--grip-lower-mm 3` is a single-run fix,
 not a calibration; source and base must be reachable (x <= ~600 mm worked) and both visible from the view pose.

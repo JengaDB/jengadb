@@ -391,6 +391,44 @@ class RunFlowHarness(unittest.TestCase):
         self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
         self.assertEqual([b[1:3] for b in world.blocks if b[0] == "TALL"], [[250.0, 232.0]])   # never touched
 
+    def test_missed_pick_tries_another_grip_then_another_block(self):
+        # Operator, 30 Oct: the claws missed a block the same way twice. Block M is missed by any grip across it, and
+        # the gripper still reports holding (as it did live, widths 675-776); it is tried once more another way, then
+        # left for the other blocks.
+        world = World([("M", 330.0, 170.0, 10.0, 0), ("A", 430.0, 60.0, 30.0, 0), ("C", 470.0, 250.0, -40.0, 0),
+                       ("K", 420.0, 330.0, -20.0, 0), ("F", 360.0, 40.0, 30.0, 0)])
+        world.phantom = False
+        orig_grab, orig_open = FakeGripper.grab, FakeGripper.open
+
+        async def grab(gripper):
+            ok = await orig_grab(gripper)
+            w = gripper.w
+            if w.held is not None and w.held[0][0] == "M" and abs(((w.claws - w.held[0][3]) + 90.0) % 180.0 - 90.0) > 45.0:
+                w.held, w.phantom = None, True                                    # closed beside it: nothing lifted
+            return ok
+
+        async def open_(gripper):
+            gripper.w.phantom = False
+            return await orig_open(gripper)
+        robot_cls = make_robot_class(world)
+        orig_state = robot_cls.grip_state
+
+        async def grip_state(robot):
+            state = await orig_state(robot)
+            return dict(state, holding=True, width=730.0) if world.phantom else state
+        robot_cls.grip_state = grip_state
+        with mock.patch.object(FakeGripper, "grab", grab), mock.patch.object(FakeGripper, "open", open_), \
+                mock.patch(__name__ + ".make_robot_class", lambda w: robot_cls):
+            rc, events = self.run_flow(world)
+        missed = [e for e in events if e.get("phase") == "pick_missed"]
+        self.assertTrue(missed)
+        self.assertEqual(missed[0]["action"], "other_grip")
+        self.assertIn(missed[-1]["action"], ("other_grip", "skip_block"))
+        m_picks = [e for e in events if e.get("phase") == "plan_block" and math.dist(e["pick_xy"], (330.0, 170.0)) < 10]
+        self.assertLessEqual(len(m_picks), 2)                                     # never a third time
+        self.assertEqual(len({p["grasp"] for p in m_picks}), len(m_picks))         # never the same grip twice
+        self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
+
     def refused_before_picking(self, spot, reason):
         rc, events = self.run_flow(self.flat_heap(), drop_spot_xy=spot)
         self.assertEqual(rc, 1)
