@@ -261,6 +261,11 @@ def sync(data_dir, mode, remote, source_alias="laptop", observation_ids=None):
                     sha = art["sha256"]
                     line = {"observation_id": obs_id, "kind": art["kind"], "sha256": sha, "local_status": local[art["kind"]]}
                     if sha in acks.data["media"]:
+                        # Media bytes may have been acknowledged before metadata
+                        # succeeded, or reused by another observation. Reconcile
+                        # each association even when no upload is necessary.
+                        remote.set_artifact_sync(sha, obs_id, "synced", acks.data["media"][sha], art["bytes"],
+                                                 {"source_alias": source_alias, "status": local[art["kind"]]})
                         line["remote_status"] = "synced"
                         if local[art["kind"]] != "present":
                             line["note"] = "local copy missing, remote verified"

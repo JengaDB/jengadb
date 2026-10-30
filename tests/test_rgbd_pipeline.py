@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -190,6 +191,7 @@ class MemoryRemote:
         assert self.candidates[doc["candidate_id"]] == doc
 
     def set_artifact_sync(self, sha, obs_id, status, gid, size, local_check):
+        self._fail("artifact_sync_before")
         row = self.artifact_sync.setdefault(sha, {"remote_status": "pending", "observation_ids": set()})
         row["observation_ids"].add(obs_id)
         row["last_local_check"] = local_check
@@ -387,6 +389,74 @@ class IdentityAndCheckpointTests(unittest.TestCase):
         make_pipeline(self.dir, seg2).process("obs_test")
         self.assertEqual(seg2.calls, 1)
 
+    def test_embedding_cache_across_observations_keeps_ids_and_existing_sync(self):
+        seg, emb = StubSegmenter(), StubEmbedder()
+        first = make_pipeline(self.dir, seg, emb).process("obs_test")
+        make_observation(self.dir, obs_id="obs_other", register=False)
+        # New Pipeline instance simulates reopening the local cache. Observation
+        # identity remains distinct even when the embedding inputs are identical.
+        second = make_pipeline(self.dir, seg, emb).process("obs_other")
+        self.assertEqual((seg.calls, emb.calls), (2, 3))
+        self.assertTrue({c["candidate_id"] for c in first["candidates"]}.isdisjoint(
+            {c["candidate_id"] for c in second["candidates"]}))
+        for a, b in zip(first["candidates"], second["candidates"]):
+            self.assertEqual(pipeline.load_embedding(self.dir, a), pipeline.load_embedding(self.dir, b))
+        store = candidate_store.CandidateLocalStore(self.dir, "mock")
+        store.put_many(first["candidates"] + second["candidates"])
+        remote = MemoryRemote()
+        remote.fail_once.add("candidate_after")
+        failed = candidate_store.sync(self.dir, "mock", remote, observation_ids=["obs_test", "obs_other"])
+        self.assertEqual(failed["error"], "TimeoutError")
+        retried = candidate_store.sync(self.dir, "mock", remote, observation_ids=["obs_test", "obs_other"])
+        self.assertIsNone(retried["error"])
+        self.assertEqual(retried["pending_candidates"], 0)
+        self.assertEqual((len(remote.observations), len(remote.candidates)), (2, 6))
+        self.assertEqual(len(store.read()), 6)
+        repeated = candidate_store.sync(self.dir, "mock", remote, observation_ids=["obs_test", "obs_other"])
+        self.assertEqual((repeated["media_uploaded"], repeated["observations_sent"], repeated["candidates_sent"]), (0, 0, 0))
+        self.assertEqual(emb.calls, 3)
+
+    def test_checkpoint_repair_preserves_candidate_creation_time(self):
+        first = make_pipeline(self.dir).process("obs_test")
+        proc = self.dir / first["candidates"][0]["processing_dir"]
+        store = candidate_store.CandidateLocalStore(self.dir, "mock")
+        remote = MemoryRemote()
+        # Recover from the processing output before it is committed, then from
+        # the immutable store after the processing output itself is lost/corrupt.
+        for source in ("processing_output", "store_missing_output", "store_corrupt_output"):
+            with self.subTest(source=source):
+                if source != "processing_output":
+                    store.put_many(first["candidates"])
+                    candidate_store.sync(self.dir, "mock", remote, observation_ids=["obs_test"])
+                    if source == "store_missing_output":
+                        (proc / "candidates.json").unlink()
+                    else:
+                        (proc / "candidates.json").write_text("broken json")
+                (proc / first["candidates"][0]["embedding_ref"]).unlink()
+                with patch.object(rgbd, "utc_now", return_value="2099-01-01T00:00:00+00:00"):
+                    repaired = make_pipeline(self.dir).process("obs_test")
+                self.assertEqual(repaired["candidates"], first["candidates"])
+                store.put_many(repaired["candidates"])
+                # Remote insert-only readback must accept the repaired record too.
+                for c in repaired["candidates"]:
+                    remote.upsert_candidate(candidate_store.remote_candidate(self.dir, c, {}))
+
+    def test_image_only_contract_survives_pipeline_cache_wrapper(self):
+        provider = embeddings.VoyageMultimodalProvider(Config(voyage_key="k"), allow_cloud=True)
+        wrapped = make_pipeline(self.dir, emb=provider).emb
+        self.assertFalse(wrapped.uses_text)
+        self.assertIs(make_pipeline(self.dir, emb=wrapped).emb, wrapped)
+
+    def test_embedding_cache_reuses_inputs_across_processing_versions(self):
+        emb = StubEmbedder()
+        first = make_pipeline(self.dir, emb=emb).process("obs_test")
+        # This bookkeeping flag changes the overall processing identity, but
+        # does not change the geometry text or image sent to the embedder.
+        second = make_pipeline(self.dir, emb=emb, params=exposure.ExposureParams(
+            block_dimensions_verified=True)).process("obs_test")
+        self.assertNotEqual(first["processing_version"], second["processing_version"])
+        self.assertEqual(emb.calls, 3)
+
     def test_tampered_checkpoint_is_recomputed(self):
         seg, emb = StubSegmenter(), StubEmbedder()
         first = make_pipeline(self.dir, seg, emb).process("obs_test")
@@ -472,6 +542,7 @@ class ProviderParserTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             embeddings.parse_voyage_response({"data": []}, 1024)
 
+    @unittest.skipUnless(HAVE_DEPS, "numpy and Pillow required for image preparation")
     def test_voyage_default_is_image_only_with_description_as_metadata(self):
         cfg = Config(voyage_key="k")
         img_only = embeddings.VoyageMultimodalProvider(cfg, allow_cloud=True)
@@ -642,6 +713,29 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(len(doc["embedding"]), 1024)
         self.assertIsInstance(doc["cutout_png"], bytes)
         self.assertNotIn("embedding", self.store.read()[0])
+
+    def test_retry_repairs_artifact_metadata_after_media_ack(self):
+        self.remote.fail_once.add("artifact_sync_before")
+        failed = candidate_store.sync(self.dir, "mock", self.remote, observation_ids=["obs_test"])
+        self.assertEqual(failed["error"], "TimeoutError")
+        self.assertEqual(failed["media_uploaded"], 1)
+        self.assertEqual(len(self.remote.artifact_sync), 0)
+        retried = candidate_store.sync(self.dir, "mock", self.remote, observation_ids=["obs_test"])
+        self.assertIsNone(retried["error"])
+        self.assertEqual(retried["media_uploaded"], 1)
+        self.assertEqual(len(self.remote.artifact_sync), 2)
+        self.assertTrue(all(r["remote_status"] == "synced" for r in self.remote.artifact_sync.values()))
+
+    def test_shared_media_links_every_observation(self):
+        make_observation(self.dir, obs_id="obs_other", register=False)
+        self.store.put_many(make_pipeline(self.dir).process("obs_other")["candidates"])
+        for obs_id in ("obs_test", "obs_other"):
+            result = candidate_store.sync(self.dir, "mock", self.remote, observation_ids=[obs_id])
+            self.assertIsNone(result["error"])
+        self.assertEqual(result["media_uploaded"], 0)
+        self.assertEqual(len(self.remote.artifact_sync), 2)
+        for row in self.remote.artifact_sync.values():
+            self.assertEqual(row["observation_ids"], {"obs_test", "obs_other"})
 
     def test_sync_requires_explicit_ids_and_delete_refuses_after_upload(self):
         with self.assertRaises(ValueError):

@@ -12,6 +12,8 @@ import shutil
 from pathlib import Path
 from .local_store import atomic_write
 from . import rgbd, segmentation, exposure, cutouts, embeddings
+from .cached_embedding import CachedEmbeddingProvider
+from .result_cache import ResultCache
 
 PIPELINE_CODE_VERSION = "rgbd-pipeline-v1"
 
@@ -83,7 +85,9 @@ class Pipeline:
         self.description_template = description_template
         self.store = rgbd.ObservationStore(data_dir, mode)
         self.registry = rgbd.CalibrationRegistry(data_dir, mode)
-        self.seg, self.emb = seg_provider, emb_provider
+        self.seg = seg_provider
+        self.emb = emb_provider if isinstance(emb_provider, CachedEmbeddingProvider) else CachedEmbeddingProvider(
+            emb_provider, ResultCache(self.data_dir / mode / "provider-cache" / "results.sqlite3"))
         self.exposure_params = exposure_params or exposure.ExposureParams()
         self.cutout_cfg = cutout_cfg or cutouts.cutout_settings()
 
@@ -178,6 +182,17 @@ class Pipeline:
         # -- stage 4: embeddings, one atomic file per candidate
         emb_dir = proc / "embeddings"
         emb_dir.mkdir(exist_ok=True)
+        # A repaired checkpoint has a new write time, but an existing candidate
+        # keeps its original creation time. Committed records take precedence.
+        from .candidate_store import CandidateLocalStore, validate_candidate
+        previous = {}
+        try:
+            saved = json.loads((proc / "candidates.json").read_text())
+            if isinstance(saved, list):
+                previous = {c["candidate_id"]: validate_candidate(c) for c in saved}
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        previous.update({c["candidate_id"]: c for c in CandidateLocalStore(self.data_dir, self.mode).read()})
         candidates = []
         template_id = self.description_template
         for m, res, cut in zip(masks, results, cut_ckpt["payload"]["items"]):
@@ -210,7 +225,7 @@ class Pipeline:
                 "description_text": text, "description_template": template_id,
                 "embedding_input_parts": list(cfg["embedding"].get("input_parts", ["text", "image"])), "files": cut["files"], "processing_version": version,
                 "processing_dir": str(proc.relative_to(self.data_dir)), "calibration_version": obs["calibration_version"],
-                "created_at": e_ckpt["written_at"]})
+                "created_at": previous[cid]["created_at"] if cid in previous else e_ckpt["written_at"]})
         atomic_write(proc / "candidates.json", rgbd.canonical_json(candidates))
         return {"observation_id": observation_id, "processing_version": version, "candidates": candidates,
                 "gated_in": registration_verified, "gate_reasons": ex_ckpt["payload"]["gate_reasons"],
