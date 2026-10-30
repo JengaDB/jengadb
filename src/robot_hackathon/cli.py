@@ -59,10 +59,10 @@ def main(argv=None):
                 if args.command == "live-run":
                     from .segmentation import MetaSam3Provider
                     from .agent_cli import _parse_xy
-                    if not args.tower_origin:
-                        raise ConfigError("live-run needs --tower-origin x,y")
+                    from .live_executor import BLUE_SQUARE_ORIGIN
+                    origin = _parse_xy(args.tower_origin) if args.tower_origin else BLUE_SQUARE_ORIGIN
                     filled = [s for s in (args.filled_slots or "").split(",") if s]
-                    return asyncio.run(run_flow(config, args.data_dir, args.operator, args.episode, _parse_xy(args.tower_origin), filled,
+                    return asyncio.run(run_flow(config, args.data_dir, args.operator, args.episode, origin, filled,
                                                 args.tower_gap, args.max_blocks, MetaSam3Provider(config, allow_cloud=True),
                                                 arm_speed=args.arm_speed, arm_accel=args.arm_accel))
                 return asyncio.run(run_step(config, args.data_dir, args.step, args.operator, args.episode, args.decision, args.table_z,

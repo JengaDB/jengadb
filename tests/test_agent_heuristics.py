@@ -437,11 +437,13 @@ class ProposalTests(unittest.TestCase):
         self.assertEqual(proposal.DeterministicCoordinator().decide(full)["reason"], "all_slots_filled")
         # second block of a touching row: open slot exists but has no claw room -> blocked, validator refuses it too
         beside = proposal.build_context(self.scene, tower_origin_xy_mm=(160.0, 300.0), filled_slots=["L0S0"])
-        self.assertEqual(beside["placement"]["status"], "blocked")
+        self.assertEqual(beside["placement"]["status"], "available")
         self.assertEqual(beside["placement"]["next_slot"]["slot_id"], "L0S1")
-        self.assertTrue(proposal.DeterministicCoordinator().decide(beside)["reason"].startswith("slot_release_room_insufficient:L0S1"))
-        with self.assertRaisesRegex(proposal.SelectionError, "slot_blocked"):
+        self.assertTrue(beside["placement"]["next_slot"]["requires_ends_grasp"])
+        with self.assertRaisesRegex(proposal.SelectionError, "slot_requires_ends_grasp"):
             proposal.validate_selection(beside, self.names["A"], "middle", 0.0, "L0S1")
+        decision = proposal.DeterministicCoordinator().decide(beside)
+        self.assertEqual((decision["kind"], decision["grasp"]["style"]), ("pick_and_place_proposal", "ends"))
         doc = json.loads(json.dumps(self.synth.geometry_document()))
         doc["support_surface"]["verified"] = False
         unverified = dict(self.scene, calibration=geom.bundle_from_records(self.scene["observation"], True, doc))

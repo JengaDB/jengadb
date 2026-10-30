@@ -29,7 +29,12 @@ CLAW_THICKNESS_MM = 8.0           # Sam's; closed claws are two claws thick
 PUSH_START_GAP_MM = 5.0           # gap between the closed claws and the last block before the push starts
 PUSH_TIPS_MM = 5.0                # claw tips above the table while pushing
 PUSH_EXTRA_MM = 8.0               # shove past the point where the gaps have closed
+ADJACENT_CLEARANCE_MM = 1.5       # placing exactly one pitch away nudged the neighbour; leave this much and push later
+PUSH_IF_GAPS_OVER_MM = 2.0
 MOVE_TIMEOUT_S = 120.0
+# Blue tape square on the table, measured from obs_bd83a42d69914db0 (marks at x 397..481, y 165..241 world):
+# centre (439, 203); x pre-compensated by -4 mm for the placement bias measured on the first two rows.
+BLUE_SQUARE_ORIGIN = (435.0, 203.0)
 STEPS = ("status", "home", "hover", "descend", "grab", "lift", "to-slot", "release", "retreat", "abort-up", "open", "push")
 
 
@@ -138,7 +143,7 @@ class Robot:
 
 
 async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled, gap_mm, max_blocks=3, seg_provider=None,
-                   final_capture=True):
+                   final_capture=True, arm_speed=None, arm_accel=None):
     """One connection, one capture: segment, rank, then place blocks back to back. The next slot is positioned from the
     previous block's *actual* release pose (plus one pitch along the row) rather than the nominal slot, so release
     nudges do not accumulate. Grasp per slot: ends when the slot touches a placed neighbour, else middle/side/ends.
@@ -160,11 +165,19 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
         await asyncio.wait_for(client.refresh(), timeout=10)
         bot = Robot(client, config)
         camera = Camera.from_robot(client, config.camera_resource)
+        if arm_speed is not None or arm_accel is not None:
+            # UFactory xArm module do_command keys; operator-requested, applied for this session only.
+            result = {}
+            if arm_speed is not None:
+                result["set_speed"] = await bot.arm.do_command({"set_speed": float(arm_speed)})
+            if arm_accel is not None:
+                result["set_acceleration"] = await bot.arm.do_command({"set_acceleration": float(arm_accel)})
+            ep.event("flow", phase="arm_speed", speed_deg_s=arm_speed, accel_deg_s2=arm_accel, result=result)
 
         async def scene_from_capture():
             obs = await capture_with_camera(config, data_dir, camera, episode_id, client=client)
             obs, rgb, depth = rgbd.ObservationStore(data_dir, "live").load_arrays(obs["observation_id"])
-            raw = seg_provider.segment(rgb)
+            raw = await asyncio.to_thread(seg_provider.segment, rgb)  # the provider runs its own event loop internally
             masks = segmentation.finalize_masks(raw, rgb.shape[1], rgb.shape[0], 200)
             for m in masks:
                 m.update(candidate_id=candidate_id(obs["observation_id"], "live-flow", m["mask_index"]), embedding=None, candidate=None)
@@ -186,12 +199,43 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                  rejections={c["candidate_id"]: c["rejection_reasons"] for c in ctx["candidates"] if not c["eligible"]},
                  table_plane=ctx["table_plane"].get("status"), tower_origin=list(tower_origin), gap_mm=gap_mm, filled=list(filled))
         filled = list(filled)
+        # Declared filled slots must be visible: a block in the tower zone at that layer's height for each one.
+        if filled:
+            in_zone = [c["geometry"] for c in ctx["candidates"] if "in_tower_zone" in c["rejection_reasons"] and c["geometry"]["height_above_table_mm"] is not None]
+            layers_declared = {int(s[1]) for s in filled}
+            missing = []
+            for layer in layers_declared:
+                expect = (layer + 1) * calib.block.height_mm
+                seen = [g for g in in_zone if abs(g["height_above_table_mm"] - expect) < 0.6 * calib.block.height_mm]
+                count = sum(1 for s in filled if int(s[1]) == layer)
+                if len(seen) < min(count, 1):
+                    missing.append({"layer": layer, "expected_height_mm": expect, "seen_heights": [round(g["height_above_table_mm"], 1) for g in in_zone]})
+            if missing:
+                ep.event("flow", phase="stop", reason="declared_filled_slots_not_visible", missing=missing,
+                         note="nothing placed; fix --filled-slots or put the base layer back")
+                return 1
         last_pose = None   # (x, y, long_side_deg) of the previous block as released
+
+        def row_blocks(context, layer):
+            """Measured blocks in the tower zone at this layer's height, ordered along the row's across direction."""
+            expect = (layer + 1) * calib.block.height_mm
+            found = [c["geometry"] for c in context["candidates"] if "in_tower_zone" in c["rejection_reasons"]
+                     and c["geometry"]["height_above_table_mm"] is not None and abs(c["geometry"]["height_above_table_mm"] - expect) < 0.6 * calib.block.height_mm]
+            across = math.radians(target.layer0_long_side_deg + 90.0 * (layer + 1))
+            return sorted(found, key=lambda g: g["base_point_mm"][0] * math.cos(across) + g["base_point_mm"][1] * math.sin(across))
+
         for _ in range(max_blocks):
             slot = next_open_slot(target, filled)
             if slot is None:
                 ep.event("flow", phase="layer_complete", filled=filled)
                 break
+            if last_pose is None and slot["index"] > 0:
+                # Resuming a partly built layer: continue from the measured end of the row, not the nominal slot.
+                row = row_blocks(ctx, slot["layer"])
+                if row:
+                    g = row[-1]
+                    last_pose = (g["base_point_mm"][0], g["base_point_mm"][1], slot["long_side_deg"])
+                    ep.event("flow", phase="resume_from_measured_row", row_end_xy=[round(last_pose[0], 1), round(last_pose[1], 1)], blocks_seen=len(row))
             order = proposal.grasp_order(slot)
             pick = None
             for c in queue:
@@ -210,7 +254,7 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 sx, sy = slot["block_center_mm"][0], slot["block_center_mm"][1]
             else:
                 across = math.radians(slot["long_side_deg"] + 90.0)
-                pitch = slot["block_dimensions_mm"][1] + gap_mm
+                pitch = slot["block_dimensions_mm"][1] + gap_mm + ADJACENT_CLEARANCE_MM
                 sx, sy = last_pose[0] + pitch * math.cos(across), last_pose[1] + pitch * math.sin(across)
             tips = grasp["tips_above_table_mm"]
             ep.event("flow", phase="plan_block", slot=slot["slot_id"], candidate=pick["candidate_id"], grasp=grasp["style"], pick_xy=[round(bx, 1), round(by, 1)],
@@ -255,10 +299,43 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
             filled.append(slot["slot_id"])
             placed.append({"slot": slot["slot_id"], "candidate": pick["candidate_id"], "released_at": [round(rx, 1), round(ry, 1)], "grasp": grasp["style"]})
             ep.event("flow", phase="placed", slot=slot["slot_id"], released_block_xy=[round(rx, 1), round(ry, 1)], aligned_at_pick=aligned)
-        # --- home and final validation
+        # --- home, measure, push the table row together if the measured gaps say so (layer 0 only), measure again
         await bot.gripper.open()
         ok, _ = await bot.move_to(*HOME)
         ep.event("flow", phase="home", accepted=ok, placed=placed)
+        if placed and any(p["slot"].startswith("L0") for p in placed) and not any(p["slot"].startswith("L1") for p in placed):
+            obs_m, scene_m = await scene_from_capture()
+            ctx_m = proposal.build_context(scene_m, tower_origin_xy_mm=tower_origin, filled_slots=filled, dry_run=True, tower_gap_mm=gap_mm)
+            row = row_blocks(ctx_m, 0)
+            w = calib.block.width_mm
+            pts = [g["base_point_mm"] for g in row]
+            gaps = sum(max(0.0, math.hypot(b[0] - a[0], b[1] - a[1]) - w) for a, b in zip(pts, pts[1:]))
+            ep.event("flow", phase="row_measured", blocks=len(row), row_gaps_mm=round(gaps, 1),
+                     centres=[[round(p[0], 1), round(p[1], 1)] for p in pts])
+            if len(row) >= 2 and gaps > PUSH_IF_GAPS_OVER_MM:
+                across = math.radians(target.layer0_long_side_deg + 90.0)
+                ux, uy = -math.cos(across), -math.sin(across)                # from the row's far end back toward its first block
+                distance = gaps + PUSH_START_GAP_MM + PUSH_EXTRA_MM
+                last = pts[-1]
+                back = w / 2 + CLAW_THICKNESS_MM + PUSH_START_GAP_MM
+                start = (last[0] - ux * back, last[1] - uy * back)
+                await bot.gripper.grab()
+                g = await bot.gripper_origin()
+                travel_z = g[2]
+                ep.event("flow", phase="push_plan", start_xy=[round(v, 1) for v in start], distance_mm=round(distance, 1))
+                await bot.move_delta(dx=start[0] - g[0], dy=start[1] - g[1])
+                await bot.align_claws(wrap_90(target.layer0_long_side_deg + 90.0), tolerance_deg=1.5)
+                g = await bot.gripper_origin()
+                await bot.move_delta(dx=start[0] - g[0], dy=start[1] - g[1])
+                g = await bot.gripper_origin()
+                ok, _ = await bot.move_delta(dz=(table_z + PUSH_TIPS_MM - TIP_ABOVE_GRIPPER_FRAME_MM) - g[2], near_table=True)
+                if ok:
+                    ok, _ = await bot.move_delta(dx=ux * distance, dy=uy * distance, near_table=True)
+                g = await bot.gripper_origin()
+                await bot.move_delta(dz=travel_z - g[2], near_table=True)
+                await bot.gripper.open()
+                await bot.move_to(*HOME)
+                ep.event("flow", phase="pushed", accepted=ok)
         if final_capture:
             obs2, scene2 = await scene_from_capture()
             ctx2 = proposal.build_context(scene2, tower_origin_xy_mm=tower_origin, filled_slots=filled, dry_run=True, tower_gap_mm=gap_mm)
