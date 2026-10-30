@@ -99,7 +99,11 @@ PALLET_SQUARE_DEG = 4.0           # a pallet block turned further than this from
                                   # the stack refuses a bundle whose blocks differ more (layer_stack.PARALLEL_TOLERANCE_DEG)
 PALLET_LINE_MM = 20.0             # ...or whose centre lies further than this from the row's line along its long side (the
                                   # stack refuses ends staggered more: 75 - MIN_SHARED_CONTACT_MM 55; run 13: 37.7 mm)
-MAX_PALLET_FIXES = 6              # pallet corrections (take a block off, or put one back square) per run
+MAX_PALLET_FIXES = 9              # pallet corrections (take a block off, or put one back square) per run: three per block
+MAX_RESEATS_PER_BLOCK = 3         # a misoriented pallet block is re-seated through the drop spot at most this many times in
+                                  # a row before the flow carries on (operator, 30 Oct: repeat until it is right)
+LEFT_AS_IS_MM = 12.0              # a block given up on is left alone at later checks while it lies within this of where it
+                                  # was left (half the row pitch, so a neighbour never matches; harness: re-seated 6 times)
 ALIGN_START_GAP_MM = 10.0         # end alignment: the claws come down this far past the block's end (5 was too close: operator, 30 Oct)
 LOW_TRAVEL_TIPS_MM = 30.0         # pallet push stage: closed claws travel this high, over 15 mm block tops with 15 to spare
 LOW_TRAVEL_MARGIN_MM = 10.0       # anything taller than LOW_TRAVEL_TIPS_MM minus this near the path is gone over, not through
@@ -1944,14 +1948,62 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
             ep.event("flow", phase="pallet_replaced", label=label, released_block_xy=[round(v, 1) for v in released])
             return None
 
+        async def reseat(c, reasons, good_xy, found, label):
+            """Operator, 30 Oct: a block that came to lie misoriented on the pallet (the grip turned or rolled it) is picked
+            again, taken to the drop spot and dropped there so it lies flat on its own (take_off -> drop_and_check), picked
+            there with a fresh grip, and put back into the row square (row_destination, release_at). The next look checks
+            it again. Returns "stop" (event recorded) or None."""
+            status = await take_off(c, reasons, found, label)
+            if status:
+                return status
+            near = [x for x in ctx["candidates"] if x["geometry"].get("base_point_mm")
+                    and math.dist(x["geometry"]["base_point_mm"][:2], drop_spot_xy) < DROP_FIND_MM]
+            if not near:
+                ep.event("flow", phase="reseat_lost", label=label, note="not found at the drop spot; it is a heap block again")
+                print("Re-seat: the block was not found at the drop spot; carrying on", flush=True)
+                return None
+            d = min(near, key=lambda x: math.dist(x["geometry"]["base_point_mm"][:2], drop_spot_xy))
+            if geom.lying_flat_reasons(d["geometry"], candidate_tilt(scene, d), calib.block):
+                ep.event("flow", phase="reseat_not_flat", label=label, candidate=d["candidate_id"], note="left at the drop spot; picked later")
+                print("Re-seat: the block does not lie flat at the drop spot; leaving it there for now", flush=True)
+                return None
+            entry = proposal.candidate_entry(ctx, d["candidate_id"])
+            grasp = next((g for style in proposal.grasp_order(None) for g in entry["grasps"] if g["style"] == style and g["eligible"]), None)
+            if grasp is None:
+                ep.event("flow", phase="reseat_no_grip", label=label, candidate=d["candidate_id"], note="left at the drop spot")
+                print("Re-seat: no clear grip at the drop spot; leaving the block there for now", flush=True)
+                return None
+            tips, resting = grasp["tips_above_table_mm"], grasp.get("resting_level_mm", 0.0)
+            slot0 = target.slots()[0]
+            pitch = calib.block.width_mm + gap_mm + release_spacing_mm(grasp["style"], calib.finger, calib.block.width_mm, place_spacing_mm)
+            where, (sx, sy) = row_destination(good_xy, pitch, slot0["long_side_deg"]) if good_xy else ("first_slot", tuple(slot0["block_center_mm"][:2]))
+            ep.event("flow", phase="reseat_place", label=label, candidate=d["candidate_id"], grasp=grasp["style"],
+                     from_xy=[round(v, 1) for v in d["geometry"]["base_point_mm"][:2]], dest_xy=[round(sx, 1), round(sy, 1)], where=where)
+            print(f"Re-seat: picking the block again at the drop spot and putting it back at ({sx:.0f}, {sy:.0f})", flush=True)
+            stop_reason, held, travel_z, attempt, _ = await grab_block(entry, grasp, tips, "reseat")
+            if stop_reason:
+                ep.event("flow", phase="stop", reason=stop_reason, candidate=d["candidate_id"], attempts=attempt)
+                return "stop"
+            await bot.move_delta(dz=PICK_LIFT_MM, near_table=True)
+            released = await release_at(sx, sy, slot0["long_side_deg"], slot0["support_z_mm"], grasp, tips, resting, held, travel_z)
+            if released is None:
+                ep.event("flow", phase="stop", reason="place_descend_refused", note="block still held; use live-step abort-up/open")
+                return "stop"
+            ep.event("flow", phase="pallet_reseated", label=label, released_block_xy=[round(v, 1) for v in released])
+            return None
+
         async def square_pallet(label):
             """Look at the pallet and make it whole and square (operator, 30 Oct: double picks happen; after every
             placement check how many blocks are there and fix them, re-picking if need be). pallet_audit decides; one fix
-            per look, then look again: a block that does not lie flat, then a block too many, goes to the drop spot
-            (take_off); a block turned or off the row's line is put back square (re_place). At most MAX_PALLET_FIXES
-            fixes per run. Returns the number of fixes made in this call, or "stop"."""
+            per look, then look again. A kept block that is misoriented (not flat, turned, off the row's line) is re-seated
+            through the drop spot (reseat: dropped, picked again, put back square), up to MAX_RESEATS_PER_BLOCK times in a
+            row, before the flow goes on (operator, 30 Oct); without --drop-spot a turned or off-line one is put back
+            directly (re_place), with the same limit. A block given up on is left as it is at later checks (left_as_is).
+            A block too many goes to the drop spot and stays (take_off). At most MAX_PALLET_FIXES fixes per run. Returns
+            the number of fixes made in this call, or "stop"."""
             nonlocal obs, scene, ctx, queue, pallet_count, last_pose, pallet_fixes
             fixes = 0
+            reseats = 0
             while True:
                 ok, _ = await bot.move_to(*home)
                 if not ok:
@@ -1978,24 +2030,41 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                     ep.event("flow", phase="pallet_not_square", label=label, fixes=pallet_fixes, note="carrying on; fix the pallet by hand if the stack refuses it")
                     print(f"Pallet still not whole and square after {pallet_fixes} fixes; carrying on", flush=True)
                     return fixes
-                not_flat = [i for i, _ in audit["fix"] if blocks[i]["flat_reasons"]]
-                to_take = not_flat + audit["extra"][::-1]                        # extras are ordered best first
-                turned = [(i, r) for i, r in audit["fix"] if not blocks[i]["flat_reasons"]]
-                if to_take and drop_spot_xy is None:
-                    # Taking a block off needs somewhere to put it; without --drop-spot only re-placing is possible.
-                    ep.event("flow", phase="pallet_fix_needs_drop_spot", label=label, blocks=[found[i]["candidate_id"] for i in to_take])
-                    to_take = []
-                if not to_take and not turned:
+                # Misoriented kept blocks (not flat first), then blocks too many.
+                misoriented = sorted(audit["fix"], key=lambda t: not blocks[t[0]]["flat_reasons"])
+                extras = audit["extra"][::-1]                                     # extras are ordered best first
+                if drop_spot_xy is None:
+                    # Nowhere to drop: a turned or off-line block is put back directly; the rest can only be reported.
+                    stuck = [i for i, _ in misoriented if blocks[i]["flat_reasons"]] + extras
+                    if stuck:
+                        ep.event("flow", phase="pallet_fix_needs_drop_spot", label=label, blocks=[found[i]["candidate_id"] for i in stuck])
+                    misoriented = [(i, r) for i, r in misoriented if not blocks[i]["flat_reasons"]]
+                    extras = []
+                misoriented = [(i, r) for i, r in misoriented if not any(math.dist(blocks[i]["xy"], xy) < LEFT_AS_IS_MM for xy in left_as_is)]
+                if not misoriented and not extras:
+                    return fixes
+                if misoriented and reseats >= MAX_RESEATS_PER_BLOCK:
+                    left_as_is.append(blocks[misoriented[0][0]]["xy"])
+                    ep.event("flow", phase="pallet_not_square", label=label, reseats=reseats, left_xy=[round(v, 1) for v in blocks[misoriented[0][0]]["xy"]],
+                             note="the block is still misoriented after re-seating; left as it is, carrying on with the next block")
+                    print(f"Pallet: block still misoriented after {reseats} re-seats; leaving it and carrying on", flush=True)
                     return fixes
                 pallet_fixes += 1
                 fixes += 1
-                if to_take:
-                    i = to_take[0]
-                    status = await take_off(found[i], audit["reasons"][i] or ["extra_block"], found, label)
+                if misoriented:
+                    i, reasons = misoriented[0]
+                    # Places taken in the row: every other block there, and the moved block's own place when it rested on
+                    # one (the block under it is hidden from the camera; harness: it was put back on top of it, again).
+                    taken = [blocks[j]["xy"] for j in range(len(blocks)) if j != i and j not in audit["extra"]]
+                    if any(r.startswith("height:") for r in blocks[i]["flat_reasons"]):
+                        taken.append(blocks[i]["xy"])
+                    reseats += 1
+                    if drop_spot_xy is not None:
+                        status = await reseat(found[i], reasons, taken, found, label)
+                    else:
+                        status = await re_place(found[i], reasons, taken, found, label)
                 else:
-                    i, reasons = turned[0]
-                    good = [blocks[j]["xy"] for j in audit["keep"] if j != i and not audit["reasons"][j]]
-                    status = await re_place(found[i], reasons, good, found, label)
+                    status = await take_off(found[extras[0]], audit["reasons"][extras[0]] or ["extra_block"], found, label)
                 if status == "stop":
                     return "stop"
                 last_pose = None
@@ -2200,6 +2269,7 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
         x_sweeps_used = 0
         push_outs_used = 0
         pallet_fixes = 0
+        left_as_is = []                                          # pallet blocks given up on after MAX_RESEATS_PER_BLOCK tries
         rescans_without_progress = 0
         placed_at_last_scan = 0
         pallet_count = len([s for s in filled if s.startswith('L0')])

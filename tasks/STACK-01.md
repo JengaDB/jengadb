@@ -681,6 +681,27 @@ local/layer-stack-data/live/episodes/):
   - a double pick without `--drop-spot` is reported and four blocks are never pushed;
   - the earlier sweep tests now expect picks first.
   - 196 tests pass. Untested live.
+- Change (operator: a block the grip turned is picked again, dropped on the drop spot to reorient, picked there and
+  put back; repeat for that block until it is right, then the next block):
+  - With `--drop-spot`, a kept pallet block that is misoriented (turned more than 4 deg, more than 20 mm off the row's
+    line, or not lying flat) is re-seated (`reseat`): taken off to the drop spot, looked at there, picked with a fresh
+    grip and released into the row's free place (`row_destination`). Without `--drop-spot` a turned or off-line block
+    is put back directly (`re_place`), as before.
+  - The pallet is checked again after each re-seat; the next block is not picked until the check is square.
+  - At most `MAX_RESEATS_PER_BLOCK` (3) tries per block. A block still wrong after that is left where it lies and not
+    touched again (`left_as_is`, matched within 12 mm); the flow goes on (`pallet_not_square`). `MAX_PALLET_FIXES`
+    rose from 6 to 9 per run.
+  - Fix found by the harness: the free place for a re-seated block now counts every other block in the row and, when
+    the block rested on another, its own place too. Before, it was put back on top of the hidden block below, six
+    times.
+  - Fix found by the harness: the 3-try limit reset at every pallet check, so a block that kept landing turned was
+    re-seated six times.
+- Tests (harness, drop spot set): a block landing turned 15 deg is re-seated once and is square before the next pick;
+  turned again on its first re-seat, it is re-seated twice with no other pick between; turned every time, it is
+  re-seated three times, left, and the next block is still placed.
+  - 199 tests pass. Untested live.
+- Known gap: a block left as is that the push stage later moves more than 12 mm is no longer recognised and can be
+  re-seated again (bounded by `MAX_PALLET_FIXES`).
 
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot
 complete until it is changed; table height and camera offset are unverified; `--grip-lower-mm 3` is a single-run fix,

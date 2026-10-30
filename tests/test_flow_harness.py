@@ -599,6 +599,65 @@ class RunFlowHarness(unittest.TestCase):
             if math.hypot(b[1] - self.PALLET[0], b[2] - self.PALLET[1]) < 200:
                 self.assertLess(abs(((b[3] + 90.0) % 180.0) - 90.0), 2.0)     # all square to the row
 
+    def run_turning_releases(self, turns):
+        """The second block is turned 15 deg each time it is released on the pallet, `turns` times (its first placement
+        and then its re-seats), as if the grip kept turning it; with a drop spot."""
+        world = self.flat_heap()
+        orig_open = FakeGripper.open
+        state = {"first": None, "turned": 0, "pallet": []}
+
+        async def open_(gripper):
+            b = gripper.w.held[0] if gripper.w.held is not None else None
+            await orig_open(gripper)
+            if b is None or math.hypot(b[1] - self.PALLET[0], b[2] - self.PALLET[1]) >= 200:
+                return
+            if b not in state["pallet"]:
+                state["pallet"].append(b)
+            if len(state["pallet"]) == 2 and state["first"] is None:
+                state["first"] = b
+            if b is state["first"] and state["turned"] < turns:
+                state["turned"] += 1
+                b[3] += 15.0
+        with mock.patch.object(FakeGripper, "open", open_):
+            rc, events = self.run_flow(world, drop_spot_xy=(500.0, 120.0))
+        return world, events
+
+    def test_misoriented_block_is_reseated_through_the_drop_spot(self):
+        # Operator, 30 Oct: a block the grip turned is picked again, dropped on the drop spot to reorient, picked there
+        # and put back on the pallet; then the next block.
+        world, events = self.run_turning_releases(turns=1)
+        phases = [e["phase"] for e in events]
+        i = phases.index("pallet_repair")
+        self.assertTrue(events[i]["misplaced"][0].startswith("rotated:+15"))
+        order = [p for p in phases[i:] if p in ("dropped", "reseat_place", "pallet_reseated", "pallet_check")][:4]
+        self.assertEqual(order, ["dropped", "reseat_place", "pallet_reseated", "pallet_check"])
+        check_after = next(e for e in events[i:] if e.get("phase") == "pallet_check")
+        self.assertTrue(check_after["square"])
+        next_pick = next(j for j, e in enumerate(events) if e.get("phase") == "plan_block" and j > i)
+        self.assertLess(events.index(check_after), next_pick)                    # fixed before the next block
+        self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
+        for b in world.blocks:
+            if math.hypot(b[1] - self.PALLET[0], b[2] - self.PALLET[1]) < 200:
+                self.assertLess(abs(((b[3] + 90.0) % 180.0) - 90.0), 2.0)
+
+    def test_reseat_repeats_until_the_block_is_right(self):
+        world, events = self.run_turning_releases(turns=2)                       # turned again on its first re-seat
+        reseated = [e for e in events if e.get("phase") == "pallet_reseated"]
+        self.assertEqual(len(reseated), 2)
+        second = events.index(reseated[1])
+        self.assertTrue(next(e for e in events[second:] if e.get("phase") == "pallet_check")["square"])
+        picks_between = [e for e in events[events.index(reseated[0]):second] if e.get("phase") == "plan_block"]
+        self.assertEqual(picks_between, [])                                      # no other block until it is right
+        self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
+
+    def test_reseats_stop_after_the_cap_and_the_flow_goes_on(self):
+        world, events = self.run_turning_releases(turns=10)                      # the grip turns it every time
+        reseated = [e for e in events if e.get("phase") == "pallet_reseated"]
+        from robot_hackathon.live_executor import MAX_RESEATS_PER_BLOCK
+        self.assertEqual(len(reseated), MAX_RESEATS_PER_BLOCK)
+        stop = next(j for j, e in enumerate(events) if e.get("phase") == "pallet_not_square")
+        self.assertTrue(any(e.get("phase") == "plan_block" for e in events[stop:]))   # next block still placed
+
     def test_top_layer_is_picked_first_not_swept(self):
         # Operator, 30 Oct: prioritise the top layer; the sweep need not flatten every layer first.
         world = World([("LOW", 360.0, 60.0, 30.0, 0), ("TOP", 360.0, 60.0, 120.0, 1), ("A", 430.0, 250.0, -40.0, 0),
