@@ -82,6 +82,8 @@ class Reasons(unittest.TestCase):
         self.assertIn("tilt:15.0deg", leaning)
         self.assertTrue(any(r.startswith("short:60.0") for r in leaning))
         self.assertIn("tilt:unknown", geom.lying_flat_reasons(flat_geometry(), None, self.dims))
+        # 30 Oct, kazy-palletize-30oct: a block that had landed flat read 10.4 mm high; low readings are not an orientation
+        self.assertEqual(geom.lying_flat_reasons(flat_geometry(height_above_table_mm=10.4), 4.6, self.dims), [])
 
     def test_pallet_check_needs_positive_evidence(self):
         # A good pallet block whose mask is trimmed by its neighbours, or whose face cannot be fitted, is left alone.

@@ -658,11 +658,13 @@ def reorient_reasons(geometry, tilt_deg, max_tilt_deg=REORIENT_TILT_DEG):
 
 
 def lying_flat_reasons(geometry, tilt_deg, dims, max_tilt_deg=REORIENT_TILT_DEG):
-    """Check a block after the drop: one block thick (not on its edge, 25 mm, or end, 75 mm), the full footprint
-    visible, top face level. Empty when it lies flat."""
+    """Check a block after the drop: no thicker than one block (not on its edge, 25 mm, or end, 75 mm), the full
+    footprint visible, top face level. Empty when it lies flat."""
     reasons = []
     h = geometry.get("height_above_table_mm")
-    if h is None or abs(h - dims.height_mm) > 0.3 * dims.height_mm:
+    # Only too high counts: on its edge reads ~25 mm, on end ~75. Low readings are depth bias, not an orientation
+    # (30 Oct: a block that had landed flat read 10.4 mm; flat pallet blocks read 11.9-14.7).
+    if h is None or h > 1.3 * dims.height_mm:
         reasons.append("height:unknown" if h is None else f"height:{h:.1f}mm_not_one_block")
     if "possibly_on_edge" in (geometry.get("flags") or []):
         reasons.append("on_edge")

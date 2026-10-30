@@ -466,9 +466,12 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
             return geom.top_face_tilt_deg(m["mask"], hm, cand["geometry"].get("mm_per_px"))
 
         def drop_spot_blocked(context, exclude_id):
+            """A block from this capture lying within DROP_CLEAR_MM of the spot, ignoring blocks picked since the capture
+            (30 Oct: a block already moved to the pallet was still reported as occupying the spot)."""
+            moved = {p["candidate"] for p in placed}
             for c in context["candidates"]:
                 p = c["geometry"].get("base_point_mm")
-                if c["candidate_id"] != exclude_id and p and math.dist(p[:2], drop_spot_xy) < DROP_CLEAR_MM:
+                if c["candidate_id"] != exclude_id and c["candidate_id"] not in moved and p and math.dist(p[:2], drop_spot_xy) < DROP_CLEAR_MM:
                     return c["candidate_id"]
             return None
 

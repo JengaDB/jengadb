@@ -230,6 +230,23 @@ local/layer-stack-data/live/episodes/):
   with no re-pick; a block put down on its neighbour taken off, laid flat and replaced to a full pallet; drop spot
   too close / in the lane refused before picking. Untested live.
 
+- 30 Oct 19:38-19:43 UTC, episode kazy-palletize-30oct, second cycle (operator Kazy, kazy/push-tuning @fd95a0a,
+  `--drop-spot 300,330 --layers 4`, otherwise as the first cycle). Assembly: an on-edge block resting on another
+  (top 31.8 mm) was dropped at the spot and then placed normally; one close-and-centre push (gaps 105.7 -> 3.0 mm)
+  then two end-alignment pushes (ends aligned, gaps 0.3, centre 2.2 mm off): the operator's push changes worked live.
+  The third block released 137 mm out was counted through the row lane. Pallet check: 3 blocks, tilt 1.2-3.3 deg,
+  heights 13.0-14.2, none flagged. Stacking: grab ok, lift check 0 left behind, released at (537.2, -20.7).
+  Verification refused (`verify_failed`, outcome unknown): a detection at (541.7, 14.1), 70.4 mm, is the base
+  layer's ends protruding ~5 mm past the new layer (photo obs_87bc5ecf52004a3b; base spans y -58.3..16.7, new layer
+  ~-61.7..11.9) read with mixed depth. From the detected centres the new layer sits ~4.0 mm from the base centre
+  (mostly along y) and ~1.6 deg from perpendicular: likely stacked, just over the 3 mm tolerance. Not counted.
+  Two bugs from this run fixed: the post-drop flatness check failed a flat block that read 10.4 mm (only too-high
+  readings count now); a tilted block was skipped as "drop spot occupied" by a block already moved to the pallet
+  since that capture (picked blocks are now ignored).
+  Open: verification treats a lower layer's protruding ends as a block "between layer heights" on top; a
+  between-level detection below the top layer's height and outside its footprint could be ignored, as split_scene
+  already does for the base. The ~4 mm placement offset points at the unverified camera XY / table calibration.
+
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot
 complete until it is changed; table height and camera offset are unverified; `--grip-lower-mm 3` is a single-run fix,
 not a calibration; source and base must be reachable (x <= ~600 mm worked) and both visible from the view pose.
