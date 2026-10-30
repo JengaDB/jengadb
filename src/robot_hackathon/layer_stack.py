@@ -20,7 +20,11 @@ from .grasp_geometry import ACROSS, GraspParams, wrap_90
 
 BLOCKS_PER_LAYER = 3
 PARALLEL_TOLERANCE_DEG = 4.0      # every block within this of the layer's long-side angle
-SPACING_RANGE_MM = (22.0, 28.0)   # neighbour pitch for a packed layer of 25 mm blocks
+SPACING_RANGE_MM = (22.0, 28.0)   # neighbour pitch for a packed layer of 25 mm blocks (the bundle to be gripped)
+BASE_SPACING_RANGE_MM = (20.0, 33.0)  # the tower's top layer only has to give a centre and an angle; its blocks may
+                                      # have settled apart a little and the overview measures it from far above
+                                      # (robot-live-8 18:50: pitch 28.3 measured, run refused)
+BASE_MIN_SHARED_CONTACT_MM = 40.0
 MIN_SHARED_CONTACT_MM = 55.0      # 45 mm finger width plus margin must overlap all three blocks' long sides
 HEIGHT_BAND = 0.3                 # of a block height (4.5 mm): beyond this a top surface is between layers (tilted block)
 MIN_BLOCK_HEIGHT_FRACTION = 0.5   # detections lower than half a block are flat objects (paper, tape), not blocks
@@ -81,8 +85,9 @@ def layer_level(height_above_table_mm, block_height_mm):
     return level if level >= 0 and abs(n - round(n)) <= HEIGHT_BAND else None
 
 
-def summarize_layer(blocks, block_height_mm=15.0):
-    """Validate three measured blocks as one packed, flat, parallel layer and return its pose."""
+def summarize_layer(blocks, block_height_mm=15.0, spacing_range=SPACING_RANGE_MM, min_shared_contact_mm=MIN_SHARED_CONTACT_MM):
+    """Validate three measured blocks as one packed, flat, parallel layer and return its pose. The defaults are the
+    bundle requirements; use base_layer() for the tower's top layer."""
     blocks = [b for b in blocks if _usable(b)]
     if any(b.get("clipped") for b in blocks):
         raise LayerCheckError("a block is cut off by the image edge; move the view so the whole layer is visible")
@@ -101,17 +106,22 @@ def summarize_layer(blocks, block_height_mm=15.0):
     across = sorted(x * -ay + y * ax for x, y in xy)
     along = [x * ax + y * ay for x, y in xy]
     spacing = [b - a for a, b in zip(across, across[1:])]
-    lo, hi = SPACING_RANGE_MM
+    lo, hi = spacing_range
     if not all(lo <= s <= hi for s in spacing):
         raise LayerCheckError("layer has gaps or overlaps: pitch " + ", ".join(f"{s:.1f}" for s in spacing) +
                               f" mm (want {lo:.0f}-{hi:.0f}); push it together by hand")
     contact = 75.0 - (max(along) - min(along))
-    if contact < MIN_SHARED_CONTACT_MM:
+    if contact < min_shared_contact_mm:
         raise LayerCheckError(f"block ends are staggered by {75.0 - contact:.1f} mm; line the ends up")
     cx = sum(p[0] for p in xy) / len(xy)
     cy = sum(p[1] for p in xy) / len(xy)
     height = statistics.median(b["height_above_table_mm"] for b in blocks)
     return LayerPose((cx, cy), theta, height, spacing, contact, levels.pop(), [list(p) for p in xy])
+
+
+def base_layer(blocks, block_height_mm=15.0):
+    """The tower's top layer: same flatness/parallel checks as a bundle, looser spacing and end-stagger limits."""
+    return summarize_layer(blocks, block_height_mm, spacing_range=BASE_SPACING_RANGE_MM, min_shared_contact_mm=BASE_MIN_SHARED_CONTACT_MM)
 
 
 def split_scene(blocks, tower_origin_xy, zone_radius_mm, block_height_mm=15.0, ignored=None):
@@ -272,12 +282,15 @@ class ResidualLog:
 
 # ---------------------------------------------------------------- live run
 
-async def _open_client(config, direct_local):
-    """Sessions stay enabled. direct_local dials viam-server on the LAN over gRPC instead of the cloud WebRTC relay
-    (measured 29 Oct: median 0.37 s vs 1.13 s per RGB-D read, max 0.87 s vs 5.39 s)."""
+async def _open_client(config, direct_local, disable_sessions=False):
+    """direct_local dials viam-server on the LAN over gRPC instead of the cloud WebRTC relay (measured 29 Oct: median
+    0.37 s vs 1.13 s per RGB-D read, max 0.87 s vs 5.39 s). Sessions stay enabled unless the operator disables them
+    (--no-sessions): with sessions on, a missed heartbeat expires the session and ends the run mid-flow
+    (SESSION_EXPIRED, robot-live-8 18:43, as Sam saw before); with them off, a dropped connection no longer stops a
+    move that is already executing, so the e-stop is the only stop for that move."""
     from .capture import open_client
     if not direct_local:
-        return await open_client(config)
+        return await open_client(config, disable_sessions=disable_sessions)
     from viam.robot.client import RobotClient
     config.require_viam()
     host = config.address.split(":")[0]
@@ -285,6 +298,12 @@ async def _open_client(config, direct_local):
         raise LayerCheckError("--direct-local needs the machine's <name>.viam.cloud address in MACHINE_ADDRESS")
     options = RobotClient.Options.with_api_key(api_key=config.key, api_key_id=config.key_id)
     options.dial_options.disable_webrtc = True
+    if disable_sessions:
+        # Also stop the SDK's connectivity probe (ResourceNames with a 1 s deadline every 10 s): a server busy with
+        # motion planning misses it and the SDK tears down in-flight calls ("Lost connection", robot-live-8 18:36).
+        options.disable_sessions = True
+        options.check_connection_interval = 0
+        options.attempt_reconnect_interval = 0
     return await asyncio.wait_for(RobotClient.at_address(host.replace(".viam.cloud", ".local.viam.cloud") + ":8080", options), timeout=15)
 
 
@@ -302,7 +321,8 @@ def _blocks(context, width, height):
 
 async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, seg_provider, direct_local=False,
                           apply_offset=False, confirm=input, plan_only=False, view_pose=None, grip_lower_mm=0.0,
-                          source_hint_xy=None, tips_floor_mm=None, expected_layers=None, grip_retries=1):
+                          source_hint_xy=None, tips_floor_mm=None, expected_layers=None, grip_retries=1, disable_sessions=False,
+                          arm_speed=None, approach_speed=None, align_speed=None):
     """One supervised stack. Returns 0 on a verified success, 1 otherwise. See module docstring.
     plan_only: capture from the current pose, measure both layers and print the plan; no motion command is sent.
     source_hint_xy: operator-supplied world x,y (mm) of the hand-built layer when it lies outside the overview image;
@@ -323,7 +343,9 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
     from . import proposal, rgbd, segmentation
     from . import grasp_geometry as geom
     from .capture import capture_with_camera
-    from .live_executor import PICK_LIFT_MM, TIP_ABOVE_GRIPPER_FRAME_MM, Episode, Robot, grip_failed
+    from .live_executor import PICK_LIFT_MM, TIP_ABOVE_GRIPPER_FRAME_MM, DEFAULT_ARM_SPEED_DEG_S, Episode, Robot, grip_failed
+    # Speeds as in run_flow: slow final approach and slow claw alignment, travel speed restored afterwards.
+    travel_speed = arm_speed if arm_speed is not None else (DEFAULT_ARM_SPEED_DEG_S if (approach_speed or align_speed) else None)
     from .pipeline import candidate_id
     from .placement import TowerTarget, footprint_clearance_mm
     # The SDK builds resource clients only for APIs registered (imported) before connecting; see live_executor.run_flow.
@@ -333,7 +355,7 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
     from viam.services.motion import MotionClient  # noqa: F401
 
     ep = Episode(data_dir, episode_id, operator)
-    client = await _open_client(config, direct_local)
+    client = await _open_client(config, direct_local, disable_sessions=disable_sessions)
     bot = None
     holding = False
     try:
@@ -394,7 +416,12 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
 
         async def move_z_to(tips_above_table, table_z):
             g = await bot.gripper_origin()
-            ok, _ = await bot.move_delta(dz=(table_z + tips_above_table - TIP_ABOVE_GRIPPER_FRAME_MM) - g[2], near_table=True)
+            target_z = table_z + tips_above_table - TIP_ABOVE_GRIPPER_FRAME_MM
+            if target_z < g[2]:
+                ok = await bot.descend_to(target_z, approach_speed, travel_speed)   # slow for the last stretch
+                await bot.set_speed(travel_speed)
+            else:
+                ok, _ = await bot.move_delta(dz=target_z - g[2], near_table=True)
             if not ok:
                 raise LayerCheckError("planner refused the vertical move")
 
@@ -440,8 +467,17 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
             await hover_over(tower_origin)
             ctx_t, _ = await measure("base_find")
             base_blocks = split_scene(_blocks(ctx_t, *size), tower_origin, zone, dims.height_mm)[1]
-        base0 = summarize_layer(base_blocks, dims.height_mm)
-        source0, hint_note = source_from_overview(outside, table_z)
+        base0 = base_layer(base_blocks, dims.height_mm)
+
+        def at_source(blocks):
+            """With a known source spot (the pallet), only blocks within the footprint zone of it count as the source
+            layer; loose heap blocks elsewhere outside the tower zone are not part of it (robot-live-8 18:56: the
+            heap made the overview see 6 and the close-up refuse on a clipped heap block)."""
+            if source_hint_xy is None:
+                return blocks
+            return [b for b in blocks if math.hypot(b["base_point_mm"][0] - source_hint_xy[0], b["base_point_mm"][1] - source_hint_xy[1]) < zone]
+
+        source0, hint_note = source_from_overview(at_source(outside), table_z)
         source0_xy = source0.center_xy if source0 else tuple(source_hint_xy)
         if hint_note:
             print(hint_note)
@@ -457,8 +493,10 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
             ep.event("stack", phase="layers", label=label, tower_layers=n, top_height_mm=round(top.height_above_table_mm, 1),
                      blocks_high=round(blocks_high, 2), expected_layers=expected_layers, layers_stacked=stacked)
             if expected_layers is not None and n != expected_layers:
-                raise LayerCheckError(f"--layers {expected_layers} but the tower measures {n} layer(s) ({label}: top "
-                                      f"{top.height_above_table_mm:.1f} mm = {blocks_high:.2f} blocks); check the tower or the argument")
+                # The measurement wins (operator decision, 30 Oct): --layers is a cross-check that is reported, not enforced.
+                print(f"NOTE: --layers {expected_layers} but the tower measures {n} layer(s) ({label}: top {top.height_above_table_mm:.1f} mm "
+                      f"= {blocks_high:.2f} blocks); using the measurement", flush=True)
+                ep.event("stack", phase="layers_mismatch", label=label, expected_layers=expected_layers, measured_layers=n)
             return n
 
         layers_before = check_layers(base0, "overview")
@@ -477,7 +515,7 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
         await hover_over(base0.center_xy)
         ctx_b, _ = await measure("base_close")
         tolerated = []
-        base = summarize_layer(split_scene(_blocks(ctx_b, *size), tower_origin, zone, dims.height_mm, ignored=tolerated)[1], dims.height_mm)
+        base = base_layer(split_scene(_blocks(ctx_b, *size), tower_origin, zone, dims.height_mm, ignored=tolerated)[1], dims.height_mm)
         if tolerated:
             ep.event("stack", phase="between_level_ignored", label="base_close",
                      heights_mm=[round(b["height_above_table_mm"], 1) for b in tolerated])
@@ -488,7 +526,7 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
         base_view_claws_deg = await bot.close_direction_deg()  # wrist camera: viewpoint includes the claw angle
         await hover_over(source0_xy)
         ctx_s, _ = await measure("source_close")
-        source_blocks = split_scene(_blocks(ctx_s, *size), tower_origin, zone, dims.height_mm)[0]
+        source_blocks = at_source(split_scene(_blocks(ctx_s, *size), tower_origin, zone, dims.height_mm)[0])
         try:
             source = summarize_layer(source_blocks, dims.height_mm)
         except LayerCheckError as exc:
@@ -524,8 +562,9 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
         attempt = 0
         while True:
             attempt += 1
+            await bot.gripper.open()   # always approach with open claws
             await hover_over(source.center_xy)
-            aligned, align_log = await bot.align_claws(plan.claws_close_at_pick_deg, tolerance_deg=1.5)
+            aligned, align_log = await bot.align_claws(plan.claws_close_at_pick_deg, tolerance_deg=1.5, align_speed=align_speed, travel_speed=travel_speed)
             if not aligned:
                 raise LayerCheckError(f"claws did not align for the pick: errors {align_log}")
             await hover_over(source.center_xy)
@@ -569,7 +608,7 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
 
         # 4. Place: over the base, turn the bundle to base + 90, put the *bundle* centre (not the gripper) on target.
         await hover_over(plan.target_center_xy)
-        aligned, align_log = await bot.align_claws(plan.claws_close_at_place_deg, tolerance_deg=1.0)
+        aligned, align_log = await bot.align_claws(plan.claws_close_at_place_deg, tolerance_deg=1.0, align_speed=align_speed, travel_speed=travel_speed)
         if not aligned:
             raise LayerCheckError(f"claws did not align over the tower: errors {align_log}; bundle still held")
         hx, hy, _ = await bot.point_in_world("gripper", x=held[0], y=held[1])
@@ -588,13 +627,13 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
 
         # 5. Verify from the same viewpoint as the base measurement, then record the residual.
         await hover_over(base_view[:2])
-        await bot.align_claws(base_view_claws_deg, tolerance_deg=1.5)
+        await bot.align_claws(base_view_claws_deg, tolerance_deg=1.5, align_speed=align_speed, travel_speed=travel_speed)
         await hover_over(base_view[:2])
         ctx_v, _ = await measure("verify")
         try:
             tolerated = []
             top = split_scene(_blocks(ctx_v, *size), tower_origin, zone, dims.height_mm, ignored=tolerated)[1]
-            measured = summarize_layer(top, dims.height_mm)
+            measured = base_layer(top, dims.height_mm)   # the stacked layer is measured like a tower layer
         except LayerCheckError as exc:
             ep.event("stack", phase="verify_failed", reason=str(exc), observed_outcome="unknown", observation_id=last_obs[0])
             print(f"Verification could not measure the new layer: {exc}. Outcome unknown; inspect by eye.")
@@ -645,7 +684,8 @@ async def run_layer_stack(config, data_dir, operator, episode_id, tower_origin, 
 
 async def run_palletize(config, data_dir, operator, episode_id, tower_origin, pallet_xy, seg_provider, cycles=1, max_blocks=3,
                         direct_local=False, view_pose=None, grip_lower_mm=0.0, tips_floor_mm=None, expected_layers=None,
-                        confirm=input, apply_offset=False, arm_speed=None, arm_accel=None, place_spacing_mm=None, grip_retries=1):
+                        confirm=input, apply_offset=False, arm_speed=None, arm_accel=None, place_spacing_mm=None, grip_retries=1,
+                        references="none", approach_speed=None, push_speed=None, disable_sessions=False, align_speed=None):
     """Full flow, `cycles` times: build a packed three-block layer on the pallet spot from the loose blocks in view
     (live_executor.run_flow: pick one at a time, place back to back, push the row tight and centre it), then grip that
     layer as a bundle and stack it on the tower (run_layer_stack). The tower is a keep-out for the picking stage. The
@@ -668,18 +708,25 @@ async def run_palletize(config, data_dir, operator, episode_id, tower_origin, pa
                  continuing_row=carry)
         print(f"\n=== Cycle {cycle}/{cycles}: assemble a layer on the pallet at ({pallet_xy[0]:.0f}, {pallet_xy[1]:.0f}) from the loose blocks"
               + (f", continuing the row {carry}" if carry else "") + " ===", flush=True)
-        rc = await run_flow(config, data_dir, operator, episode_id, pallet_xy, carry, 0.0, max_blocks, seg_provider,
+        rc = await run_flow(config, data_dir, operator, episode_id, pallet_xy, carry, 0.0, max(max_blocks, BLOCKS_PER_LAYER + 2), seg_provider,
                             arm_speed=arm_speed, arm_accel=arm_accel, grip_lower_mm=grip_lower_mm, tips_floor_mm=tips_floor_mm,
                             keep_out_xy=tower_origin, view_pose=view_pose, direct_local=direct_local, drop_unseen_filled=True,
-                            grip_retries=grip_retries, **({"place_spacing_mm": place_spacing_mm} if place_spacing_mm is not None else {}))
+                            grip_retries=grip_retries, references=references, skip_if_complete=True, layers=1, disable_sessions=disable_sessions,
+                            **({"place_spacing_mm": place_spacing_mm} if place_spacing_mm is not None else {}),
+                            **({"approach_speed": approach_speed} if approach_speed is not None else {}),
+                            **({"push_speed": push_speed} if push_speed is not None else {}),
+                            **({"align_speed": align_speed} if align_speed is not None else {}))
         ep = Episode(data_dir, episode_id, operator)
         filled = [s for s in ep.state.get("filled", []) if s.startswith("L0")]
-        if rc != 0 or len(filled) < BLOCKS_PER_LAYER:
-            ep.state["pallet_incomplete"] = bool(filled)
+        # The pallet count is the measured one from the final capture (falls back to the commanded slots).
+        count = ep.state.get("pallet_count", len(filled))
+        if rc != 0 or count < BLOCKS_PER_LAYER:
+            ep.state["pallet_incomplete"] = count > 0
+            ep.state["filled"] = [f"L0S{i}" for i in range(min(count, BLOCKS_PER_LAYER))]
             ep.save()
-            ep.event("palletize", phase="stop", cycle=cycle, reason="pallet_incomplete", filled=filled, flow_rc=rc)
-            print(f"\nSTOPPED: the pallet has {len(filled)} of {BLOCKS_PER_LAYER} blocks after the assembly stage; nothing stacked. "
-                  + ("Add loose blocks in view and rerun; the row is continued from these slots." if filled else
+            ep.event("palletize", phase="stop", cycle=cycle, reason="pallet_incomplete", measured=count, filled=filled, flow_rc=rc)
+            print(f"\nSTOPPED: the pallet shows {count} of {BLOCKS_PER_LAYER} blocks after the assembly stage; nothing stacked. "
+                  + ("Add loose blocks in view and rerun; the row is continued." if count else
                      "Check the loose blocks (lying flat, clear of each other, in view) and rerun."))
             return 1
         before = Episode(data_dir, episode_id, operator).state.get("layers_stacked", 0)
@@ -687,7 +734,8 @@ async def run_palletize(config, data_dir, operator, episode_id, tower_origin, pa
         rc = await run_layer_stack(config, data_dir, operator, episode_id, tower_origin, seg_provider, direct_local=direct_local,
                                    apply_offset=apply_offset, confirm=confirm, view_pose=view_pose, grip_lower_mm=grip_lower_mm,
                                    source_hint_xy=pallet_xy, tips_floor_mm=tips_floor_mm, expected_layers=expected_layers,
-                                   grip_retries=grip_retries)
+                                   grip_retries=grip_retries, disable_sessions=disable_sessions,
+                                   arm_speed=arm_speed, approach_speed=approach_speed, align_speed=align_speed)
         state = Episode(data_dir, episode_id, operator).state
         if state.get("layers_stacked", 0) <= before:
             ep.event("palletize", phase="stop", cycle=cycle, reason="stack_not_verified", stack_rc=rc)

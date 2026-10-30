@@ -36,6 +36,20 @@ class SummarizeLayer(unittest.TestCase):
         self.assertEqual(pose.level, 0)
         self.assertTrue(all(abs(s - 25) < 1e-6 for s in pose.spacing_mm))
 
+    def test_tower_top_layer_tolerates_settled_spacing(self):
+        # robot-live-8 18:50: tower top measured at x 575.3 / 550.4 / 522.1 (pitch 24.9, 28.3) and the run refused to stack
+        base = layer((549, -7), -89.5, level=1)
+        base[0]["base_point_mm"] = (575.3, -7.0, 0.0)
+        base[1]["base_point_mm"] = (550.4, -5.4, 0.0)
+        base[2]["base_point_mm"] = (522.1, -9.2, 0.0)
+        with self.assertRaisesRegex(ls.LayerCheckError, "gaps or overlaps"):
+            ls.summarize_layer(base)                      # not tight enough to be gripped as a bundle
+        pose = ls.base_layer(base)                        # fine as the thing to stack onto
+        self.assertEqual(pose.level, 1)
+        self.assertAlmostEqual(pose.center_xy[0], (575.3 + 550.4 + 522.1) / 3, places=6)
+        with self.assertRaisesRegex(ls.LayerCheckError, "gaps or overlaps"):
+            ls.base_layer(layer((0, 0), 0, pitch=36))      # a real gap is still refused
+
     def test_angle_wraps_across_plus_minus_90(self):
         blocks = layer((0, 0), 89.0)
         blocks[0]["base_long_side_deg"] = -89.0  # same physical direction
@@ -207,6 +221,53 @@ class LiftCheck(unittest.TestCase):
         self.assertEqual(ls.blocks_left_behind(src, layer((448, 201), 6.8)), 0)
         held = [dict(b, height_above_table_mm=110.0) for b in layer((570, 213), 2.5)]   # bundle in the air is not on the table
         self.assertEqual(ls.blocks_left_behind(src, held), 0)
+
+
+class RowPush(unittest.TestCase):
+    def test_single_direction_push_closes_gaps_and_centres_in_one_stroke(self):
+        from robot_hackathon.live_executor import row_push_plan
+        # Row along +y, (ax, ay) = (0, 1). Nominal anchor for a 3 x 25 mm row centred on y 195 is 170; it was released
+        # 8 mm past that toward the open end (178) and the next two 39 mm apart (14 mm release spacing).
+        pts = [(440, 178), (440, 217), (440, 256)]          # 14 mm release spacing: pitch 39
+        plan = row_push_plan(pts, (440, 195), 0.0, 1.0, 25.0)
+        self.assertAlmostEqual(plan["gaps_mm"], 28.0)
+        # closed row centre = anchor + 25 = 203 -> must move 8 mm toward the anchor (-a): pushable
+        self.assertAlmostEqual(plan["shift_mm"], 8.0)
+        self.assertAlmostEqual(plan["unpushable_mm"], 0.0)
+        # a row whose anchor sits short of nominal cannot be fixed by pushing toward the anchor
+        plan = row_push_plan([(440, 160), (440, 185), (440, 210)], (440, 195), 0.0, 1.0, 25.0)
+        self.assertAlmostEqual(plan["gaps_mm"], 0.0)
+        self.assertAlmostEqual(plan["shift_mm"], 0.0)
+        self.assertAlmostEqual(plan["unpushable_mm"], 10.0)
+        self.assertEqual(row_push_plan([], (440, 195), 0.0, 1.0, 25.0)["gaps_mm"], 0.0)
+
+
+class ReleaseSpacing(unittest.TestCase):
+    def test_across_grasps_leave_the_claw_sweep_next_to_a_neighbour(self):
+        from robot_hackathon.live_executor import release_spacing_mm
+        from robot_hackathon.grasp_geometry import FingerGeometry
+        finger = FingerGeometry(open_gap_mm=104.0, claw_thickness_mm=8.0, finger_width_mm=45.0, margin_mm=5.0)
+        # robot-live-8: blocks released 39 mm apart with a middle grasp dragged the neighbour 16-30 mm when the claws opened
+        self.assertAlmostEqual(release_spacing_mm("middle", finger, 25.0, 14.0), (104 - 25) / 2 + 8 + 5)   # 52.5
+        self.assertAlmostEqual(release_spacing_mm("side", finger, 25.0, 14.0), 52.5)
+        self.assertAlmostEqual(release_spacing_mm("ends", finger, 25.0, 14.0), 14.0)
+
+
+class RowAlign(unittest.TestCase):
+    def test_blocks_sticking_out_along_their_length_are_listed_largest_first(self):
+        from robot_hackathon.live_executor import row_align_plan
+        # row along +y, blocks' long sides along +x (long_deg 0); the middle block sits 7 mm further along +x
+        pts = [(440, 170), (447, 195), (438, 220)]
+        plan = row_align_plan(pts, 0.0, 5.0)
+        self.assertEqual([(i, round(o, 1)) for i, o in plan], [(1, 7.0)])
+        self.assertEqual(row_align_plan([(440, 170), (443, 195), (438, 220)], 0.0, 5.0), [])   # within 5 mm
+        # long sides along +y (row runs along x): offsets measured along y
+        plan = row_align_plan([(440, 195), (465, 195), (490, 232)], 90.0, 5.0)
+        self.assertEqual([(i, round(o, 1)) for i, o in plan], [(2, 37.0)])
+        # the photo of 11:33: three blocks each shifted ~18 mm further along their length than the previous one
+        plan = row_align_plan([(440, 170), (458, 195), (476, 220)], 0.0, 5.0)
+        self.assertEqual([(i, round(o, 1)) for i, o in plan], [(0, -18.0), (2, 18.0)])
+        self.assertEqual(row_align_plan([(440, 170)], 0.0, 5.0), [])
 
 
 class GripReport(unittest.TestCase):

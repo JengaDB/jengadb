@@ -13,7 +13,11 @@ def main(argv=None):
     parser.add_argument("command", nargs="?", default="mock-demo",
                         choices=("mock-demo", "report", "viam-check", "mongo-ping", "mongo-index", "flush", "live-step", "live-run", "layer-stack", "palletize") + rgbd_cli.COMMANDS + agent_cli.COMMANDS)
     parser.add_argument("--cycles", type=int, default=1, help="palletize: how many layers to build and stack in one go")
-    parser.add_argument("--place-spacing-mm", type=float, default=10.0, help="live-run/palletize: extra pitch between consecutive pallet blocks at release; the push rounds close it")
+    parser.add_argument("--place-spacing-mm", type=float, default=14.0, help="live-run/palletize: extra pitch between consecutive pallet blocks at release; the single-direction push closes it")
+    parser.add_argument("--no-sessions", action="store_true", help="live-run/layer-stack/palletize: disable Viam sessions (a missed heartbeat ended runs with SESSION_EXPIRED); a dropped connection then no longer stops a move already executing: the e-stop does")
+    parser.add_argument("--align-speed", type=float, default=45.0, help="live-run/layer-stack/palletize: joint speed (deg/s) for the wrist rotations that align the claws")
+    parser.add_argument("--approach-speed", type=float, default=40.0, help="live-run/palletize: joint speed (deg/s) for the last 40 mm of every descent to the table")
+    parser.add_argument("--push-speed", type=float, default=30.0, help="live-run/palletize: joint speed (deg/s) while pushing the pallet row together")
     parser.add_argument("--grip-retries", type=int, default=1, help="live-run/layer-stack/palletize: repeat the pick movement this many times when the gripper reports an empty grip (grab false, not holding, or opening <= 0.5 mm)")
     parser.add_argument("--max-blocks", type=int, default=3, help="live-run: blocks to place in this run")
     parser.add_argument("--arm-speed", type=float, default=None, help="live-run/live-step: arm joint speed to request via do_command (deg/s)")
@@ -83,14 +87,18 @@ def main(argv=None):
                                                      grip_lower_mm=args.grip_lower_mm, tips_floor_mm=args.tips_floor_mm, expected_layers=args.layers,
                                                      confirm=(lambda msg: print(msg + "[--no-pause: continuing]", flush=True)) if args.no_pause else input,
                                                      apply_offset=args.apply_offset, arm_speed=args.arm_speed, arm_accel=args.arm_accel,
-                                                     place_spacing_mm=args.place_spacing_mm, grip_retries=args.grip_retries))
+                                                     place_spacing_mm=args.place_spacing_mm, grip_retries=args.grip_retries,
+                                                     references=args.references or "none", approach_speed=args.approach_speed,
+                                                     push_speed=args.push_speed, disable_sessions=args.no_sessions, align_speed=args.align_speed))
                 return asyncio.run(run_layer_stack(config, args.data_dir, args.operator, args.episode, origin,
                                                    MetaSam3Provider(config, allow_cloud=True), direct_local=args.direct_local,
                                                    apply_offset=args.apply_offset, plan_only=args.plan_only, grip_lower_mm=args.grip_lower_mm,
                                                    confirm=(lambda msg: print(msg + "[--no-pause: continuing]", flush=True)) if args.no_pause else input,
                                                    view_pose=[float(v) for v in args.view.split(",")] if args.view else None,
                                                    source_hint_xy=_parse_xy(args.source) if args.source else None,
-                                                   tips_floor_mm=args.tips_floor_mm, expected_layers=args.layers, grip_retries=args.grip_retries))
+                                                   tips_floor_mm=args.tips_floor_mm, expected_layers=args.layers, grip_retries=args.grip_retries,
+                                                   disable_sessions=args.no_sessions, arm_speed=args.arm_speed, approach_speed=args.approach_speed,
+                                                   align_speed=args.align_speed))
             except ConfigError:
                 raise
             except Exception as exc:  # noqa: BLE001 - verbatim robot/planner error for the operator; carries no secrets
@@ -115,7 +123,9 @@ def main(argv=None):
                                                 keep_out_xy=_parse_xy(args.keep_out) if args.keep_out else None,
                                                 view_pose=[float(v) for v in args.view.split(",")] if args.view else None,
                                                 direct_local=args.direct_local, place_spacing_mm=args.place_spacing_mm,
-                                                grip_retries=args.grip_retries))
+                                                grip_retries=args.grip_retries, references=args.references or "none",
+                                                approach_speed=args.approach_speed, push_speed=args.push_speed,
+                                                disable_sessions=args.no_sessions, align_speed=args.align_speed))
                 return asyncio.run(run_step(config, args.data_dir, args.step, args.operator, args.episode, args.decision, args.table_z,
                                             args.push_distance))
             except ConfigError:

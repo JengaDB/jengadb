@@ -18,8 +18,9 @@ def _intrinsics(props):
     return {k: getattr(intr, k, None) for k in ("width_px", "height_px", "focal_x_px", "focal_y_px", "center_x_px", "center_y_px")}
 
 
-async def open_client(config):
-    """Read-only connection to the machine (robot address with API key, or local viam-server without one)."""
+async def open_client(config, disable_sessions=False):
+    """Connection to the machine (robot address with API key, or local viam-server without one). Sessions are on
+    unless the operator disables them (see layer_stack._open_client for the trade-off)."""
     config.require_viam()
     from viam.robot.client import RobotClient
     if config.machine_auth == "none":
@@ -27,6 +28,10 @@ async def open_client(config):
         options = RobotClient.Options(dial_options=DialOptions(insecure=True, disable_webrtc=True))
     else:
         options = RobotClient.Options.with_api_key(api_key=config.key, api_key_id=config.key_id)
+    if disable_sessions:
+        options.disable_sessions = True
+        options.check_connection_interval = 0   # no 1 s connectivity probe that a busy server can miss
+        options.attempt_reconnect_interval = 0
     return await asyncio.wait_for(RobotClient.at_address(config.address, options), timeout=15)
 
 

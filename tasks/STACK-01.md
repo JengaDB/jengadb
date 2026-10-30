@@ -130,6 +130,69 @@ local/layer-stack-data/live/episodes/):
   layer-stack. This is a deliberate, operator-requested, bounded exception to the "no automatic motion retry" rule;
   the gripper report fields the robot's gripper module actually returns are unknown until the first live run (the
   event `grab` records `gripper.source`).
+- Operator requests (10:58-10:59), all in run_flow unless noted: release spacing 14 mm (`PLACE_SPACING_MM`); the row
+  push is one direction only (from the open end toward the anchor block) and one stroke closes the gaps and centres
+  the row (`row_push_plan`); the anchor is released `ROW_PRE_OFFSET_MM` = 8 past nominal toward the open end so the
+  centring shift is in the pushable direction, an off-centre the other way is reported, not pushed; pushes run at
+  `--push-speed` (30 deg/s) and the last `APPROACH_MM` = 40 of every descent at `--approach-speed` (40 deg/s), travel
+  speed restored afterwards (`--arm-speed`, else 180 as used on 30 Oct, announced); grasp order for a slot is taken
+  from a target with the release spacing as gap, so middle/side grasps remain allowed next to a placed neighbour
+  (`spaced_target`); `--layers` mismatch is reported and the measurement used (layer_stack `layers_mismatch`);
+  the pallet count is measured (`reconcile_pallet` at start and after each rescan, `pallet_count` from the final
+  capture) and palletize gates on that count; `--references local|atlas` embeds the eligible heap candidates'
+  context cutouts (hosted Voyage, image-only) and ranks curated look-alikes first via the SKY-66 retrieval
+  (`retrieval` event). Untested live as of this note; speed keys are the xArm module's `set_speed`.
+- 11:15: palletize's pallet target is now a one-layer target (`layers=1`): a full row means `layer_already_complete`
+  and the assembly stage returns after its first capture (no push rounds, no extra captures) so the stacking stage
+  runs at once; previously a full row would have opened slot L1S0 on top of the pallet.
+- 11:19: every pick attempt opens the gripper first (after a push the claws are closed). Multi-height heap: the
+  tips floor is now relative to the surface a block rests on (`resting_level_mm` = rounded whole levels under the
+  top; `grip_tips_mm(..., block_thickness_mm)`), so the operator's deep grip (depth 28, floor -6) gives tips -6 for
+  a table block and +9 for a block lying on another, never through the lower block; the claw-clearance strips are
+  checked down to those tips, so a lower block under the claws makes that grasp ineligible (side/ends may still be
+  clear). run_flow applies grip depth and floor through the calibration bundle's GraspParams, so eligibility and
+  the commanded descent agree, and takes the heap from the top (higher resting level first). 1 test added.
+- 11:24 palletize on a real heap (obs_5533b073025c47a2; tower "2" meanwhile reduced to 2 layers): 4 heap blocks
+  detected (three on the table, one lying across two of them at 29 mm), every grasp `fingers_blocked`: the claw
+  strips (47-65 mm from the centre) land on neighbours 13-14 mm high while the tips were to go to -6 / +9. Also
+  Atlas retrieval ran (3 embedded per capture, all `no_match`: no curated pickable references in the index yet).
+  Fix: `claw_obstruction` distinguishes a hard obstruction (higher than block top - MIN_GRIP_DEPTH_MM 8) from a low
+  neighbour the claws may stop on: the latter keeps the grasp eligible with `tips_raised_over_neighbour` (tips =
+  p90 of the obstruction + 2 mm). The bridge block becomes pickable at tips 16 (13 mm grip); a table block beside
+  a 26 mm stack stays blocked. The release height now subtracts the block's resting level (a block picked from on
+  top of another hangs tips - resting below the tips). 1 test added.
+- 11:32 (photo: pallet row with ends staggered ~18 mm per block): end alignment added to the push stage.
+  `row_align_plan` lists blocks whose centre along the row's long axis is more than ROW_ALIGN_TOLERANCE_MM (5) from
+  the row median; `push_block_end` sets closed claws (closing along the length, faces square to the push) just beyond
+  the protruding end and slides the block back by the offset minus 1 mm at push speed. One block per round after
+  gaps/centre are satisfied, ROW_PUSH_ROUNDS = 5 in total. 1 test added.
+- 11:36 palletize: three heap blocks picked and placed (one off another block at raised tips 17.1; gripper width via
+  `is_holding_something.meta.position`, ~220 for a held block, ~730 for an ends grip). Then: (a) blocks released with
+  an across grasp 39 mm from the neighbour were dragged 16-30 mm when the claws opened (claw sweep ~40 mm/side);
+  (b) a 60 mm constrained push ended in "Lost connection" (SDK probe: ResourceNames with 1 s deadline, missed while
+  the server planned). 11:43 rerun: three placed, then SESSION_EXPIRED at layer_complete. Fixes: across-grasp
+  release spacing = (open_gap - width)/2 + claw + margin = 52.5 mm (`release_spacing_mm`), ends grasp keeps 14;
+  pushes in <= 25 mm segments; a complete-but-loose row on rerun goes through the push rounds; `--no-sessions`
+  disables Viam sessions and the 1 s connectivity probe (operator decision; a dropped connection then no longer
+  stops an executing move); Voyage embeddings run off the event loop; `--align-speed` (45 deg/s) for the claw
+  alignment rotations and the slow final approach also in layer-stack. 1 test added.
+- 18:48-18:50 palletize, FIRST COMPLETE ASSEMBLY STAGE: three heap blocks picked (bridge block at raised tips 19.9,
+  then ends grasps; one rescan), released 39/38 mm apart, one 40 mm push (segments) closed the row to gaps 0.0 and
+  centre offset 2.1 mm, ends aligned, final count 3. Stacking stage then refused at the overview: tower top layer
+  pitch 24.9 / 28.3 mm against the 22-28 bundle window. Fix: `base_layer()` measures the tower's top (and the
+  stacked layer at verification) with BASE_SPACING_RANGE_MM 20-33 and BASE_MIN_SHARED_CONTACT_MM 40; the bundle on
+  the pallet keeps the strict window. 1 test added.
+- 18:53-18:56 palletize: assembly stage complete again (3 picked, one rescan, one 34 mm push -> gaps 1.7, centre
+  4.5 mm off toward the anchor, count 3). Stacking stage: the source search took every block outside the tower zone,
+  so the remaining heap counted as part of the source (overview "saw 6", fell back to --source; close-up refused on
+  a clipped heap block). Fix: with a source spot given, only blocks within the footprint zone of it are the source
+  layer (`at_source`), overview and close-up.
+- 12:01 operator request: the pallet must always end with three. run_flow restructured into `pick_phase` and
+  `push_phase` inside a fill loop (MAX_FILL_ROUNDS = 3): after the push rounds the measured count is checked; if it is
+  short (a block dropped in transit, knocked out, failed grasp with the gripper report), the pallet is re-measured,
+  the slots re-derived from what is there and another block fetched, within the placement budget (palletize allows
+  BLOCKS_PER_LAYER + 2 placements). Hard stops (planner refusal, grab failure after retries, no candidate after
+  rescans) still end the stage.
 
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot
 complete until it is changed; table height and camera offset are unverified; `--grip-lower-mm 3` is a single-run fix,

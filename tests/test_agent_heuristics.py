@@ -6,6 +6,7 @@ calibration blocking proposals, a similar-looking block rejected for blocked fin
 selection validator, deterministic abstention and the OpenAI tool loop with a fake transport.
 Geometry tests need numpy/Pillow (RGBD_TESTS_REQUIRED=1 fails instead of skipping).
 """
+import dataclasses
 import json
 import math
 import os
@@ -290,6 +291,41 @@ class GeometryTests(unittest.TestCase):
         narrow = geom.CalibrationBundle(calib.intrinsics, calib.extrinsics, calib.support_surface, geom.FingerGeometry(open_gap_mm=80, verified=True),
                                         calib.block, True, "v", "s", calib.workspace)
         self.assertIn("gripper_too_narrow_for_ends", geom.evaluate_grasps(free, hm, narrow)[3]["reasons"])
+
+    def test_grip_tips_floor_follows_the_block_resting_level(self):
+        # Heap with blocks on blocks (30 Oct): the operator's deep grip (depth 28, floor -6) must not drive the claws
+        # through the block underneath. The floor is relative to the surface the block rests on.
+        deep = geom.GraspParams(grasp_depth_mm=28.0, tips_min_mm=-6.0)
+        self.assertEqual(geom.resting_level_mm(14.2, 15.0), 0.0)
+        self.assertEqual(geom.resting_level_mm(29.3, 15.0), 15.0)
+        self.assertEqual(geom.resting_level_mm(44.0, 15.0), 30.0)
+        self.assertEqual(geom.resting_level_mm(29.3, None), 0.0)
+        self.assertAlmostEqual(geom.grip_tips_mm(14.2, geom.ACROSS, deep, 15.0), -6.0)          # on the table: as before
+        self.assertAlmostEqual(geom.grip_tips_mm(29.3, geom.ACROSS, deep, 15.0), 15.0 - 6.0)    # on another block
+        self.assertAlmostEqual(geom.grip_tips_mm(29.3, geom.ACROSS, deep), 1.3)                 # without thickness: old behaviour
+        shallow = geom.GraspParams()
+        self.assertAlmostEqual(geom.grip_tips_mm(29.3, geom.ACROSS, shallow, 15.0), 21.3)        # depth rules when it is above the floor
+
+    def test_claws_may_stop_on_a_low_neighbour_when_enough_block_remains_to_grip(self):
+        # Heap capture obs_5533b073025c47a2 (30 Oct): a block lying across two others (top 29 mm) had every grasp
+        # refused because the claw strips land on the lower blocks (14 mm) while the tips were asked to go to 9 mm.
+        depth, masks, truth, calib, plane, hm = self.scene("separated")
+        hm = np.zeros_like(hm)                      # flat table everywhere
+        est = geom.BlockEstimate(0, None, pixel_center=(160.0, 120.0), image_angle_deg=0.0, depth_mm=435.0, height_above_table_mm=29.0,
+                                 valid_fraction=1.0, pixels=400, mm_per_px=435.0 / 228.0, length_mm=75.0, width_mm=25.0)
+        deep = dataclasses.replace(calib, grasp=geom.GraspParams(grasp_depth_mm=28.0, tips_min_mm=-6.0))
+        hm[:, :] = 14.0                             # lower blocks everywhere under the strips
+        hm[108:132, 120:200] = 29.0                 # the block itself
+        grasps = geom.evaluate_grasps(est, hm, deep)
+        middle = grasps[0]
+        self.assertTrue(middle["eligible"], middle)
+        self.assertTrue(middle.get("tips_raised_over_neighbour"))
+        self.assertAlmostEqual(middle["tips_above_table_mm"], 14.0 + 2.0)   # stop just above the neighbour, 13 mm of grip left
+        # a table block (top 12) beside a stacked one (26 mm) stays blocked: fewer than 8 mm would remain
+        low = dataclasses.replace(est, height_above_table_mm=12.3)
+        hm[:, :] = 26.0
+        hm[108:132, 120:200] = 12.3
+        self.assertTrue(all(not g["eligible"] and g["reasons"] == ["fingers_blocked"] for g in geom.evaluate_grasps(low, hm, deep)))
 
     def test_floor_past_the_table_edge_does_not_skew_the_plane(self):
         # 30 Oct, overview from flange z 650 (obs_b174ec2236ec429a): the left 15% of the image was the floor at ~1400 mm
