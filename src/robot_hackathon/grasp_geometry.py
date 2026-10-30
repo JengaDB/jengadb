@@ -678,6 +678,14 @@ def lying_flat_reasons(geometry, tilt_deg, dims, max_tilt_deg=REORIENT_TILT_DEG)
     return reasons
 
 
+def standing_on_end(geometry, dims):
+    """A block standing upright on its end: about one block length tall, with only its small end face (25 x 15 mm)
+    visible from above. Such a block is rejected for picking (implausible height and length); it is knocked over."""
+    h, length, width = geometry.get("height_above_table_mm"), geometry.get("length_mm"), geometry.get("width_mm")
+    return (h is not None and 0.7 * dims.length_mm <= h <= 1.2 * dims.length_mm and length is not None
+            and length <= 0.6 * dims.length_mm and (width is None or width <= 1.3 * dims.width_mm))
+
+
 def misplaced_on_pallet_reasons(geometry, tilt_deg, dims, max_tilt_deg=REORIENT_TILT_DEG):
     """A pallet block that must be taken off and laid flat again: not one block thick (on a neighbour, on its edge),
     standing on its edge, or tilted. Only positive evidence counts here: pallet blocks touch, so their masks can be

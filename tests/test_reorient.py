@@ -95,5 +95,47 @@ class Reasons(unittest.TestCase):
         self.assertIn("on_edge", geom.misplaced_on_pallet_reasons(flat_geometry(height_above_table_mm=25.0, flags=["possibly_on_edge"]), 0.5, self.dims))
 
 
+
+class StandingOnEnd(unittest.TestCase):
+    dims = geom.BlockDimensions()
+
+    def test_recognises_only_an_upright_block(self):
+        self.assertTrue(geom.standing_on_end({"height_above_table_mm": 74.0, "length_mm": 24.0, "width_mm": 14.0}, self.dims))
+        self.assertTrue(geom.standing_on_end({"height_above_table_mm": 60.3, "length_mm": 27.0, "width_mm": 16.0}, self.dims))
+        # a tower top (layers of long blocks) and flat or on-edge blocks are not standing blocks
+        self.assertFalse(geom.standing_on_end({"height_above_table_mm": 59.0, "length_mm": 73.0, "width_mm": 24.0}, self.dims))
+        self.assertFalse(geom.standing_on_end({"height_above_table_mm": 15.0, "length_mm": 74.0, "width_mm": 24.0}, self.dims))
+        self.assertFalse(geom.standing_on_end({"height_above_table_mm": 25.0, "length_mm": 74.0, "width_mm": 14.0}, self.dims))
+        self.assertFalse(geom.standing_on_end({"height_above_table_mm": None, "length_mm": 24.0, "width_mm": 14.0}, self.dims))
+
+
+class KnockPlan(unittest.TestCase):
+    dims = geom.BlockDimensions()
+
+    def plan(self, others=(), avoid=(), forbidden=None):
+        from robot_hackathon.live_executor import knock_plan
+        # end face's long side (25 mm) along x: the thin 15 mm side faces +y/-y
+        return knock_plan((350.0, 0.0), 0.0, list(others), list(avoid), self.dims, forbidden=forbidden)
+
+    def test_prefers_tipping_onto_the_wide_face_with_room(self):
+        from robot_hackathon.live_executor import PUSH_START_GAP_MM, KNOCK_PAST_MM
+        plan = self.plan(others=[(350.0, 70.0)])                      # a block lies where a +y fall would land
+        self.assertEqual(plan["onto"], "wide_face")
+        self.assertAlmostEqual(plan["u_deg"], 270.0)                   # falls toward -y, away from it
+        self.assertAlmostEqual(plan["landing_xy"][1], -(7.5 + 37.5))
+        self.assertAlmostEqual(plan["start_xy"][1], 7.5 + 8.0 + PUSH_START_GAP_MM)   # claws start on the far side
+        self.assertAlmostEqual(plan["distance_mm"], PUSH_START_GAP_MM + 7.5 + KNOCK_PAST_MM)
+
+    def test_falls_back_to_the_edge_then_gives_up(self):
+        blocked_y = [(350.0, 50.0), (350.0, -50.0)]
+        plan = self.plan(others=blocked_y)
+        self.assertEqual(plan["onto"], "edge")                          # along x instead; the drop step lays it flat later
+        self.assertIn(round(plan["u_deg"]), (0, 180))
+        self.assertIsNone(self.plan(others=blocked_y + [(400.0, 0.0), (300.0, 0.0)]))
+        # the tower's keep-out and the pallet lane count as occupied too
+        self.assertIsNone(self.plan(avoid=[((350.0, 0.0), 120.0)]))
+        self.assertIsNone(self.plan(forbidden=lambda xy: True))
+
+
 if __name__ == "__main__":
     unittest.main()

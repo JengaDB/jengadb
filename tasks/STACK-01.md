@@ -258,6 +258,20 @@ local/layer-stack-data/live/episodes/):
   that is one 15.4 mm stroke instead of two pushes. Harness: two blocks 8 and 12 mm out lined up within 2 mm in one
   stroke (the simulated claw face now pushes every block it covers). Untested live.
 
+- Knock-over (operator request, 30 Oct; `--knock-over`, live-run and palletize): a block standing on its end (about
+  one block length tall with only its 25 x 15 end face visible; `standing_on_end`) is rejected for picking, so when
+  a capture has nothing pickable the flow pushes it over: closed claws at KNOCK_TIPS_MM 45 above the table, from the
+  far side, KNOCK_PAST_MM 30 past contact. `knock_plan` prefers pushing across the thin 15 mm side (it tips onto its
+  wide face and lies flat), then across the 25 mm side (lands on its edge; the drop step lays it flat later); the
+  landing spot must have no other block centre within 55 mm and lie outside the tower/pallet/keep-out/drop spot
+  and the pallet lane, and nothing may lie within 30 mm of where the claws come down; otherwise the block is left
+  (`knock_not_possible`). A fresh capture checks it fell (`knock_check`); MAX_KNOCKS 2 per run, then stop. Tests:
+  standing detection (a 59 mm tower top with a 73 mm top is not a standing block), knock_plan direction choice and
+  refusals, and a harness run (standing block rendered separately, camera resolution doubled so the end face
+  clears the 200 px mask minimum) where it is knocked onto its wide face (lands 14.9 mm high) and then picked to a
+  full pallet. Untested live: the real topple, the knock height and whether a SAM mask of a standing block's end
+  face gives a usable height on the D435.
+
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot
 complete until it is changed; table height and camera offset are unverified; `--grip-lower-mm 3` is a single-run fix,
 not a calibration; source and base must be reachable (x <= ~600 mm worked) and both visible from the view pose.

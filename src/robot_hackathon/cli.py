@@ -32,6 +32,7 @@ def main(argv=None):
     parser.add_argument("--no-pause", action="store_true", help="layer-stack: do not wait for Enter; every check still stops the run. Someone stays at the e-stop")
     parser.add_argument("--grip-lower-mm", type=float, default=0.0, help="layer-stack/live-run: grip this much deeper than the default 8 mm below the block top (limited by the tips floor)")
     parser.add_argument("--drop-spot", default=None, help="live-run/palletize: 'x,y' mm (world) of a clear table spot; a tilted or on-edge heap block is dropped there from a short height to lie flat before it is placed")
+    parser.add_argument("--knock-over", action="store_true", help="live-run/palletize: when no block can be picked, push a block standing on its end over so it falls flat onto clear table")
     parser.add_argument("--keep-out", default=None, help="live-run: 'x,y' mm (world) of a tower that must not be picked from; blocks within the footprint clearance of it are skipped")
     parser.add_argument("--layers", type=int, default=None, help="layer-stack: layers already on the tower; the measured count (top height / block height) must agree")
     parser.add_argument("--tips-floor-mm", type=float, default=None, help="layer-stack/live-run: lowest claw-tip height above the calibrated table for the pick (default 1.0; down to -6.0 when the calibrated table z is known to sit above the real surface)")
@@ -91,7 +92,8 @@ def main(argv=None):
                                                      place_spacing_mm=args.place_spacing_mm, grip_retries=args.grip_retries,
                                                      references=args.references or "none", approach_speed=args.approach_speed,
                                                      push_speed=args.push_speed, disable_sessions=args.no_sessions, align_speed=args.align_speed,
-                                                     drop_spot_xy=_parse_xy(args.drop_spot) if args.drop_spot else None))
+                                                     drop_spot_xy=_parse_xy(args.drop_spot) if args.drop_spot else None,
+                                                     knock_over=args.knock_over))
                 return asyncio.run(run_layer_stack(config, args.data_dir, args.operator, args.episode, origin,
                                                    MetaSam3Provider(config, allow_cloud=True), direct_local=args.direct_local,
                                                    apply_offset=args.apply_offset, plan_only=args.plan_only, grip_lower_mm=args.grip_lower_mm,
@@ -128,7 +130,8 @@ def main(argv=None):
                                                 grip_retries=args.grip_retries, references=args.references or "none",
                                                 approach_speed=args.approach_speed, push_speed=args.push_speed,
                                                 disable_sessions=args.no_sessions, align_speed=args.align_speed,
-                                                drop_spot_xy=_parse_xy(args.drop_spot) if args.drop_spot else None))
+                                                drop_spot_xy=_parse_xy(args.drop_spot) if args.drop_spot else None,
+                                                knock_over=args.knock_over))
                 return asyncio.run(run_step(config, args.data_dir, args.step, args.operator, args.episode, args.decision, args.table_z,
                                             args.push_distance))
             except ConfigError:

@@ -36,6 +36,10 @@ DROP_HEIGHT_MM = 25.0             # a block to be laid flat is released with its
 DROP_CLEAR_MM = 60.0              # nothing else may lie within this of the drop spot (a 75 mm block landing any way round)
 DROP_FIND_MM = 70.0               # after the drop, the block is looked for within this of the spot
 MAX_REORIENT_DROPS = 2            # drops per run before the flow stops and asks the operator to lay the block flat
+KNOCK_TIPS_MM = 45.0              # closed claw tips this far above the table push a standing (75 mm) block over
+KNOCK_PAST_MM = 30.0              # stroke past first contact: the top must move ~15 mm before a 15 mm-thick block tips
+KNOCK_CLEAR_MM = 55.0             # no other block centre within this of where the knocked block lands
+MAX_KNOCKS = 2                    # knock-overs per run before the flow stops and asks the operator
 PUSH_EXTRA_MM = 8.0               # shove past the point where the gaps have closed
 ADJACENT_CLEARANCE_MM = 1.5       # placing exactly one pitch away nudged the neighbour; leave this much and push later
 MAX_RESCANS = 2                   # consecutive re-captures without a placement before the flow gives up on the layer
@@ -83,6 +87,39 @@ def row_push_plan(points, origin_xy, ax, ay, block_width_mm):
     closed_centre = (points[0][0] + (len(points) - 1) / 2 * w * ax, points[0][1] + (len(points) - 1) / 2 * w * ay)
     after_close = (origin_xy[0] - closed_centre[0]) * ax + (origin_xy[1] - closed_centre[1]) * ay
     return {"gaps_mm": gaps, "offset_mm": offset, "shift_mm": max(0.0, -after_close), "unpushable_mm": max(0.0, after_close)}
+
+
+def knock_plan(block_xy, top_long_deg, others_xy, avoid, dims, forbidden=None, clear_mm=KNOCK_CLEAR_MM):
+    """Push direction that topples a block standing on its end onto clear table (operator request, 30 Oct). Its end
+    face is width x height (25 x 15): pushing across the thin 15 mm side tips it over the 25 mm edge onto its wide face
+    (lies flat), so those two directions come first; across the 25 mm side it lands on its edge (the drop step then
+    lays it flat). A direction is usable when the landing centre (half the footprint plus half the length beyond the
+    block) has no other block centre within clear_mm, lies outside every (centre, radius) in avoid and is not
+    forbidden(xy), and nothing lies within 30 mm of where the closed claws come down. Among usable directions of the
+    better kind, the one with the most room wins. Returns {u_deg, start_xy, distance_mm, landing_xy, onto} or None."""
+    def room(xy):
+        d = [math.dist(xy, o) for o in others_xy] + [math.dist(xy, c) - r for c, r in avoid]
+        return min(d) if d else float("inf")
+    for onto, base_deg, half in (("wide_face", top_long_deg + 90.0, dims.height_mm / 2), ("edge", top_long_deg, dims.width_mm / 2)):
+        best = None
+        for u_deg in (base_deg, base_deg + 180.0):
+            ux, uy = math.cos(math.radians(u_deg)), math.sin(math.radians(u_deg))
+            landing = (block_xy[0] + ux * (half + dims.length_mm / 2), block_xy[1] + uy * (half + dims.length_mm / 2))
+            back = half + CLAW_THICKNESS_MM + PUSH_START_GAP_MM
+            start = (block_xy[0] - ux * back, block_xy[1] - uy * back)
+            if any(math.dist(landing, o) < clear_mm for o in others_xy) or any(math.dist(landing, c) < r for c, r in avoid):
+                continue
+            if forbidden is not None and forbidden(landing):
+                continue
+            if any(math.dist(start, o) < 30.0 for o in others_xy):
+                continue
+            plan = {"u_deg": u_deg % 360.0, "start_xy": start, "distance_mm": PUSH_START_GAP_MM + half + KNOCK_PAST_MM,
+                    "landing_xy": landing, "onto": onto, "room_mm": room(landing)}
+            if best is None or plan["room_mm"] > best["room_mm"]:
+                best = plan
+        if best is not None:
+            return best
+    return None
 
 
 def row_align_push(points, long_deg, tolerance_mm, origin_xy, block_width_mm=25.0):
@@ -328,7 +365,7 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                    keep_out_xy=None, view_pose=None, direct_local=False, drop_unseen_filled=False,
                    place_spacing_mm=PLACE_SPACING_MM, grip_retries=1, references="none", approach_speed=DEFAULT_APPROACH_SPEED_DEG_S,
                    push_speed=DEFAULT_PUSH_SPEED_DEG_S, skip_if_complete=False, layers=2, disable_sessions=False,
-                   align_speed=DEFAULT_ALIGN_SPEED_DEG_S, drop_spot_xy=None):
+                   align_speed=DEFAULT_ALIGN_SPEED_DEG_S, drop_spot_xy=None, knock_over=False):
     """One connection, one capture: segment, rank, then place blocks back to back. The next slot is positioned from the
     previous block's *actual* release pose (plus one pitch along the row) rather than the nominal slot, so release
     nudges do not accumulate. Grasp per slot: ends when the slot touches a placed neighbour, else middle/side/ends.
@@ -354,7 +391,9 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
     stands on its edge, is first released DROP_HEIGHT_MM above this spot so gravity lays it flat; a fresh capture then
     checks it lies flat before it can go to the pallet (operator request, 30 Oct). After the push rounds the pallet is
     checked the same way and a block on a neighbour, tilted or on its edge is taken off and dropped there too, then
-    replaced by the top-up. None keeps the old behaviour."""
+    replaced by the top-up. None keeps the old behaviour.
+    knock_over: when no pickable block is left in a capture, a block standing on its end (75 mm tall) is pushed over
+    at KNOCK_TIPS_MM so it falls onto clear table, then the scene is captured again (operator request, 30 Oct)."""
     from . import proposal, rgbd, segmentation, retrieval
     from . import grasp_geometry as geom
     from .capture import open_client, capture_with_camera
@@ -714,6 +753,86 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 return "reorient_failed"
             return None
 
+        def find_standing(context):
+            """A block standing on its end, away from the pallet, its row lane and the keep-out (the tower)."""
+            for c in context["candidates"]:
+                g = c["geometry"]
+                p = g.get("base_point_mm")
+                if not p or g.get("base_long_side_deg") is None or "in_tower_zone" in c["rejection_reasons"] or in_row_lane(g, any_height=True):
+                    continue
+                if keep_out_xy is not None and math.dist(p[:2], keep_out_xy) < footprint_clearance_mm(target):
+                    continue
+                if geom.standing_on_end(g, calib.block):
+                    return c
+            return None
+
+        async def knock_over_block(c, label):
+            """Push a standing block over with the closed claws at KNOCK_TIPS_MM, then capture and look at where it fell.
+            Returns (status, reason): ("knocked", None), ("not_possible", why) with no motion, or ("stop", reason)."""
+            nonlocal knocks_used, obs, scene, ctx, queue
+            g = c["geometry"]
+            bxy = tuple(g["base_point_mm"][:2])
+            others = [tuple(o["geometry"]["base_point_mm"][:2]) for o in ctx["candidates"]
+                      if o is not c and o["geometry"].get("base_point_mm")]
+            clear = footprint_clearance_mm(target) + 10.0
+            avoid = [(tuple(tower_origin), clear)] + ([(tuple(keep_out_xy), clear)] if keep_out_xy is not None else []) \
+                + ([(tuple(drop_spot_xy), DROP_CLEAR_MM)] if drop_spot_xy is not None else [])
+            plan = knock_plan(bxy, g["base_long_side_deg"], others, avoid, calib.block,
+                              forbidden=lambda xy: in_row_lane({"base_point_mm": xy}, any_height=True))
+            if plan is None:
+                ep.event("flow", phase="knock_not_possible", slot=label, candidate=c["candidate_id"], block_xy=list(bxy),
+                         note="no direction with clear table to fall onto")
+                print(f"{label}: block standing on end at ({bxy[0]:.0f}, {bxy[1]:.0f}) has no clear side to fall onto; leaving it", flush=True)
+                return "not_possible", "no_clear_side"
+            ux, uy = math.cos(math.radians(plan["u_deg"])), math.sin(math.radians(plan["u_deg"]))
+            sx, sy = plan["start_xy"]
+            ep.event("flow", phase="knock_over", slot=label, candidate=c["candidate_id"], block_xy=[round(v, 1) for v in bxy],
+                     height_mm=g.get("height_above_table_mm"), direction_deg=round(plan["u_deg"], 1), onto=plan["onto"],
+                     landing_xy=[round(v, 1) for v in plan["landing_xy"]], distance_mm=round(plan["distance_mm"], 1), tips_mm=KNOCK_TIPS_MM)
+            print(f"{label}: block standing on end at ({bxy[0]:.0f}, {bxy[1]:.0f}); pushing it over toward "
+                  f"({plan['landing_xy'][0]:.0f}, {plan['landing_xy'][1]:.0f}) onto its {plan['onto'].replace('_', ' ')}", flush=True)
+            await bot.gripper.grab()                     # closed claws are the pusher
+            g0 = await bot.gripper_origin()
+            travel_z = g0[2]
+            ok, _ = await bot.move_delta(dx=sx - g0[0], dy=sy - g0[1])
+            if ok:
+                await bot.align_claws(wrap_90(plan["u_deg"]), tolerance_deg=1.5, align_speed=align_speed, travel_speed=travel_speed)
+                g1 = await bot.gripper_origin()
+                ok, _ = await bot.move_delta(dx=sx - g1[0], dy=sy - g1[1])
+            if ok:
+                ok = await bot.descend_to(table_z + KNOCK_TIPS_MM - TIP_ABOVE_GRIPPER_FRAME_MM, approach_speed, travel_speed)
+            if ok:
+                await bot.set_speed(push_speed)
+                ok = await slide(ux, uy, plan["distance_mm"])
+            await bot.set_speed(travel_speed)
+            g2 = await bot.gripper_origin()
+            await bot.move_delta(dz=travel_z - g2[2], near_table=True)
+            await bot.gripper.open()
+            knocks_used += 1
+            ok_home, _ = await bot.move_to(*home)
+            if not ok_home:
+                ep.event("flow", phase="stop", reason="view_pose_refused_after_knock")
+                return "stop", "view_pose_refused_after_knock"
+            obs, scene = await scene_from_capture()
+            ctx = await context_for(scene, filled)
+            reconcile_pallet(ctx, f"after_knock_{label}")
+            queue = build_queue(ctx, obs, scene, f"after_knock_{label}")
+            still = find_standing(ctx)
+            still_here = still is not None and math.dist(still["geometry"]["base_point_mm"][:2], bxy) < 40.0
+            near = [o for o in ctx["candidates"] if o["geometry"].get("base_point_mm")
+                    and math.dist(o["geometry"]["base_point_mm"][:2], plan["landing_xy"]) < 60.0]
+            landed = min(near, key=lambda o: math.dist(o["geometry"]["base_point_mm"][:2], plan["landing_xy"])) if near else None
+            ep.event("flow", phase="knock_check", slot=label, observation_id=obs["observation_id"], push_completed=bool(ok),
+                     still_standing=still_here, landed=landed["candidate_id"] if landed else None,
+                     landed_height_mm=landed["geometry"].get("height_above_table_mm") if landed else None, knocks_used=knocks_used)
+            print(f"{label}: after the knock the block is {'STILL STANDING' if still_here else 'down'}"
+                  + (f" (top {landed['geometry']['height_above_table_mm']:.0f} mm near the landing spot)" if landed and not still_here else ""), flush=True)
+            if still_here and knocks_used >= MAX_KNOCKS:
+                ep.event("flow", phase="stop", reason="knock_failed", knocks_used=knocks_used, note="lay the block down by hand, then rerun")
+                print(f"{label}: still standing after {knocks_used} knock(s); lay it down by hand and rerun", flush=True)
+                return "stop", "knock_failed"
+            return "knocked", None
+
         async def pick_phase():
             """Place blocks until the layer is full, the placement budget is spent, or a hard stop."""
             nonlocal filled, last_pose, obs, scene, ctx, queue, flow_stopped, rescans_without_progress, placed_at_last_scan
@@ -739,6 +858,15 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                     if g is not None:
                         pick, grasp = c, g
                         break
+                if pick is None and knock_over and knocks_used < MAX_KNOCKS:
+                    # Nothing pickable: a block standing on its end is pushed over so it can be picked next.
+                    standing = find_standing(ctx)
+                    if standing is not None:
+                        status, reason = await knock_over_block(standing, slot["slot_id"])
+                        if status == "stop":
+                            flow_stopped = True; break
+                        if status == "knocked":
+                            continue
                 if pick is None:
                     # The queue comes from one capture. Blocks that had no clear grasp then (a neighbour inside the claws'
                     # sweep; robot-live-8: the third heap block was freed only after the second was picked) may be free now,
@@ -1005,6 +1133,7 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
 
         flow_stopped = False
         drops_used = 0
+        knocks_used = 0
         rescans_without_progress = 0
         placed_at_last_scan = 0
         pallet_count = len([s for s in filled if s.startswith('L0')])

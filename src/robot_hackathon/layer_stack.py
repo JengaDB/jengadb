@@ -686,7 +686,7 @@ async def run_palletize(config, data_dir, operator, episode_id, tower_origin, pa
                         direct_local=False, view_pose=None, grip_lower_mm=0.0, tips_floor_mm=None, expected_layers=None,
                         confirm=input, apply_offset=False, arm_speed=None, arm_accel=None, place_spacing_mm=None, grip_retries=1,
                         references="none", approach_speed=None, push_speed=None, disable_sessions=False, align_speed=None,
-                        drop_spot_xy=None):
+                        drop_spot_xy=None, knock_over=False):
     """Full flow, `cycles` times: build a packed three-block layer on the pallet spot from the loose blocks in view
     (live_executor.run_flow: pick one at a time, place back to back, push the row tight and centre it), then grip that
     layer as a bundle and stack it on the tower (run_layer_stack). The tower is a keep-out for the picking stage. The
@@ -713,7 +713,7 @@ async def run_palletize(config, data_dir, operator, episode_id, tower_origin, pa
                             arm_speed=arm_speed, arm_accel=arm_accel, grip_lower_mm=grip_lower_mm, tips_floor_mm=tips_floor_mm,
                             keep_out_xy=tower_origin, view_pose=view_pose, direct_local=direct_local, drop_unseen_filled=True,
                             grip_retries=grip_retries, references=references, skip_if_complete=True, layers=1, disable_sessions=disable_sessions,
-                            drop_spot_xy=drop_spot_xy,
+                            drop_spot_xy=drop_spot_xy, knock_over=knock_over,
                             **({"place_spacing_mm": place_spacing_mm} if place_spacing_mm is not None else {}),
                             **({"approach_speed": approach_speed} if approach_speed is not None else {}),
                             **({"push_speed": push_speed} if push_speed is not None else {}),
