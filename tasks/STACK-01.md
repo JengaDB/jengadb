@@ -298,6 +298,23 @@ local/layer-stack-data/live/episodes/):
   alignment; outside margin: pallet check pick-and-drop. Not handled: a block standing on end on the pallet (no
   grasp; the run stops for the operator).
 
+- 30 Oct 19:58-19:59 UTC, episode kazy-palletize-30oct, third cycle (kazy/push-tuning @dc20a8e, `--tips-floor-mm 0
+  --align-speed 90 --drop-spot 300,330 --knock-over`): stopped before any placement. First pick: a block on its edge on
+  top of a two-block stack (top 38.6 mm, tilt 17.9) was dropped at the spot and landed on its edge (23.3 mm high,
+  11.1 mm wide); picked and dropped again: on its edge again (22.1 mm). `reorient_failed` after 2 drops, pallet 0. The
+  claws grip an on-edge block across its 15 mm thickness, so it hangs and lands on its edge; the drop only helps a
+  block held tilted. Also: an on-edge block on the table was read as "resting on a block at 15 mm" (its 25 mm height
+  rounds to one level).
+- Change (operator: "instead of relying on bouncing, try sweeping"; Sam's plan_sweep in ViamPython jenga.py does the
+  same: knock it over across its short side toward the emptier side): `--knock-over` now sweeps upright blocks.
+  On its edge on the table (`on_edge_on_table`: flagged on edge, 19.5-31 mm tall): swept where it lies, claw tips at
+  16 mm (0.6 x 25, at least one block + 1 mm), across its thin side only, landing 20 mm over; no pick, no drop. On
+  its edge on top of other blocks: still picked and dropped at the spot; if it lands on its edge there it is swept
+  on the spot (the drop spot no longer counts as a forbidden landing for a block already on it). Standing on end:
+  as before at 45 mm. Re-dropping no longer happens for these. Tests: on-edge detection on the 19:59 readings,
+  on-edge sweep plan (thin side only, 16 mm, 20 mm landing, refused when both sides are blocked), and a harness run
+  where an on-edge block is swept flat (no drop) and picked to a full pallet. Untested live.
+
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot
 complete until it is changed; table height and camera offset are unverified; `--grip-lower-mm 3` is a single-run fix,
 not a calibration; source and base must be reachable (x <= ~600 mm worked) and both visible from the view pose.

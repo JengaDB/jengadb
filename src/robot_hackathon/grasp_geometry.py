@@ -686,6 +686,24 @@ def standing_on_end(geometry, dims):
             and length <= 0.6 * dims.length_mm and (width is None or width <= 1.3 * dims.width_mm))
 
 
+def on_edge_on_table(geometry, dims):
+    """A block lying on its long narrow side directly on the table: about one block width tall (25 mm) with its 15 mm
+    side on top (estimate_block flags it possibly_on_edge). resting_level_mm reads its 25 mm as resting on a block;
+    it is not (30 Oct, kazy-palletize-30oct: two drops left such a block on its edge both times)."""
+    h = geometry.get("height_above_table_mm")
+    return "possibly_on_edge" in (geometry.get("flags") or []) and h is not None and 1.3 * dims.height_mm < h <= dims.width_mm + 6.0
+
+
+def upright_kind(geometry, dims):
+    """'standing' (on its end, ~75 mm), 'on_edge' (on its narrow side on the table, ~25 mm) or None. Both are swept
+    over across their thin side so they fall onto their wide face."""
+    if standing_on_end(geometry, dims):
+        return "standing"
+    if on_edge_on_table(geometry, dims):
+        return "on_edge"
+    return None
+
+
 PALLET_YAW_TOLERANCE_DEG = 10.0   # a pallet block turned further than this from the row's long side is taken off (pushes cannot turn it)
 
 

@@ -32,7 +32,7 @@ def main(argv=None):
     parser.add_argument("--no-pause", action="store_true", help="layer-stack: do not wait for Enter; every check still stops the run. Someone stays at the e-stop")
     parser.add_argument("--grip-lower-mm", type=float, default=0.0, help="layer-stack/live-run: grip this much deeper than the default 8 mm below the block top (limited by the tips floor)")
     parser.add_argument("--drop-spot", default=None, help="live-run/palletize: 'x,y' mm (world) of a clear table spot; a tilted or on-edge heap block is dropped there from a short height to lie flat before it is placed")
-    parser.add_argument("--knock-over", action="store_true", help="live-run/palletize: when no block can be picked, push a block standing on its end over so it falls flat onto clear table")
+    parser.add_argument("--knock-over", action="store_true", help="live-run/palletize: sweep upright blocks over so they lie flat: one on its edge on the table where it lies (instead of dropping it), one that lands on its edge at the drop spot, and one standing on its end when nothing else can be picked")
     parser.add_argument("--keep-out", default=None, help="live-run: 'x,y' mm (world) of a tower that must not be picked from; blocks within the footprint clearance of it are skipped")
     parser.add_argument("--layers", type=int, default=None, help="layer-stack: layers already on the tower; the measured count (top height / block height) must agree")
     parser.add_argument("--tips-floor-mm", type=float, default=None, help="layer-stack/live-run: lowest claw-tip height above the calibrated table for the pick (default 1.0; down to -6.0 when the calibrated table z is known to sit above the real surface)")

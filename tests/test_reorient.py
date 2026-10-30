@@ -114,6 +114,21 @@ class StandingOnEnd(unittest.TestCase):
         self.assertFalse(geom.standing_on_end({"height_above_table_mm": None, "length_mm": 24.0, "width_mm": 14.0}, self.dims))
 
 
+class OnEdge(unittest.TestCase):
+    dims = geom.BlockDimensions()
+
+    def test_on_its_edge_on_the_table(self):
+        # kazy-palletize-30oct 19:59: after both drops the block read 23.3 / 22.1 mm high, 11-12 mm wide, flagged on edge
+        for h, w in ((23.3, 11.1), (22.1, 12.1)):
+            g = {"height_above_table_mm": h, "length_mm": 72.0, "width_mm": w, "flags": ["possibly_on_edge"]}
+            self.assertTrue(geom.on_edge_on_table(g, self.dims))
+            self.assertEqual(geom.upright_kind(g, self.dims), "on_edge")
+        # the first pick: on its edge on top of a two-block stack (top 38.6 mm) is not on the table; it is picked and dropped
+        self.assertFalse(geom.on_edge_on_table({"height_above_table_mm": 38.6, "width_mm": 12.0, "flags": ["possibly_on_edge"]}, self.dims))
+        self.assertIsNone(geom.upright_kind({"height_above_table_mm": 15.0, "length_mm": 74.0, "width_mm": 24.0, "flags": []}, self.dims))
+        self.assertEqual(geom.upright_kind({"height_above_table_mm": 74.0, "length_mm": 24.0, "width_mm": 14.0, "flags": []}, self.dims), "standing")
+
+
 class KnockPlan(unittest.TestCase):
     dims = geom.BlockDimensions()
 
@@ -140,6 +155,20 @@ class KnockPlan(unittest.TestCase):
         # the tower's keep-out and the pallet lane count as occupied too
         self.assertIsNone(self.plan(avoid=[((350.0, 0.0), 120.0)]))
         self.assertIsNone(self.plan(forbidden=lambda xy: True))
+
+    def test_on_edge_tips_across_its_thin_side_only(self):
+        from robot_hackathon.live_executor import knock_plan, PUSH_START_GAP_MM, KNOCK_PAST_MM
+        # on its edge, length along x: it can only tip across y; it falls its 25 mm height outward, landing 20 mm over
+        plan = knock_plan((300.0, 330.0), 0.0, [], [], self.dims, upright="on_edge")
+        self.assertEqual(plan["onto"], "wide_face")
+        self.assertIn(round(plan["u_deg"]), (90, 270))
+        self.assertAlmostEqual(math.dist(plan["landing_xy"], (300.0, 330.0)), 7.5 + 12.5)
+        self.assertAlmostEqual(plan["tips_mm"], 16.0)                                # above flat 15 mm neighbours
+        self.assertAlmostEqual(plan["distance_mm"], PUSH_START_GAP_MM + 7.5 + KNOCK_PAST_MM)
+        standing = knock_plan((300.0, 330.0), 0.0, [], [], self.dims)
+        self.assertAlmostEqual(standing["tips_mm"], 45.0)
+        # both thin-side directions blocked: an on-edge block has no other way to tip
+        self.assertIsNone(knock_plan((300.0, 330.0), 0.0, [(300.0, 350.0), (300.0, 310.0)], [], self.dims, upright="on_edge"))
 
 
 if __name__ == "__main__":

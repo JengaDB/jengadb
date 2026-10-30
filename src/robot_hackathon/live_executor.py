@@ -33,7 +33,8 @@ DROP_HEIGHT_MM = 25.0             # a block to be laid flat is released with its
 DROP_CLEAR_MM = 60.0              # nothing else may lie within this of the drop spot (a 75 mm block landing any way round)
 DROP_FIND_MM = 70.0               # after the drop, the block is looked for within this of the spot
 MAX_REORIENT_DROPS = 2            # drops per run before the flow stops and asks the operator to lay the block flat
-KNOCK_TIPS_MM = 45.0              # closed claw tips this far above the table push a standing (75 mm) block over
+KNOCK_TIPS_FRACTION = 0.6         # sweep with the claw tips at this fraction of the block's height (45 mm for one standing
+                                  # on end, 16 mm for one on its edge: never below one block + 1 mm, clear of flat neighbours)
 KNOCK_PAST_MM = 30.0              # stroke past first contact: the top must move ~15 mm before a 15 mm-thick block tips
 KNOCK_CLEAR_MM = 55.0             # no other block centre within this of where the knocked block lands
 MAX_KNOCKS = 2                    # knock-overs per run before the flow stops and asks the operator
@@ -70,22 +71,30 @@ def release_spacing_mm(grasp_style, finger, block_width_mm, base_spacing_mm):
     return max(base_spacing_mm, sweep)
 
 
-def knock_plan(block_xy, top_long_deg, others_xy, avoid, dims, forbidden=None, clear_mm=KNOCK_CLEAR_MM):
-    """Push direction that topples a block standing on its end onto clear table (operator request, 30 Oct). Its end
-    face is width x height (25 x 15): pushing across the thin 15 mm side tips it over the 25 mm edge onto its wide face
-    (lies flat), so those two directions come first; across the 25 mm side it lands on its edge (the drop step then
-    lays it flat). A direction is usable when the landing centre (half the footprint plus half the length beyond the
-    block) has no other block centre within clear_mm, lies outside every (centre, radius) in avoid and is not
-    forbidden(xy), and nothing lies within 30 mm of where the closed claws come down. Among usable directions of the
-    better kind, the one with the most room wins. Returns {u_deg, start_xy, distance_mm, landing_xy, onto} or None."""
+def knock_plan(block_xy, top_long_deg, others_xy, avoid, dims, forbidden=None, clear_mm=KNOCK_CLEAR_MM, upright="standing"):
+    """Sweep that tips an upright block onto clear table (operator requests, 30 Oct: knock a standing block over;
+    sweep rather than drop a block on its edge). upright "standing" (on its end, end face 25 x 15): across the thin
+    15 mm side it tips onto its wide face (lies flat), so those two directions come first; across the 25 mm side it
+    lands on its edge (swept again later). upright "on_edge" (on its narrow side, 25 mm tall, 15 mm on top): only
+    across the thin side, which lays it on its wide face. The claw tips sweep at KNOCK_TIPS_FRACTION of the block's
+    height. A direction is usable when the landing centre has no other block centre within clear_mm, lies outside
+    every (centre, radius) in avoid and is not forbidden(xy), and nothing lies within 30 mm of where the closed claws
+    come down. Among usable directions of the better kind, the one with the most room wins.
+    Returns {u_deg, start_xy, distance_mm, landing_xy, onto, tips_mm} or None."""
     def room(xy):
         d = [math.dist(xy, o) for o in others_xy] + [math.dist(xy, c) - r for c, r in avoid]
         return min(d) if d else float("inf")
-    for onto, base_deg, half in (("wide_face", top_long_deg + 90.0, dims.height_mm / 2), ("edge", top_long_deg, dims.width_mm / 2)):
+    if upright == "on_edge":
+        height, options = dims.width_mm, (("wide_face", top_long_deg + 90.0, dims.height_mm / 2),)
+    else:
+        height, options = dims.length_mm, (("wide_face", top_long_deg + 90.0, dims.height_mm / 2), ("edge", top_long_deg, dims.width_mm / 2))
+    tips = max(KNOCK_TIPS_FRACTION * height, dims.height_mm + 1.0)
+    for onto, base_deg, half in options:
         best = None
         for u_deg in (base_deg, base_deg + 180.0):
             ux, uy = math.cos(math.radians(u_deg)), math.sin(math.radians(u_deg))
-            landing = (block_xy[0] + ux * (half + dims.length_mm / 2), block_xy[1] + uy * (half + dims.length_mm / 2))
+            # it pivots on its bottom edge (half the footprint out) and falls its height outward
+            landing = (block_xy[0] + ux * (half + height / 2), block_xy[1] + uy * (half + height / 2))
             back = half + CLAW_THICKNESS_MM + PUSH_START_GAP_MM
             start = (block_xy[0] - ux * back, block_xy[1] - uy * back)
             if any(math.dist(landing, o) < clear_mm for o in others_xy) or any(math.dist(landing, c) < r for c, r in avoid):
@@ -95,7 +104,7 @@ def knock_plan(block_xy, top_long_deg, others_xy, avoid, dims, forbidden=None, c
             if any(math.dist(start, o) < 30.0 for o in others_xy):
                 continue
             plan = {"u_deg": u_deg % 360.0, "start_xy": start, "distance_mm": PUSH_START_GAP_MM + half + KNOCK_PAST_MM,
-                    "landing_xy": landing, "onto": onto, "room_mm": room(landing)}
+                    "landing_xy": landing, "onto": onto, "room_mm": room(landing), "tips_mm": tips}
             if best is None or plan["room_mm"] > best["room_mm"]:
                 best = plan
         if best is not None:
@@ -382,8 +391,10 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
     checks it lies flat before it can go to the pallet (operator request, 30 Oct). After the push rounds the pallet is
     checked the same way and a block on a neighbour, tilted or on its edge is taken off and dropped there too, then
     replaced by the top-up. None keeps the old behaviour.
-    knock_over: when no pickable block is left in a capture, a block standing on its end (75 mm tall) is pushed over
-    at KNOCK_TIPS_MM so it falls onto clear table, then the scene is captured again (operator request, 30 Oct)."""
+    knock_over: sweep upright blocks over so they lie flat (operator requests, 30 Oct): a picked block lying on its edge
+    on the table is swept where it lies instead of being dropped; one that lands on its edge at the drop spot is swept
+    there; when nothing is pickable, a block standing on its end (or on its edge) is swept. Then the scene is
+    captured again."""
     from . import proposal, rgbd, segmentation, retrieval
     from . import grasp_geometry as geom
     from .capture import open_client, capture_with_camera
@@ -735,14 +746,22 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
             ep.event("flow", phase="reorient_check", slot=label, observation_id=obs["observation_id"],
                      candidate=found["candidate_id"] if found else None, flat=not flat_reasons, reasons=flat_reasons, drops_used=drops_used)
             print(f"{label}: after the drop the block {'lies flat' if not flat_reasons else 'is NOT flat: ' + ', '.join(flat_reasons)}", flush=True)
+            if flat_reasons and found is not None and knock_over and knocks_used < MAX_KNOCKS and geom.upright_kind(found["geometry"], calib.block):
+                # Dropping again would land it the same way (30 Oct: on its edge twice); sweep it over on the clear spot.
+                status, reason = await knock_over_block(found, label)
+                if status == "stop":
+                    return reason
+                if status == "knocked":
+                    return None
             if flat_reasons and drops_used >= MAX_REORIENT_DROPS:
                 ep.event("flow", phase="stop", reason="reorient_failed", drops_used=drops_used, note="lay the block flat by hand, then rerun")
                 print(f"{label}: still not flat after {drops_used} drop(s); lay it flat by hand and rerun", flush=True)
                 return "reorient_failed"
             return None
 
-        def find_standing(context):
-            """A block standing on its end, away from the pallet, its row lane and the keep-out (the tower)."""
+        def find_upright(context):
+            """A block standing on its end or on its edge on the table, away from the pallet, its row lane and the
+            keep-out (the tower)."""
             for c in context["candidates"]:
                 g = c["geometry"]
                 p = g.get("base_point_mm")
@@ -750,34 +769,38 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                     continue
                 if keep_out_xy is not None and math.dist(p[:2], keep_out_xy) < footprint_clearance_mm(target):
                     continue
-                if geom.standing_on_end(g, calib.block):
+                if geom.upright_kind(g, calib.block):
                     return c
             return None
 
         async def knock_over_block(c, label):
-            """Push a standing block over with the closed claws at KNOCK_TIPS_MM, then capture and look at where it fell.
-            Returns (status, reason): ("knocked", None), ("not_possible", why) with no motion, or ("stop", reason)."""
+            """Sweep an upright block (standing on its end, or on its edge) over with the closed claws, then capture and
+            look at where it fell. Returns (status, reason): ("knocked", None), ("not_possible", why) with no motion, or
+            ("stop", reason)."""
             nonlocal knocks_used, obs, scene, ctx, queue
             g = c["geometry"]
             bxy = tuple(g["base_point_mm"][:2])
+            kind = geom.upright_kind(g, calib.block) or "on_edge"
+            what = "standing on end" if kind == "standing" else "on its edge"
             others = [tuple(o["geometry"]["base_point_mm"][:2]) for o in ctx["candidates"]
                       if o is not c and o["geometry"].get("base_point_mm")]
             clear = footprint_clearance_mm(target) + 10.0
             avoid = [(tuple(tower_origin), clear)] + ([(tuple(keep_out_xy), clear)] if keep_out_xy is not None else []) \
-                + ([(tuple(drop_spot_xy), DROP_CLEAR_MM)] if drop_spot_xy is not None else [])
+                + ([(tuple(drop_spot_xy), DROP_CLEAR_MM)] if drop_spot_xy is not None and math.dist(bxy, drop_spot_xy) >= DROP_CLEAR_MM else [])
             plan = knock_plan(bxy, g["base_long_side_deg"], others, avoid, calib.block,
-                              forbidden=lambda xy: in_row_lane({"base_point_mm": xy}, any_height=True))
+                              forbidden=lambda xy: in_row_lane({"base_point_mm": xy}, any_height=True), upright=kind)
             if plan is None:
                 ep.event("flow", phase="knock_not_possible", slot=label, candidate=c["candidate_id"], block_xy=list(bxy),
                          note="no direction with clear table to fall onto")
-                print(f"{label}: block standing on end at ({bxy[0]:.0f}, {bxy[1]:.0f}) has no clear side to fall onto; leaving it", flush=True)
+                print(f"{label}: block {what} at ({bxy[0]:.0f}, {bxy[1]:.0f}) has no clear side to fall onto; leaving it", flush=True)
                 return "not_possible", "no_clear_side"
             ux, uy = math.cos(math.radians(plan["u_deg"])), math.sin(math.radians(plan["u_deg"]))
             sx, sy = plan["start_xy"]
             ep.event("flow", phase="knock_over", slot=label, candidate=c["candidate_id"], block_xy=[round(v, 1) for v in bxy],
                      height_mm=g.get("height_above_table_mm"), direction_deg=round(plan["u_deg"], 1), onto=plan["onto"],
-                     landing_xy=[round(v, 1) for v in plan["landing_xy"]], distance_mm=round(plan["distance_mm"], 1), tips_mm=KNOCK_TIPS_MM)
-            print(f"{label}: block standing on end at ({bxy[0]:.0f}, {bxy[1]:.0f}); pushing it over toward "
+                     landing_xy=[round(v, 1) for v in plan["landing_xy"]], distance_mm=round(plan["distance_mm"], 1), tips_mm=round(plan["tips_mm"], 1),
+                     upright=kind)
+            print(f"{label}: block {what} at ({bxy[0]:.0f}, {bxy[1]:.0f}); sweeping it over at {plan['tips_mm']:.0f} mm toward "
                   f"({plan['landing_xy'][0]:.0f}, {plan['landing_xy'][1]:.0f}) onto its {plan['onto'].replace('_', ' ')}", flush=True)
             await bot.gripper.grab()                     # closed claws are the pusher
             g0 = await bot.gripper_origin()
@@ -788,7 +811,7 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 g1 = await bot.gripper_origin()
                 ok, _ = await bot.move_delta(dx=sx - g1[0], dy=sy - g1[1])
             if ok:
-                ok = await bot.descend_to(table_z + KNOCK_TIPS_MM - TIP_ABOVE_GRIPPER_FRAME_MM, approach_speed, travel_speed)
+                ok = await bot.descend_to(table_z + plan["tips_mm"] - TIP_ABOVE_GRIPPER_FRAME_MM, approach_speed, travel_speed)
             if ok:
                 await bot.set_speed(push_speed)
                 ok = await slide(ux, uy, plan["distance_mm"])
@@ -805,19 +828,19 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
             ctx = await context_for(scene, filled)
             reconcile_pallet(ctx, f"after_knock_{label}")
             queue = build_queue(ctx, obs, scene, f"after_knock_{label}")
-            still = find_standing(ctx)
-            still_here = still is not None and math.dist(still["geometry"]["base_point_mm"][:2], bxy) < 40.0
+            still_here = any(o["geometry"].get("base_point_mm") and math.dist(o["geometry"]["base_point_mm"][:2], bxy) < 15.0
+                             and geom.upright_kind(o["geometry"], calib.block) == kind for o in ctx["candidates"])
             near = [o for o in ctx["candidates"] if o["geometry"].get("base_point_mm")
                     and math.dist(o["geometry"]["base_point_mm"][:2], plan["landing_xy"]) < 60.0]
             landed = min(near, key=lambda o: math.dist(o["geometry"]["base_point_mm"][:2], plan["landing_xy"])) if near else None
             ep.event("flow", phase="knock_check", slot=label, observation_id=obs["observation_id"], push_completed=bool(ok),
                      still_standing=still_here, landed=landed["candidate_id"] if landed else None,
                      landed_height_mm=landed["geometry"].get("height_above_table_mm") if landed else None, knocks_used=knocks_used)
-            print(f"{label}: after the knock the block is {'STILL STANDING' if still_here else 'down'}"
+            print(f"{label}: after the sweep the block is {'STILL ' + what.upper() if still_here else 'down'}"
                   + (f" (top {landed['geometry']['height_above_table_mm']:.0f} mm near the landing spot)" if landed and not still_here else ""), flush=True)
             if still_here and knocks_used >= MAX_KNOCKS:
                 ep.event("flow", phase="stop", reason="knock_failed", knocks_used=knocks_used, note="lay the block down by hand, then rerun")
-                print(f"{label}: still standing after {knocks_used} knock(s); lay it down by hand and rerun", flush=True)
+                print(f"{label}: still {what} after {knocks_used} sweep(s); lay it down by hand and rerun", flush=True)
                 return "stop", "knock_failed"
             return "knocked", None
 
@@ -847,8 +870,8 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                         pick, grasp = c, g
                         break
                 if pick is None and knock_over and knocks_used < MAX_KNOCKS:
-                    # Nothing pickable: a block standing on its end is pushed over so it can be picked next.
-                    standing = find_standing(ctx)
+                    # Nothing pickable: a block standing on its end (or on its edge) is swept over so it can be picked next.
+                    standing = find_upright(ctx)
                     if standing is not None:
                         status, reason = await knock_over_block(standing, slot["slot_id"])
                         if status == "stop":
@@ -886,6 +909,13 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 # Gravity reorientation: a tilted or on-edge block is laid flat on the drop spot before it goes to the pallet.
                 tilt = candidate_tilt(scene, pick)
                 reorient = geom.reorient_reasons(geo, tilt)
+                if reorient and knock_over and knocks_used < MAX_KNOCKS and geom.on_edge_on_table(geo, calib.block):
+                    # On its edge on the table: sweep it over where it lies (dropping it lands it on its edge again).
+                    status, reason = await knock_over_block(pick, slot["slot_id"])
+                    if status == "stop":
+                        flow_stopped = True; break
+                    if status == "knocked":
+                        continue
                 if reorient and drop_spot_xy is None:
                     ep.event("flow", phase="misaligned_pick", candidate=pick["candidate_id"], reasons=reorient, tilt_deg=tilt,
                              note="no --drop-spot: placed as is")

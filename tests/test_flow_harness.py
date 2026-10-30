@@ -301,22 +301,22 @@ class RunFlowHarness(unittest.TestCase):
         self.assertEqual(len(self.on_pallet(world)), 3)
         self.assertEqual([b[0] for b in world.blocks if b[4] == 1], [])  # nothing left lying on the row
 
-    def test_block_standing_on_end_is_knocked_over_then_picked(self):
-        """'UP' blocks stand on end (25 x 15 footprint, 75 mm tall), rendered separately and composited; the simulated
-        claws topple one when they sweep through it at knock height, leaving it flat along the push. The camera
-        resolution is doubled so the small end face clears run_flow's 200 px mask minimum (on the D435 a lying block
-        covers ~9000 px, an end face ~1800)."""
+    def run_with_upright(self, world, prefix, dims, tips_range, fall_mm, hi_res=False):
+        """Blocks named prefix* are upright with footprint/height `dims` (rendered separately and composited); the
+        simulated claws topple one when they sweep through it with their tips inside tips_range, leaving it flat
+        `fall_mm` further along the sweep. hi_res doubles the camera resolution so a small end face clears run_flow's
+        200 px mask minimum (on the D435 a lying block covers ~9000 px, an end face ~1800)."""
         import numpy as np
         from robot_hackathon import synthetic_scene as synth
         orig_render = synth.render
 
         def render(preset, seed=7, invalid_fraction=0.01):
             entries = synth.PRESETS[preset]
-            synth.PRESETS["_flat"] = [e for e in entries if not e[0].startswith("UP")]
-            synth.PRESETS["_up"] = [e for e in entries if e[0].startswith("UP")]
+            synth.PRESETS["_flat"] = [e for e in entries if not e[0].startswith(prefix)]
+            synth.PRESETS["_up"] = [e for e in entries if e[0].startswith(prefix)]
             rgb, depth, masks, truth = orig_render("_flat", seed, invalid_fraction)
             if synth.PRESETS["_up"]:
-                with mock.patch.object(synth, "BLOCK", (25.0, 15.0, 75.0)):
+                with mock.patch.object(synth, "BLOCK", dims):
                     rgb2, depth2, masks2, _ = orig_render("_up", seed, invalid_fraction)
                 nearer = (depth2 > 0) & ((depth == 0) | (depth2 < depth - 2))
                 depth = np.where(nearer, depth2, depth)
@@ -324,7 +324,6 @@ class RunFlowHarness(unittest.TestCase):
                 masks = [m & ~nearer for m in masks] + [m & nearer for m in masks2]
             return rgb, depth, masks, truth
 
-        world = World([("A", 430.0, 60.0, 30.0, 0), ("C", 470.0, 250.0, -40.0, 0), ("UP1", 380.0, 120.0, 0.0, 0)])
         robot_cls = make_robot_class(world)
         base_move = robot_cls.move_delta
 
@@ -332,29 +331,51 @@ class RunFlowHarness(unittest.TestCase):
             old = (world.g[0], world.g[1])
             res = await base_move(robot, dx, dy, dz, rotate, near_table)
             tips = world.g[2] + 0.5 - world.table_z(*old)
-            if res[0] and world.closed and world.held is None and 25 < tips < 70 and (dx or dy):
+            if res[0] and world.closed and world.held is None and tips_range[0] < tips < tips_range[1] and (dx or dy):
                 d = math.hypot(dx, dy)
                 ux, uy = dx / d, dy / d
                 for b in world.blocks:
                     ahead_before = (b[1] - old[0]) * ux + (b[2] - old[1]) * uy
                     ahead_after = (b[1] - world.g[0]) * ux + (b[2] - world.g[1]) * uy
                     side = abs(-(b[1] - world.g[0]) * uy + (b[2] - world.g[1]) * ux)
-                    if b[0].startswith("UP") and side < 30.0 and ahead_before > 0 and ahead_after < 15.0:
-                        b[0] = "FELL" + b[0][2:]
-                        b[1], b[2], b[3] = b[1] + ux * 45.0, b[2] + uy * 45.0, math.degrees(math.atan2(uy, ux))
+                    if b[0].startswith(prefix) and side < 30.0 and ahead_before > 0 and ahead_after < 15.0:
+                        b[0] = "FELL" + b[0][len(prefix):]
+                        b[1], b[2] = b[1] + ux * fall_mm, b[2] + uy * fall_mm
+                        if prefix == "UP":
+                            b[3] = math.degrees(math.atan2(uy, ux))   # a standing block falls with its length along the sweep
             return res
         robot_cls.move_delta = move_delta
-        hi_res = dict(synth.INTRINSICS, width_px=640, height_px=480, focal_x_px=456.0, focal_y_px=456.0, center_x_px=320.0, center_y_px=240.0)
-        with mock.patch.object(synth, "INTRINSICS", hi_res), mock.patch.object(synth, "render", render), \
-                mock.patch(__name__ + ".make_robot_class", lambda w: robot_cls):
-            rc, events = self.run_flow(world, knock_over=True)
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(synth, "render", render))
+            stack.enter_context(mock.patch(__name__ + ".make_robot_class", lambda w: robot_cls))
+            if hi_res:
+                stack.enter_context(mock.patch.object(synth, "INTRINSICS", dict(synth.INTRINSICS, width_px=640, height_px=480, focal_x_px=456.0,
+                                                                                focal_y_px=456.0, center_x_px=320.0, center_y_px=240.0)))
+            return self.run_flow(world, knock_over=True)
+
+    def test_block_standing_on_end_is_knocked_over_then_picked(self):
+        world = World([("A", 430.0, 60.0, 30.0, 0), ("C", 470.0, 250.0, -40.0, 0), ("UP1", 380.0, 120.0, 0.0, 0)])
+        rc, events = self.run_with_upright(world, "UP", (25.0, 15.0, 75.0), (25.0, 70.0), 45.0, hi_res=True)
         knock = [e for e in events if e.get("phase") == "knock_over"]
         self.assertEqual(len(knock), 1)
-        self.assertEqual(knock[0]["onto"], "wide_face")
+        self.assertEqual((knock[0]["onto"], knock[0]["upright"], knock[0]["tips_mm"]), ("wide_face", "standing", 45.0))
         self.assertGreater(knock[0]["height_mm"], 60.0)
         check = [e for e in events if e.get("phase") == "knock_check"][0]
         self.assertFalse(check["still_standing"])
         self.assertLess(check["landed_height_mm"], 20.0)
+        self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
+        self.assertEqual(sorted(b[0] for b in world.blocks), ["A", "C", "FELL1"])
+
+    def test_block_on_its_edge_is_swept_over_not_dropped(self):
+        # 30 Oct 19:59: dropping a block on its edge left it on its edge twice. Now it is swept over where it lies.
+        world = World([("A", 430.0, 60.0, 30.0, 0), ("C", 470.0, 250.0, -40.0, 0), ("EDGE1", 360.0, 180.0, 10.0, 0)])
+        rc, events = self.run_with_upright(world, "EDGE", (75.0, 15.0, 25.0), (12.0, 30.0), 20.0)
+        sweep = [e for e in events if e.get("phase") == "knock_over"]
+        self.assertEqual(len(sweep), 1)
+        self.assertEqual((sweep[0]["upright"], sweep[0]["onto"], sweep[0]["tips_mm"]), ("on_edge", "wide_face", 16.0))
+        self.assertFalse(any(e.get("phase") == "dropped" for e in events))
+        self.assertFalse([e for e in events if e.get("phase") == "knock_check"][0]["still_standing"])
         self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
         self.assertEqual(sorted(b[0] for b in world.blocks), ["A", "C", "FELL1"])
 
