@@ -43,6 +43,7 @@ GRIP_WIDTH_EMPTY_MM = 0.5         # a reported opening at or below this after gr
 PLACE_SPACING_MM = 14.0           # extra pitch between consecutive pallet blocks at placement; the push closes it
 ROW_PRE_OFFSET_MM = 8.0           # the first pallet block goes this far past nominal, toward the open end of the row, so
                                   # the single-direction push can bring the closed row back onto the pallet centre
+ROW_LANE_HALF_WIDTH_MM = 20.0     # a released pallet block's centre lies within this of the row axis (along its long side)
 APPROACH_MM = 40.0                # the last part of every descent to the table is driven at approach_speed
 DEFAULT_ARM_SPEED_DEG_S = 180.0   # restore value when the operator gave no --arm-speed (the value used on 30 Oct)
 DEFAULT_APPROACH_SPEED_DEG_S = 40.0
@@ -471,6 +472,33 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                     return c["candidate_id"]
             return None
 
+        # The row as released: consecutive blocks go down a release spacing apart (52.5 mm with an across grasp), so an
+        # unpushed three-block row reaches ~140 mm from the pallet centre, past the footprint circle. Blocks lying in that
+        # lane are pallet blocks: row_blocks counts them and build_queue never picks them up again (offline harness,
+        # 30 Oct: the third block landed 138 mm out, was counted as missing and re-picked by the top-up).
+        lane_spacing = release_spacing_mm("middle", calib.finger, calib.block.width_mm, place_spacing_mm)
+        lane_half_len = ((target.blocks_per_layer - 1) * (calib.block.width_mm + gap_mm + lane_spacing)
+                         + calib.block.width_mm / 2 + ROW_PRE_OFFSET_MM)
+
+        def in_row_lane(geo, any_height=False):
+            p, h = geo.get("base_point_mm"), geo.get("height_above_table_mm")
+            if not p or (not any_height and (h is None or abs(h - calib.block.height_mm) >= 0.6 * calib.block.height_mm)):
+                return False
+            a = math.radians(target.layer0_long_side_deg)
+            dx, dy = p[0] - tower_origin[0], p[1] - tower_origin[1]
+            return (abs(dx * math.cos(a) + dy * math.sin(a)) <= ROW_LANE_HALF_WIDTH_MM
+                    and abs(-dx * math.sin(a) + dy * math.cos(a)) <= lane_half_len)
+
+        if drop_spot_xy is not None:
+            a = math.radians(target.layer0_long_side_deg)
+            dx, dy = drop_spot_xy[0] - tower_origin[0], drop_spot_xy[1] - tower_origin[1]
+            if (abs(dx * math.cos(a) + dy * math.sin(a)) <= ROW_LANE_HALF_WIDTH_MM + DROP_CLEAR_MM
+                    and abs(-dx * math.sin(a) + dy * math.cos(a)) <= lane_half_len + DROP_CLEAR_MM):
+                ep.event("flow", phase="stop", reason="drop_spot_in_pallet_lane", drop_xy=list(drop_spot_xy), half_length_mm=round(lane_half_len, 1))
+                print("--drop-spot lies in line with the pallet row, where released blocks count as pallet blocks; "
+                      "choose a spot off the row's axis. Nothing moved.", flush=True)
+                return 1
+
         def build_queue(context, observation, scene_, label):
             """Ranked pickable candidates from a context, minus anything inside the keep-out circle. A heap is taken
             from the top: blocks resting on others come before blocks on the table (stable within a level)."""
@@ -483,6 +511,11 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                             and math.hypot(c["geometry"]["base_point_mm"][0] - keep_out_xy[0], c["geometry"]["base_point_mm"][1] - keep_out_xy[1]) < radius]
                 q = [c for c in q if c not in kept_out]
                 ep.event("flow", phase="keep_out", centre=list(keep_out_xy), radius_mm=round(radius, 1), excluded=[c["candidate_id"] for c in kept_out])
+            in_lane = [c for c in q if in_row_lane(c["geometry"])]
+            if in_lane:
+                q = [c for c in q if c not in in_lane]
+                ep.event("flow", phase="row_lane", label=label, excluded=[c["candidate_id"] for c in in_lane],
+                         half_length_mm=round(lane_half_len, 1))
             ep.event("flow", phase="scene", label=label, observation_id=observation["observation_id"], masks=len(scene_["masks"]),
                      eligible=[c["candidate_id"] for c in q],
                      rejections={c["candidate_id"]: c["rejection_reasons"] for c in context["candidates"] if not c["eligible"]},
@@ -516,9 +549,11 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
         last_pose = None   # (x, y, long_side_deg) of the previous block as released
 
         def row_blocks(context, layer):
-            """Measured blocks in the tower zone at this layer's height, ordered along the row's across direction."""
+            """Measured blocks in the tower zone (layer 0: or in the released row's lane) at this layer's height, ordered
+            along the row's across direction."""
             expect = (layer + 1) * calib.block.height_mm
-            found = [c["geometry"] for c in context["candidates"] if "in_tower_zone" in c["rejection_reasons"]
+            found = [c["geometry"] for c in context["candidates"]
+                     if ("in_tower_zone" in c["rejection_reasons"] or (layer == 0 and in_row_lane(c["geometry"])))
                      and c["geometry"]["height_above_table_mm"] is not None and abs(c["geometry"]["height_above_table_mm"] - expect) < 0.6 * calib.block.height_mm]
             across = math.radians(target.layer0_long_side_deg + 90.0 * (layer + 1))
             return sorted(found, key=lambda g: g["base_point_mm"][0] * math.cos(across) + g["base_point_mm"][1] * math.sin(across))
@@ -846,7 +881,8 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
             ctx = await context_for(scene, filled)
             checked = []
             for c in ctx["candidates"]:
-                if "in_tower_zone" not in c["rejection_reasons"] or not c["geometry"].get("base_point_mm"):
+                if not c["geometry"].get("base_point_mm") or not ("in_tower_zone" in c["rejection_reasons"]
+                                                                  or in_row_lane(c["geometry"], any_height=True)):
                     continue
                 tilt = candidate_tilt(scene, c)
                 checked.append((c, tilt, geom.misplaced_on_pallet_reasons(c["geometry"], tilt, calib.block)))

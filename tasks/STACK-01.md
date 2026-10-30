@@ -219,8 +219,16 @@ local/layer-stack-data/live/episodes/):
   occupied drop spot stops the run for the operator. Pick and drop motions are shared helpers (`grab_block`,
   `drop_and_check`) for heap and pallet. Scratch simulation: a pallet block put down on its neighbour measured
   29.7 mm, was taken off at tips 21.7, dropped, found flat and replaced. The same simulation still ends 2 of 3: the
-  third across-grasp block lands outside the 102.5 mm zone and the top-up re-picks it (fixed on codex/layer-stack
-  efd55a1, not merged here). Untested live.
+  third across-grasp block lands outside the 102.5 mm zone and the top-up re-picks it. Untested live.
+- Row-lane fix ported from codex/layer-stack efd55a1 (operator approved; that commit's other changes are not here):
+  three across-grasp blocks are released 77.5 mm apart, so the third lands ~138 mm from the pallet centre, outside
+  the 102.5 mm footprint circle; it was counted missing and re-picked by the top-up. Blocks in the released row's lane
+  (within ROW_LANE_HALF_WIDTH_MM 20 of the row axis, out to the full release spread) now count as pallet blocks, are
+  never picked again and are included in the pallet check; a --drop-spot in line with the row is refused at start
+  (a block dropped there would count as a pallet block). tests/test_flow_harness.py (copied from codex/layer-stack,
+  end-to-end only push contact fixed so side-by-side blocks are not shoved along) covers: three across grasps counted
+  with no re-pick; a block put down on its neighbour taken off, laid flat and replaced to a full pallet; drop spot
+  too close / in the lane refused before picking. Untested live.
 
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot
 complete until it is changed; table height and camera offset are unverified; `--grip-lower-mm 3` is a single-run fix,
