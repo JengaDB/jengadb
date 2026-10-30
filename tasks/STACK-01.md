@@ -583,6 +583,17 @@ local/layer-stack-data/live/episodes/):
   - Tests: today's closest and furthest points pass and run 12's start does not; run 12's target gets no flatten
     or knock plan; a row out there gets no push-out; harness: a block lying on another 591 mm out is neither swept
     nor picked and the pallet fills from the rest. 185 tests pass. Untested live.
+- Change (operator: after aligning the ends and going back up, check they are within 5 mm before the tower step;
+  if not, align again): in the push stage, after the end pushes the closed claws rise, the arm goes home and a
+  capture measures the row.
+  - If the ends lie within `END_ALIGN_CHECK_MM` (5 mm) of each other, the flow goes on to the pallet check and
+    stacking.
+  - Otherwise the end pushes are planned again from that look and run, up to `MAX_ALIGN_ROUNDS` (3) rounds in all.
+    After the last round it carries on, with a `row_ends_not_aligned` event; the stacking stage still refuses a
+    layer staggered by more than 20 mm.
+  - Events: `row_alignment_check` (round, offsets, spread, aligned); `push_align` carries its round.
+  - Harness: one push aligns (one check); a first push that falls short is repeated (spread over 5 mm, then within);
+    pushes that always fall short stop after three rounds and the flow carries on. 188 tests pass. Untested live.
 
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot
 complete until it is changed; table height and camera offset are unverified; `--grip-lower-mm 3` is a single-run fix,

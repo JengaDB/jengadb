@@ -480,6 +480,50 @@ class RunFlowHarness(unittest.TestCase):
         self.assertEqual([e for e in events if e.get("phase") == "final_validation"][-1]["pallet_count"], 3)
         self.assertEqual([b[1:3] for b in world.blocks if b[0] in ("LOW", "TOP")], [[520.0, 280.0], [520.0, 280.0]])   # untouched
 
+    def run_end_alignment(self, short_strokes):
+        """A full pallet with block 1's end 12 mm out; the first `short_strokes` end pushes (strokes along the blocks' long
+        side, +x here) fall short: they move the claws 1 mm instead of their full length."""
+        world = World([("P0", 200.0, 125.0, 0.0, 0), ("P1", 212.0, 150.0, 0.0, 0), ("P2", 200.0, 175.0, 0.0, 0)])
+        robot_cls = make_robot_class(world)
+        base_move = robot_cls.move_delta
+        made = []
+
+        async def move_delta(robot, dx=0.0, dy=0.0, dz=0.0, rotate=0.0, near_table=False):
+            low = world.g[2] + 0.5 - world.table_z(world.g[0], world.g[1]) < 12
+            if world.closed and world.held is None and low and abs(dx) > abs(dy) and len(made) < short_strokes:
+                made.append(dx)
+                dx = math.copysign(1.0, dx)
+            return await base_move(robot, dx, dy, dz, rotate, near_table)
+        robot_cls.move_delta = move_delta
+        with mock.patch(__name__ + ".make_robot_class", lambda w: robot_cls):
+            rc, events = self.run_flow(world, skip_if_complete=True)
+        return world, events
+
+    def test_end_alignment_is_checked_from_home_and_repeated(self):
+        # Operator, 30 Oct: after lining the ends up and going back up, check they are within 5 mm before the tower step;
+        # if not, line them up again.
+        world, events = self.run_end_alignment(short_strokes=0)
+        checks = [e for e in events if e.get("phase") == "row_alignment_check"]
+        self.assertEqual([(c["round"], c["aligned"]) for c in checks], [(1, True)])     # one push did it; one look
+        self.assertLessEqual(checks[0]["end_spread_mm"], 5.0)
+        self.assertLess(events.index(checks[0]), events.index([e for e in events if e.get("phase") == "final_validation"][-1]))
+
+    def test_end_alignment_runs_again_when_the_ends_are_still_out(self):
+        world, events = self.run_end_alignment(short_strokes=1)                           # the first push falls short
+        checks = [e for e in events if e.get("phase") == "row_alignment_check"]
+        self.assertEqual([(c["round"], c["aligned"]) for c in checks], [(1, False), (2, True)])
+        self.assertGreater(checks[0]["end_spread_mm"], 5.0)
+        self.assertEqual([e["round"] for e in events if e.get("phase") == "push_align"], [1, 2])
+        xs = sorted(b[1] for b in world.blocks)
+        self.assertLessEqual(xs[-1] - xs[0], 5.0)
+
+    def test_end_alignment_stops_after_three_rounds(self):
+        world, events = self.run_end_alignment(short_strokes=99)                          # every push falls short
+        checks = [e for e in events if e.get("phase") == "row_alignment_check"]
+        self.assertEqual([(c["round"], c["aligned"]) for c in checks], [(1, False), (2, False), (3, False)])
+        self.assertEqual(len([e for e in events if e.get("phase") == "row_ends_not_aligned"]), 1)
+        self.assertTrue([e for e in events if e.get("phase") == "final_validation"])     # carries on to the pallet check
+
     def test_no_flatten_sweeps_on_a_flat_heap(self):
         rc, events = self.run_flow(self.flat_heap(), flatten_sweeps=3)
         self.assertFalse(any(e.get("phase") == "flatten_sweep" for e in events))

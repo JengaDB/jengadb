@@ -92,6 +92,9 @@ NEAR_TABLE_BANDS = ((100.0, 60.0), (40.0, 20.0))   # (claw tips below this heigh
                                   # crawled (run 11: 23 s for the third block's 446 mm, run 8 without a cap 8-10 s).
 ZONE_EDGE_MM = 0.5                # a move ending this close to a band's edge counts as at the edge (100 mm after a lift)
 ROW_ALIGN_TOLERANCE_MM = 2.0      # a pallet block whose end sticks out past the last block's by more is pushed back (spec, 30 Oct)
+END_ALIGN_CHECK_MM = 5.0          # after the end pushes, a look from home: the ends must lie within this of each other,
+                                  # else the end alignment runs again (operator, 30 Oct)...
+MAX_ALIGN_ROUNDS = 3              # ...up to this many rounds in all, then on to the pallet check and stacking
 ALIGN_START_GAP_MM = 10.0         # end alignment: the claws come down this far past the block's end (5 was too close: operator, 30 Oct)
 LOW_TRAVEL_TIPS_MM = 30.0         # pallet push stage: closed claws travel this high, over 15 mm block tops with 15 to spare
 LOW_TRAVEL_MARGIN_MM = 10.0       # anything taller than LOW_TRAVEL_TIPS_MM minus this near the path is gone over, not through
@@ -1860,7 +1863,9 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
 
         async def push_phase():
             """Sam's pallet procedure (30 Oct spec): 0. look from home; 1. push the row together toward the first block, then
-            look again from home (run 9); 2. line up every end with the last block's, furthest first; 3. go home.
+            look again from home (run 9); 2. line up every end with the last block's, furthest first, then look again from
+            home and repeat until the ends lie within END_ALIGN_CHECK_MM of each other (MAX_ALIGN_ROUNDS at most);
+            3. go home.
             The closed claws travel LOW_TRAVEL_TIPS_MM above the table between strokes. Returns the measured pallet count."""
             nonlocal pallet_count
             pallet_count = len([s for s in filled if s.startswith("L0")])
@@ -1929,20 +1934,58 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                         ends = []
                 else:
                     ep.event("flow", phase="row_remeasure_refused", note="no end pushes without a look after the closing push")
-            turned = False
-            for e in ends if ok else []:
-                # 2. Line up the ends, furthest first; the claws turn a quarter turn the first time only
-                ok = await move_low(e["start_xy"], obstacles, high_z)
-                if ok:
-                    ok = await low_stroke(e["start_xy"], target.layer0_long_side_deg, e["direction"], e["distance_mm"], turn=not turned)
-                    turned = True
-                ep.event("flow", phase="push_align", index=e["index"], offset_mm=round(e["offset_mm"], 1), also_lines_up=e["also_lines_up"],
-                         start_xy=[round(v, 1) for v in e["start_xy"]], direction=[round(v, 2) for v in e["direction"]],
-                         distance_mm=round(e["distance_mm"], 1), accepted=ok)
-                print(f"Push (align): block {e['index']} end {e['offset_mm']:+.1f} mm past the last block's; pushed back"
-                      + (f" with block(s) {e['also_lines_up']}" if e["also_lines_up"] else ""), flush=True)
+            align_round = 0
+            while ok and ends:
+                align_round += 1
+                turned = False
+                for e in ends:
+                    # 2. Line up the ends, furthest first; the claws turn a quarter turn the first time only
+                    ok = await move_low(e["start_xy"], obstacles, high_z)
+                    if ok:
+                        ok = await low_stroke(e["start_xy"], target.layer0_long_side_deg, e["direction"], e["distance_mm"], turn=not turned)
+                        turned = True
+                    ep.event("flow", phase="push_align", round=align_round, index=e["index"], offset_mm=round(e["offset_mm"], 1),
+                             also_lines_up=e["also_lines_up"], start_xy=[round(v, 1) for v in e["start_xy"]],
+                             direction=[round(v, 2) for v in e["direction"]], distance_mm=round(e["distance_mm"], 1), accepted=ok)
+                    print(f"Push (align): block {e['index']} end {e['offset_mm']:+.1f} mm past the last block's; pushed back"
+                          + (f" with block(s) {e['also_lines_up']}" if e["also_lines_up"] else ""), flush=True)
+                    if not ok:
+                        break
                 if not ok:
                     break
+                # 2b. Check (operator, 30 Oct): rise, look from home, and line the ends up again until they lie within
+                # END_ALIGN_CHECK_MM of each other, at most MAX_ALIGN_ROUNDS rounds; then on to the pallet check.
+                g = await bot.gripper_origin()
+                if g[2] < high_z - 1.0:
+                    await bot.move_delta(dz=high_z - g[2], near_table=True)
+                ok_home, _ = await bot.move_to(*home)
+                if not ok_home:
+                    ep.event("flow", phase="row_alignment_check_skipped", round=align_round, reason="view_pose_refused")
+                    break
+                obs_m, scene_m = await scene_from_capture()
+                ctx_m = proposal.build_context(scene_m, tower_origin_xy_mm=tower_origin, filled_slots=filled, dry_run=True, tower_gap_mm=gap_mm)
+                row = row_blocks(ctx_m, 0)
+                pallet_count = len(row)
+                pts = [g_["base_point_mm"] for g_ in row]
+                check = pallet_push_plan(pts, target.layer0_long_side_deg, calib.block, ROW_ALIGN_TOLERANCE_MM, calib.finger.finger_width_mm)
+                spread = (max(check["offsets_mm"] + [0.0]) - min(check["offsets_mm"] + [0.0])) if len(row) > 1 else 0.0
+                aligned = spread <= END_ALIGN_CHECK_MM
+                ep.event("flow", phase="row_alignment_check", round=align_round, observation_id=obs_m["observation_id"], blocks=len(row),
+                         end_offsets_mm=[round(o, 1) for o in check["offsets_mm"]], end_spread_mm=round(spread, 1),
+                         limit_mm=END_ALIGN_CHECK_MM, aligned=aligned)
+                print(f"Alignment check {align_round}: ends within {spread:.1f} mm of each other "
+                      f"({'OK' if aligned else 'over ' + format(END_ALIGN_CHECK_MM, '.0f') + ' mm'})", flush=True)
+                if aligned or len(row) < 2:
+                    break
+                if align_round >= MAX_ALIGN_ROUNDS:
+                    ep.event("flow", phase="row_ends_not_aligned", rounds=align_round, end_spread_mm=round(spread, 1),
+                             note="carrying on; the stacking stage checks the layer's end stagger")
+                    print(f"Ends still {spread:.1f} mm apart after {align_round} alignment rounds; carrying on", flush=True)
+                    break
+                ends = check["ends"]
+                obstacles = [(tuple(c["geometry"]["base_point_mm"][:2]), c["geometry"]["height_above_table_mm"]) for c in ctx_m["candidates"]
+                             if c["geometry"].get("base_point_mm") and c["geometry"].get("height_above_table_mm") is not None]
+                high_z = (await bot.gripper_origin())[2]
             if not ok:
                 ep.event("flow", phase="push_refused", note="keeping the row as it is; the pallet check and stacking measure it")
                 print("A push move was refused; keeping the row as it is", flush=True)
