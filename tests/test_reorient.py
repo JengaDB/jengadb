@@ -83,6 +83,15 @@ class Reasons(unittest.TestCase):
         self.assertTrue(any(r.startswith("short:60.0") for r in leaning))
         self.assertIn("tilt:unknown", geom.lying_flat_reasons(flat_geometry(), None, self.dims))
 
+    def test_pallet_check_needs_positive_evidence(self):
+        # A good pallet block whose mask is trimmed by its neighbours, or whose face cannot be fitted, is left alone.
+        self.assertEqual(geom.misplaced_on_pallet_reasons(flat_geometry(length_mm=55.0, width_mm=16.0), None, self.dims), [])
+        self.assertEqual(geom.misplaced_on_pallet_reasons(flat_geometry(height_above_table_mm=11.9), 2.0, self.dims), [])   # 30 Oct pallet
+        on_neighbour = geom.misplaced_on_pallet_reasons(flat_geometry(height_above_table_mm=30.0), 1.0, self.dims)
+        self.assertEqual(on_neighbour, ["height:30.0mm_not_one_block"])
+        self.assertEqual(geom.misplaced_on_pallet_reasons(flat_geometry(height_above_table_mm=18.0), 12.0, self.dims), ["tilt:12.0deg"])
+        self.assertIn("on_edge", geom.misplaced_on_pallet_reasons(flat_geometry(height_above_table_mm=25.0, flags=["possibly_on_edge"]), 0.5, self.dims))
+
 
 if __name__ == "__main__":
     unittest.main()

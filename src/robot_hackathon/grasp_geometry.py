@@ -676,6 +676,14 @@ def lying_flat_reasons(geometry, tilt_deg, dims, max_tilt_deg=REORIENT_TILT_DEG)
     return reasons
 
 
+def misplaced_on_pallet_reasons(geometry, tilt_deg, dims, max_tilt_deg=REORIENT_TILT_DEG):
+    """A pallet block that must be taken off and laid flat again: not one block thick (on a neighbour, on its edge),
+    standing on its edge, or tilted. Only positive evidence counts here: pallet blocks touch, so their masks can be
+    trimmed, and a short footprint or an unmeasurable face is not a reason to disturb a good row."""
+    return [r for r in lying_flat_reasons(geometry, tilt_deg, dims, max_tilt_deg)
+            if r == "on_edge" or (r.startswith("height:") and r != "height:unknown") or (r.startswith("tilt:") and r != "tilt:unknown")]
+
+
 def grip_tips_mm(block_height, claws_deg, params, block_thickness_mm=None):
     """How far above the table the claw tips go to grip a block whose top is block_height above the table (Sam's
     grip_tips_mm). The floor tips_min_mm is relative to the surface the block rests on, so a block on top of another

@@ -319,7 +319,9 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
     layers: how many layers this target may receive. A pallet is 1: blocks are never stacked on the pallet spot.
     drop_spot_xy: a clear table spot. A picked block whose top face is tilted more than REORIENT_TILT_DEG, or that
     stands on its edge, is first released DROP_HEIGHT_MM above this spot so gravity lays it flat; a fresh capture then
-    checks it lies flat before it can go to the pallet (operator request, 30 Oct). None keeps the old behaviour."""
+    checks it lies flat before it can go to the pallet (operator request, 30 Oct). After the push rounds the pallet is
+    checked the same way and a block on a neighbour, tilted or on its edge is taken off and dropped there too, then
+    replaced by the top-up. None keeps the old behaviour."""
     from . import proposal, rgbd, segmentation, retrieval
     from . import grasp_geometry as geom
     from .capture import open_client, capture_with_camera
@@ -555,9 +557,96 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 ep.state["pallet_count"] = len(row0)
                 ep.save()
                 return 0
+        async def grab_block(pick, grasp, tips, label):
+            """Hover, align the claws, descend and grab, with the gripper's own report as the grip check and a bounded
+            retry of the same movement. Returns (stop_reason, held, travel_z, attempts, aligned); held is the block
+            centre in the gripper frame."""
+            bx, by, bz = pick["geometry"]["base_point_mm"]
+            g0 = await bot.gripper_origin()
+            travel_z = g0[2]
+            close_deg = grasp.get("claws_close_direction_deg_in_base")
+            stop_reason, held, aligned = None, None, False
+            attempt = 0
+            while True:
+                attempt += 1
+                await bot.gripper.open()   # always approach with open claws (after a push the gripper is closed)
+                g = await bot.gripper_origin()
+                ok, _ = await bot.move_delta(dx=bx - g[0], dy=by - g[1])
+                if not ok:
+                    stop_reason = "hover_refused"; break
+                aligned, log = await bot.align_claws(close_deg, align_speed=align_speed, travel_speed=travel_speed)
+                g = await bot.gripper_origin()
+                ok, _ = await bot.move_delta(dx=bx - g[0], dy=by - g[1])   # re-centre: rotating moves the gripper origin
+                ok = await bot.descend_to(table_z + tips - TIP_ABOVE_GRIPPER_FRAME_MM, approach_speed, travel_speed)
+                if not ok:
+                    await bot.set_speed(travel_speed)
+                    stop_reason = "descend_refused"; break
+                held = await bot.world_to_frame("gripper", bx, by, bz)
+                got = await bot.gripper.grab()
+                await bot.set_speed(travel_speed)
+                state = await bot.grip_state()
+                failed = grip_failed(state, got)
+                ep.event("flow", phase="grab", slot=label, candidate=pick["candidate_id"], attempt=attempt, grab=bool(got),
+                         gripper=state, failed=failed)
+                print(f"{label}: grab {'ok' if got else 'FALSE'}, gripper reports holding={state['holding']} width={state['width']} "
+                      f"({state['source']}) -> {'FAILED' if failed else 'held'}", flush=True)
+                if not failed:
+                    break
+                await bot.gripper.open()
+                g = await bot.gripper_origin()
+                await bot.move_delta(dz=travel_z - g[2], near_table=True)
+                if attempt > grip_retries:
+                    stop_reason = "grab_failed"; break
+                print(f"{label}: retrying the pick ({attempt}/{grip_retries} retries used)", flush=True)
+            return stop_reason, held, travel_z, attempt, aligned
+
+        async def drop_and_check(pick, reasons, tips, resting, travel_z, label):
+            """The block is held at lift height: release it DROP_HEIGHT_MM above the drop spot so it falls onto its widest
+            face, go to the view pose, capture, and check it lies flat. obs/scene/ctx/queue and the pallet count come from
+            the new capture. Returns a stop reason (event recorded) or None to carry on."""
+            nonlocal drops_used, obs, scene, ctx, queue
+            g = await bot.gripper_origin()
+            ok, _ = await bot.move_delta(dx=drop_spot_xy[0] - g[0], dy=drop_spot_xy[1] - g[1])
+            if ok:
+                ok = await bot.descend_to(table_z + DROP_HEIGHT_MM + (tips - resting) - TIP_ABOVE_GRIPPER_FRAME_MM, approach_speed, travel_speed)
+            if not ok:
+                await bot.set_speed(travel_speed)
+                ep.event("flow", phase="stop", reason="drop_refused", note="block still held; use live-step abort-up/open")
+                return "drop_refused"
+            await bot.gripper.open()
+            await bot.set_speed(travel_speed)
+            g = await bot.gripper_origin()
+            await bot.move_delta(dz=travel_z - g[2], near_table=True)
+            drops_used += 1
+            ep.event("flow", phase="dropped", slot=label, candidate=pick["candidate_id"], drop_xy=list(drop_spot_xy),
+                     drop_height_mm=DROP_HEIGHT_MM, reasons=reasons, drops_used=drops_used)
+            ok, _ = await bot.move_to(*home)
+            if not ok:
+                ep.event("flow", phase="stop", reason="view_pose_refused_after_drop")
+                return "view_pose_refused_after_drop"
+            obs, scene = await scene_from_capture()
+            ctx = await context_for(scene, filled)
+            reconcile_pallet(ctx, f"after_drop_{label}")
+            queue = build_queue(ctx, obs, scene, f"after_drop_{label}")
+            near = [c for c in ctx["candidates"] if c["geometry"].get("base_point_mm")
+                    and math.dist(c["geometry"]["base_point_mm"][:2], drop_spot_xy) < DROP_FIND_MM]
+            if not near:
+                flat_reasons, found = ["not_found_near_drop_spot"], None
+            else:
+                found = min(near, key=lambda c: math.dist(c["geometry"]["base_point_mm"][:2], drop_spot_xy))
+                flat_reasons = geom.lying_flat_reasons(found["geometry"], candidate_tilt(scene, found), calib.block)
+            ep.event("flow", phase="reorient_check", slot=label, observation_id=obs["observation_id"],
+                     candidate=found["candidate_id"] if found else None, flat=not flat_reasons, reasons=flat_reasons, drops_used=drops_used)
+            print(f"{label}: after the drop the block {'lies flat' if not flat_reasons else 'is NOT flat: ' + ', '.join(flat_reasons)}", flush=True)
+            if flat_reasons and drops_used >= MAX_REORIENT_DROPS:
+                ep.event("flow", phase="stop", reason="reorient_failed", drops_used=drops_used, note="lay the block flat by hand, then rerun")
+                print(f"{label}: still not flat after {drops_used} drop(s); lay it flat by hand and rerun", flush=True)
+                return "reorient_failed"
+            return None
+
         async def pick_phase():
             """Place blocks until the layer is full, the placement budget is spent, or a hard stop."""
-            nonlocal filled, last_pose, obs, scene, ctx, queue, flow_stopped, rescans_without_progress, placed_at_last_scan, drops_used
+            nonlocal filled, last_pose, obs, scene, ctx, queue, flow_stopped, rescans_without_progress, placed_at_last_scan
             rescans_without_progress = 0
             placed_at_last_scan = 0
             while len(placed) < max_blocks:
@@ -649,86 +738,13 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                       f"tips {tips:.1f} mm above the calibrated table{' (raised over a low neighbour)' if grasp.get('tips_raised_over_neighbour') else ''}"
                       + (f" -> {', '.join(reorient)}: drop at ({drop_spot_xy[0]:.0f}, {drop_spot_xy[1]:.0f}) to lay it flat"
                          if reorient else f" -> place at ({sx:.0f}, {sy:.0f}) long {slot['long_side_deg']:.0f} deg"), flush=True)
-                # --- pick, with the gripper's own report as the grip check and a bounded retry of the same movement
-                g0 = await bot.gripper_origin()
-                travel_z = g0[2]
-                close_deg = grasp.get("claws_close_direction_deg_in_base")
-                stop_reason = None
-                attempt = 0
-                while True:
-                    attempt += 1
-                    await bot.gripper.open()   # always approach with open claws (after a push the gripper is closed)
-                    g = await bot.gripper_origin()
-                    ok, _ = await bot.move_delta(dx=bx - g[0], dy=by - g[1])
-                    if not ok:
-                        stop_reason = "hover_refused"; break
-                    aligned, log = await bot.align_claws(close_deg, align_speed=align_speed, travel_speed=travel_speed)
-                    g = await bot.gripper_origin()
-                    ok, _ = await bot.move_delta(dx=bx - g[0], dy=by - g[1])   # re-centre: rotating moves the gripper origin
-                    ok = await bot.descend_to(table_z + tips - TIP_ABOVE_GRIPPER_FRAME_MM, approach_speed, travel_speed)
-                    if not ok:
-                        await bot.set_speed(travel_speed)
-                        stop_reason = "descend_refused"; break
-                    held = await bot.world_to_frame("gripper", bx, by, bz)
-                    got = await bot.gripper.grab()
-                    await bot.set_speed(travel_speed)
-                    state = await bot.grip_state()
-                    failed = grip_failed(state, got)
-                    ep.event("flow", phase="grab", slot=slot["slot_id"], candidate=pick["candidate_id"], attempt=attempt, grab=bool(got),
-                             gripper=state, failed=failed)
-                    print(f"{slot['slot_id']}: grab {'ok' if got else 'FALSE'}, gripper reports holding={state['holding']} width={state['width']} "
-                          f"({state['source']}) -> {'FAILED' if failed else 'held'}", flush=True)
-                    if not failed:
-                        break
-                    await bot.gripper.open()
-                    g = await bot.gripper_origin()
-                    await bot.move_delta(dz=travel_z - g[2], near_table=True)
-                    if attempt > grip_retries:
-                        stop_reason = "grab_failed"; break
-                    print(f"{slot['slot_id']}: retrying the pick ({attempt}/{grip_retries} retries used)", flush=True)
+                stop_reason, held, travel_z, attempt, aligned = await grab_block(pick, grasp, tips, slot["slot_id"])
                 if stop_reason:
                     flow_stopped = True; ep.event("flow", phase="stop", reason=stop_reason, candidate=pick["candidate_id"], attempts=attempt); break
                 ok, _ = await bot.move_delta(dz=PICK_LIFT_MM, near_table=True)
                 if reorient:
-                    # --- drop: release a short height above the clear spot; the block falls onto its widest face
-                    g = await bot.gripper_origin()
-                    ok, _ = await bot.move_delta(dx=drop_spot_xy[0] - g[0], dy=drop_spot_xy[1] - g[1])
-                    if ok:
-                        ok = await bot.descend_to(table_z + DROP_HEIGHT_MM + (tips - resting) - TIP_ABOVE_GRIPPER_FRAME_MM, approach_speed, travel_speed)
-                    if not ok:
-                        await bot.set_speed(travel_speed)
-                        flow_stopped = True; ep.event("flow", phase="stop", reason="drop_refused", note="block still held; use live-step abort-up/open"); break
-                    await bot.gripper.open()
-                    await bot.set_speed(travel_speed)
-                    g = await bot.gripper_origin()
-                    await bot.move_delta(dz=travel_z - g[2], near_table=True)
-                    drops_used += 1
-                    ep.event("flow", phase="dropped", candidate=pick["candidate_id"], drop_xy=list(drop_spot_xy), drop_height_mm=DROP_HEIGHT_MM,
-                             reasons=reorient, drops_used=drops_used)
-                    ok, _ = await bot.move_to(*home)
-                    if not ok:
-                        flow_stopped = True; ep.event("flow", phase="stop", reason="view_pose_refused_after_drop"); break
-                    obs, scene = await scene_from_capture()
-                    ctx = await context_for(scene, filled)
-                    reconcile_pallet(ctx, "after_drop")
-                    queue = build_queue(ctx, obs, scene, "after_drop")
-                    near = [c for c in ctx["candidates"] if c["geometry"].get("base_point_mm")
-                            and math.dist(c["geometry"]["base_point_mm"][:2], drop_spot_xy) < DROP_FIND_MM]
-                    if not near:
-                        flat_reasons, found = ["not_found_near_drop_spot"], None
-                    else:
-                        found = min(near, key=lambda c: math.dist(c["geometry"]["base_point_mm"][:2], drop_spot_xy))
-                        found_tilt = candidate_tilt(scene, found)
-                        flat_reasons = geom.lying_flat_reasons(found["geometry"], found_tilt, calib.block)
-                    ep.event("flow", phase="reorient_check", observation_id=obs["observation_id"], candidate=found["candidate_id"] if found else None,
-                             flat=not flat_reasons, reasons=flat_reasons, drops_used=drops_used)
-                    print(f"{slot['slot_id']}: after the drop the block {'lies flat' if not flat_reasons else 'is NOT flat: ' + ', '.join(flat_reasons)}", flush=True)
-                    if flat_reasons and drops_used >= MAX_REORIENT_DROPS:
-                        flow_stopped = True
-                        ep.event("flow", phase="stop", reason="reorient_failed", drops_used=drops_used,
-                                 note="lay the block flat by hand, then rerun")
-                        print(f"{slot['slot_id']}: still not flat after {drops_used} drop(s); lay it flat by hand and rerun", flush=True)
-                        break
+                    if await drop_and_check(pick, reorient, tips, resting, travel_z, slot["slot_id"]):
+                        flow_stopped = True; break
                     continue   # the slot is still open; the next pick comes from this fresh capture
                 # --- place
                 g = await bot.gripper_origin()
@@ -820,6 +836,52 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
             await bot.move_to(*home)
             return ok
 
+        async def repair_pallet(fill_round):
+            """After the push rounds (needs drop_spot_xy): a pallet block that does not lie flat (resting on a neighbour,
+            tilted, on its edge) is picked and laid flat on the drop spot, highest first, one per fill round; the top-up
+            then fetches a replacement and the next round checks again (operator request, 30 Oct: pick-and-drop rather
+            than sweeping the pallet). Sets flow_stopped when the block cannot be gripped or the drop fails."""
+            nonlocal obs, scene, ctx, queue, flow_stopped, pallet_count
+            obs, scene = await scene_from_capture()
+            ctx = await context_for(scene, filled)
+            checked = []
+            for c in ctx["candidates"]:
+                if "in_tower_zone" not in c["rejection_reasons"] or not c["geometry"].get("base_point_mm"):
+                    continue
+                tilt = candidate_tilt(scene, c)
+                checked.append((c, tilt, geom.misplaced_on_pallet_reasons(c["geometry"], tilt, calib.block)))
+            bad = [t for t in checked if t[2]]
+            ep.event("flow", phase="pallet_check", fill_round=fill_round, observation_id=obs["observation_id"],
+                     blocks=[{"candidate": c["candidate_id"], "xy": [round(v, 1) for v in c["geometry"]["base_point_mm"][:2]],
+                              "height": c["geometry"].get("height_above_table_mm"), "tilt_deg": None if t is None else round(t, 1),
+                              "misplaced": r} for c, t, r in checked])
+            if not bad:
+                return
+            c, tilt, reasons = max(bad, key=lambda b: b[0]["geometry"].get("height_above_table_mm") or 0.0)
+            print(f"Pallet check: block at ({c['geometry']['base_point_mm'][0]:.0f}, {c['geometry']['base_point_mm'][1]:.0f}) "
+                  f"{', '.join(reasons)}; taking it off to lay it flat", flush=True)
+            # Pallet blocks are excluded from picking by the zone; grasps come from a context of the same capture without it.
+            entry = proposal.candidate_entry(proposal.build_context(scene, filled_slots=filled, dry_run=True), c["candidate_id"])
+            grasp = next((g for style in proposal.grasp_order(None) for g in entry["grasps"] if g["style"] == style and g["eligible"]), None)
+            blocker = drop_spot_blocked(ctx, c["candidate_id"])
+            if grasp is None or blocker:
+                flow_stopped = True
+                why = "no clear grasp" if grasp is None else f"drop spot occupied by {blocker}"
+                ep.event("flow", phase="stop", reason="pallet_repair_impossible", candidate=c["candidate_id"], misplaced=reasons,
+                         detail=why, note="straighten or remove the block by hand, then rerun")
+                print(f"Pallet repair not possible ({why}); straighten or remove the block by hand, then rerun", flush=True)
+                return
+            tips, resting = grasp["tips_above_table_mm"], grasp.get("resting_level_mm", 0.0)
+            ep.event("flow", phase="pallet_repair", candidate=c["candidate_id"], misplaced=reasons, grasp=grasp["style"],
+                     tips_above_table_mm=round(tips, 1), resting_level_mm=resting)
+            stop_reason, _, travel_z, attempt, _ = await grab_block(entry, grasp, tips, "repair")
+            if stop_reason:
+                flow_stopped = True; ep.event("flow", phase="stop", reason=stop_reason, candidate=c["candidate_id"], attempts=attempt); return
+            await bot.move_delta(dz=PICK_LIFT_MM, near_table=True)
+            if await drop_and_check(entry, reasons, tips, resting, travel_z, "repair"):
+                flow_stopped = True; return
+            pallet_count = len(row_blocks(ctx, 0))
+
         async def push_phase():
             """Close, centre and align the row with captures between pushes; returns the measured pallet count."""
             nonlocal pallet_count
@@ -878,6 +940,8 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
             ok, _ = await bot.move_to(*home)
             ep.event("flow", phase="home", accepted=ok, placed=placed, pose=list(home), fill_round=fill_round)
             await push_phase()
+            if drop_spot_xy is not None and not flow_stopped:
+                await repair_pallet(fill_round)
             if flow_stopped or pallet_count >= target.blocks_per_layer or len(placed) >= max_blocks:
                 break
             # Fewer blocks on the pallet than placed (a drop, a knock-out): the measured count frees the slots again and

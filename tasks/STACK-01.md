@@ -211,6 +211,16 @@ local/layer-stack-data/live/episodes/):
   the pallet and keep-out. Offline: tests/test_reorient.py (tilt within 1.5 deg at 0/5/12/25 deg with side faces);
   a scratch simulation of a block leaning 12 deg measured 11.3 deg, dropped it, found it flat and finished the
   pallet. Untested live.
+- Pallet repair (same branch, operator choice "pick-and-drop" over sweeping the pallet): with `--drop-spot`, after the
+  push rounds a fresh capture checks every pallet block; one not one block thick (on a neighbour, on its edge) or
+  tilted over 8 deg is picked (grasps from a zone-free context of the same capture; tips raised over the lower
+  neighbours) and laid flat on the drop spot, highest first, one per fill round; the top-up replaces it. Only
+  positive evidence counts on the pallet (a trimmed mask or unmeasurable face does not). No clear grasp or an
+  occupied drop spot stops the run for the operator. Pick and drop motions are shared helpers (`grab_block`,
+  `drop_and_check`) for heap and pallet. Scratch simulation: a pallet block put down on its neighbour measured
+  29.7 mm, was taken off at tips 21.7, dropped, found flat and replaced. The same simulation still ends 2 of 3: the
+  third across-grasp block lands outside the 102.5 mm zone and the top-up re-picks it (fixed on codex/layer-stack
+  efd55a1, not merged here). Untested live.
 
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot
 complete until it is changed; table height and camera offset are unverified; `--grip-lower-mm 3` is a single-run fix,
