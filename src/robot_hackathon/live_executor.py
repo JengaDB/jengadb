@@ -303,39 +303,58 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
         await bot.gripper.open()
         ok, _ = await bot.move_to(*HOME)
         ep.event("flow", phase="home", accepted=ok, placed=placed)
-        if placed and any(p["slot"].startswith("L0") for p in placed) and not any(p["slot"].startswith("L1") for p in placed):
-            obs_m, scene_m = await scene_from_capture()
-            ctx_m = proposal.build_context(scene_m, tower_origin_xy_mm=tower_origin, filled_slots=filled, dry_run=True, tower_gap_mm=gap_mm)
-            row = row_blocks(ctx_m, 0)
+        async def push_row(edge_block_xy, ux, uy, distance, label):
+            """Closed claws come down just outside `edge_block_xy` on the side opposite to (ux, uy), then slide `distance`."""
             w = calib.block.width_mm
-            pts = [g["base_point_mm"] for g in row]
-            gaps = sum(max(0.0, math.hypot(b[0] - a[0], b[1] - a[1]) - w) for a, b in zip(pts, pts[1:]))
-            ep.event("flow", phase="row_measured", blocks=len(row), row_gaps_mm=round(gaps, 1),
-                     centres=[[round(p[0], 1), round(p[1], 1)] for p in pts])
-            if len(row) >= 2 and gaps > PUSH_IF_GAPS_OVER_MM:
-                across = math.radians(target.layer0_long_side_deg + 90.0)
-                ux, uy = -math.cos(across), -math.sin(across)                # from the row's far end back toward its first block
-                distance = gaps + PUSH_START_GAP_MM + PUSH_EXTRA_MM
-                last = pts[-1]
-                back = w / 2 + CLAW_THICKNESS_MM + PUSH_START_GAP_MM
-                start = (last[0] - ux * back, last[1] - uy * back)
-                await bot.gripper.grab()
-                g = await bot.gripper_origin()
-                travel_z = g[2]
-                ep.event("flow", phase="push_plan", start_xy=[round(v, 1) for v in start], distance_mm=round(distance, 1))
-                await bot.move_delta(dx=start[0] - g[0], dy=start[1] - g[1])
-                await bot.align_claws(wrap_90(target.layer0_long_side_deg + 90.0), tolerance_deg=1.5)
-                g = await bot.gripper_origin()
-                await bot.move_delta(dx=start[0] - g[0], dy=start[1] - g[1])
-                g = await bot.gripper_origin()
-                ok, _ = await bot.move_delta(dz=(table_z + PUSH_TIPS_MM - TIP_ABOVE_GRIPPER_FRAME_MM) - g[2], near_table=True)
-                if ok:
-                    ok, _ = await bot.move_delta(dx=ux * distance, dy=uy * distance, near_table=True)
-                g = await bot.gripper_origin()
-                await bot.move_delta(dz=travel_z - g[2], near_table=True)
-                await bot.gripper.open()
-                await bot.move_to(*HOME)
-                ep.event("flow", phase="pushed", accepted=ok)
+            back = w / 2 + CLAW_THICKNESS_MM + PUSH_START_GAP_MM
+            start = (edge_block_xy[0] - ux * back, edge_block_xy[1] - uy * back)
+            await bot.gripper.grab()
+            g = await bot.gripper_origin()
+            travel_z = g[2]
+            ep.event("flow", phase=f"push_{label}", start_xy=[round(v, 1) for v in start], direction=[round(ux, 2), round(uy, 2)], distance_mm=round(distance, 1))
+            await bot.move_delta(dx=start[0] - g[0], dy=start[1] - g[1])
+            await bot.align_claws(wrap_90(target.layer0_long_side_deg + 90.0), tolerance_deg=1.5)
+            g = await bot.gripper_origin()
+            await bot.move_delta(dx=start[0] - g[0], dy=start[1] - g[1])
+            g = await bot.gripper_origin()
+            ok, _ = await bot.move_delta(dz=(table_z + PUSH_TIPS_MM - TIP_ABOVE_GRIPPER_FRAME_MM) - g[2], near_table=True)
+            if ok:
+                ok, _ = await bot.move_delta(dx=ux * distance, dy=uy * distance, near_table=True)
+            g = await bot.gripper_origin()
+            await bot.move_delta(dz=travel_z - g[2], near_table=True)
+            await bot.gripper.open()
+            await bot.move_to(*HOME)
+            return ok
+
+        layer0_only = not any(p["slot"].startswith("L1") for p in placed) and not any(s.startswith("L1") for s in filled)
+        if layer0_only and (placed or any(s.startswith("L0") for s in filled)):
+            # Close the gaps, then centre the tight row on the target origin along the row direction. Two rounds at most.
+            across = math.radians(target.layer0_long_side_deg + 90.0)
+            ax, ay = math.cos(across), math.sin(across)
+            w = calib.block.width_mm
+            for _round in range(3):
+                obs_m, scene_m = await scene_from_capture()
+                ctx_m = proposal.build_context(scene_m, tower_origin_xy_mm=tower_origin, filled_slots=filled, dry_run=True, tower_gap_mm=gap_mm)
+                row = row_blocks(ctx_m, 0)
+                pts = [g["base_point_mm"] for g in row]
+                gaps = sum(max(0.0, math.hypot(b[0] - a[0], b[1] - a[1]) - w) for a, b in zip(pts, pts[1:]))
+                centre = (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts)) if pts else None
+                offset = ((tower_origin[0] - centre[0]) * ax + (tower_origin[1] - centre[1]) * ay) if centre else 0.0
+                ep.event("flow", phase="row_measured", blocks=len(row), row_gaps_mm=round(gaps, 1), centre_offset_along_row_mm=round(offset, 1),
+                         centres=[[round(p[0], 1), round(p[1], 1)] for p in pts])
+                if len(row) < 2:
+                    break
+                if gaps > PUSH_IF_GAPS_OVER_MM:
+                    # Push from the far end toward the first block (the first block was placed nominally, so it anchors the row).
+                    await push_row(pts[-1], -ax, -ay, gaps + PUSH_START_GAP_MM + PUSH_EXTRA_MM, "gaps")
+                    continue
+                if abs(offset) > 3.0:
+                    # Whole row off-centre: push from the side opposite to the needed shift by exactly that amount (no extra).
+                    sign = 1.0 if offset > 0 else -1.0
+                    edge = pts[0] if sign > 0 else pts[-1]
+                    await push_row(edge, sign * ax, sign * ay, abs(offset) + PUSH_START_GAP_MM, "centre")
+                    continue
+                break
         if final_capture:
             obs2, scene2 = await scene_from_capture()
             ctx2 = proposal.build_context(scene2, tower_origin_xy_mm=tower_origin, filled_slots=filled, dry_run=True, tower_gap_mm=gap_mm)
@@ -346,7 +365,7 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
             ep.event("flow", phase="final_validation", observation_id=obs2["observation_id"], blocks_in_tower_zone=sorted(measured, key=lambda m: (m["z"], m["xy"][1])))
         ep.state["filled"] = filled
         ep.save()
-        return 0 if placed else 1
+        return 0 if (placed or filled) else 1
     finally:
         await asyncio.wait_for(client.close(), timeout=5)
 
