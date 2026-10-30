@@ -12,7 +12,7 @@ dependencies = []
 [project.optional-dependencies]
 viam = ["viam-sdk"]
 mongo = ["pymongo>=4,<5"]
-rgbd = ["numpy", "pillow"]
+rgbd = ["numpy", "pillow", "meta-sam-parser>=0.1.0"]
 
 [project.scripts]
 robot-hackathon = "robot_hackathon.cli:main"

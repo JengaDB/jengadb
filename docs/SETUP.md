@@ -76,21 +76,28 @@ ALLOW_CLOUD=true .venv/bin/python run.py mongo-index --allow-cloud --confirm-wri
 ALLOW_CLOUD=true .venv/bin/python run.py flush --allow-cloud --confirm-write
 ```
 
-## RGB-D acquisition and Atlas connection
+## RGB-D collection pipeline
 
-Reused from SKY-66 (see docs/CACHE_INTEGRATION.md for what was and was not carried). Requires `pip install -e '.[rgbd,viam,mongo]'`. Records are written under `data/<mode>/observations/`; live capture requires `MODE=live`. Secrets come from the shell (`set -a; source .env; set +a` loads a git-ignored `.env`; nothing loads it automatically).
+Reused from SKY-66 without the local web UI (see docs/CACHE_INTEGRATION.md for the exact split). Requires `pip install -e '.[rgbd,viam,mongo]'`. Records are written under `data/<mode>/`; live capture requires `MODE=live`. Secrets come from the shell (`set -a; source .env; set +a` loads a git-ignored `.env`; nothing loads it automatically).
 
 | Command | Behavior |
 | --- | --- |
 | `rgbd-calibration --calibration-version V --alignment verified\|unverified\|unknown --method ... --checked-by ...` | Record the operator's RGB/depth alignment verdict for `SETUP_ID`; `--show` prints the current entry |
 | `rgbd-capture --allow-cloud [--episode ID]` | One read-only `camera.get_images` on `CAMERA_RESOURCE`; saves `rgb.png`, 16-bit `depth.png`, `observation.json` |
 | `rgbd-overlay --observation ID` | Depth-edge overlay PNG for the alignment check (a picture, not a verdict) |
-| `rgbd-status [--orphans --allow-cloud]` | Local observations, per-artifact hash status and acks; `--orphans` lists upload attempts past the age bound |
-| `rgbd-verify-embedding --allow-cloud` | Text-only call to the hosted Voyage endpoint through the cached provider; reports model and dimension |
-| `rgbd-index --allow-cloud --confirm-write [--status]` | Unique indexes plus the `candidate_context_v1` vector index |
-| `rgbd-flush --observation ID\|--all --allow-cloud --confirm-write [--clean-orphans]` | Upload only the named captures: media -> observation -> artifact_sync, idempotent with separate acks. No candidates on this branch |
+| `rgbd-verify-segmentation --allow-cloud --image PHOTO [--prompt "..."]` | One SAM 3.1 call on a real photo; reports masks, confidences, latency |
+| `rgbd-verify-embedding --allow-cloud` | Text-only call to the hosted Voyage endpoint; reports model and dimension |
+| `rgbd-process --observation ID\|--all --allow-cloud` | Segment (Meta SAM 3.1), classify exposure, cut out, embed (Voyage through the exact-request cache); checkpointed per stage |
+| `rgbd-status [--orphans --allow-cloud]` | Stage validity, per-artifact local status, acks; `--orphans` lists upload attempts past the age bound |
+| `rgbd-gallery` | HTML review page of cutouts with exposure status and reasons |
+| `rgbd-index --allow-cloud --confirm-write [--status]` | Unique indexes plus the `candidate_context_v1` vector index (1024-d cosine, filtered) |
+| `rgbd-flush --observation ID\|--all --allow-cloud --confirm-write [--clean-orphans]` | Upload only the named captures: media -> observation -> artifact_sync -> candidates, idempotent with separate acks |
+| `rgbd-delete --observation ID` | Remove a never-uploaded capture and its candidates locally; refused once any part was acknowledged by Atlas |
+| `rgbd-search --candidate ID --allow-cloud` | `$vectorSearch` with phase/setup/encoder filters using a local candidate's vector |
 
-Local Viam for development (second D435 on this Mac): `brew trust viamrobotics/brews && brew tap viamrobotics/brews && brew install viam-server viam`, download the `viam:realsense` module for `darwin/arm64`, point `configs/viam-local-mac.json` `modules[0].executable_path` at the extracted binary, plug in the camera and run `sudo viam-server -config configs/viam-local-mac.json` (the macOS module exits unless run as root). Then `MODE=live MACHINE_ADDRESS=localhost:8080 MACHINE_AUTH=none SETUP_ID=mac-desk-d435 ALLOW_CLOUD=true`. `MACHINE_AUTH=none` is rejected for any non-loopback address. The embedding cache lives in `data/<mode>/provider-cache/results.sqlite3`; delete the directory to reset it.
+Order for a new setup: record calibration, capture, overlay-inspect, re-record calibration as `verified` only if the overlay supports it, process, review the gallery, index once, flush. Exposure is `unknown` for every candidate until alignment is verified and the observation's calibration version is the registry's current one. Pickability is never set here. The embedding cache lives in `data/<mode>/provider-cache/results.sqlite3`; delete the directory to reset it.
+
+Local Viam for development (second D435 on this Mac): `brew trust viamrobotics/brews && brew tap viamrobotics/brews && brew install viam-server viam`, download the `viam:realsense` module for `darwin/arm64`, point `configs/viam-local-mac.json` `modules[0].executable_path` at the extracted binary, plug in the camera and run `sudo viam-server -config configs/viam-local-mac.json` (the macOS module exits unless run as root). Then `MODE=live MACHINE_ADDRESS=localhost:8080 MACHINE_AUTH=none SETUP_ID=mac-desk-d435 ALLOW_CLOUD=true`. `MACHINE_AUTH=none` is rejected for any non-loopback address.
 
 The flags express the operator's opt-in; they are not an access-control system. Use a scoped credential. TLS validation remains enabled. Connection, selection, socket, and operation timeouts are bounded. Ping does not establish write permission. No application database commands have been run. The separate Atlas management check authenticated and listed projects/clusters; it did not ping or write to the database.
 

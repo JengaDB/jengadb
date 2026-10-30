@@ -1,10 +1,15 @@
-# Hosted provider contracts (RGB-D acquisition and embeddings)
+# Hosted provider contracts (RGB-D pipeline)
 
-Evidence as of 29 October 2026, recorded on the SKY-66 branch. Adapters are tested against sanitized real responses in `fixtures/providers/`. No credentials appear here or in fixtures.
+Evidence as of 29 October 2026. Adapters are tested against sanitized real responses in `fixtures/providers/`. No credentials appear here or in fixtures.
 
-## Meta Model API, SAM 3.1 — not on this branch
+## Meta Model API, SAM 3.1 — verified
 
-The segmentation adapter, its fixture and `rgbd-verify-segmentation` live on the SKY-66 branch (PR #5) and were deliberately not carried here. This branch covers capture, storage, the Atlas connection and cached embeddings only.
+- Endpoint: `POST https://api.meta.ai/v1/responses` (Responses API), bearer key from `META_API_KEY`; host override `META_API_BASE_URL`.
+- Model `sam-3.1`. One user message with an `input_text` noun phrase (default prompt `wooden block`, configurable, part of the processing identity) and one `input_image`; a PNG `data:` URI is accepted. `metadata.mask_encoding: one_bit`, `metadata.include_confidence: "true"`.
+- Response: streamed SSE (`response.created`, `response.in_progress`, `response.output_item.added`, `response.content_part.added`, `response.output_text.delta`, `response.output_text.done`, `response.content_part.done`, `response.output_item.done`, `response.completed`). The `output_text` lane carries a special-token line with a box and a mask per object; zero matches is a completed response with an empty lane.
+- Decoding: official `meta_sam_parser` 0.1.0 (`parse_responses_stream` + `image_segmentation_format`, `decode_mask_to_raster`). Mask rasters are box-local; the adapter places each on the full frame using `record.bounds` and rejects bounds that do not fit the source image.
+- Verification run: `run.py rgbd-verify-segmentation --allow-cloud --image <real photo> --prompt mountain` on the 214x130 macOS "Sonoma Horizon" thumbnail returned 1 mask (1260 px, confidence 0.54) in 2.2 s. Fixture: `fixtures/providers/meta-sam3/responses-stream.json` (full event list). Not yet run on an actual block pile; prompt quality for wooden blocks is unmeasured.
+- References: https://dev.meta.ai/docs/sam/overview, https://dev.meta.ai/docs/sam/reading-segmentation, https://dev.meta.ai/docs/sam/client-libraries
 
 ## Voyage multimodal embeddings (MongoDB hosted endpoint) — verified
 

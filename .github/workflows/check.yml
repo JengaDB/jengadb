@@ -25,4 +25,4 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install -e '.[rgbd]'
-      - run: RGBD_TESTS_REQUIRED=1 python -m unittest tests.test_rgbd_acquisition tests.test_cached_embedding -v
+      - run: RGBD_TESTS_REQUIRED=1 python -m unittest tests.test_rgbd_pipeline tests.test_cached_embedding -v

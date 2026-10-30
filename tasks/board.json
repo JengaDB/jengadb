@@ -30,11 +30,11 @@
   {
     "id": "CACHE-01",
     "role": "data",
-    "title": "Exact-result cache with RGB-D acquisition and Atlas connection on main",
+    "title": "SKY-66 pipeline plus exact-result embedding cache, on main",
     "status": "in_progress",
     "card": "tasks/CACHE-01.md",
     "owner": "Kris",
-    "evidence": "59 offline tests pass (all RGB-D tests execute with numpy/Pillow); acquisition/connection modules copied from SKY-66 without processing; no live capture or Atlas write from this branch.",
-    "updated_at": "2026-10-30T00:15:00+00:00"
+    "evidence": "80 offline tests pass (all RGB-D tests execute with numpy/Pillow/meta-sam-parser); SKY-66 pipeline copied explicitly minus web UI; cache wired into Pipeline; match/proposal step not implemented; no live capture or Atlas write from this branch.",
+    "updated_at": "2026-10-30T00:45:00+00:00"
   }
 ]

@@ -22,15 +22,19 @@ class Config:
     uri: str = field(default="", repr=False)
     database: str = "hackathon"
     collection: str = "attempts"
-    # RGB-D acquisition and connection settings (reused from SKY-66). Optional; mock mode stays dependency-free.
+    # RGB-D collection pipeline (reused from SKY-66). All optional; defaults keep mock mode dependency-free.
     machine_auth: str = "apikey"
     setup_id: str = "mock"
     camera_resource: str = "cam"
     camera_serial: str = ""
+    meta_api_key: str = field(default="", repr=False)
+    meta_base_url: str = "https://api.meta.ai"
     voyage_key: str = field(default="", repr=False)
     voyage_base_url: str = "https://ai.mongodb.com"
     observations_collection: str = "observations"
     candidates_collection: str = "candidates"
+    block_dimensions_mm: tuple = (75.0, 25.0, 15.0)
+    block_dimensions_verified: bool = False
     media_attempt_max_age_hours: float = 24.0
 
     @classmethod
@@ -45,11 +49,17 @@ class Config:
         if machine_auth not in ("apikey", "none"):
             raise ConfigError("MACHINE_AUTH must be apikey or none")
         try:
+            dims = tuple(float(x) for x in env.get("BLOCK_DIMENSIONS_MM", "75,25,15").split(","))
+            if len(dims) != 3 or any(d <= 0 for d in dims):
+                raise ValueError
             max_age = float(env.get("MEDIA_ATTEMPT_MAX_AGE_HOURS", "24"))
             if max_age <= 0:
                 raise ValueError
         except ValueError:
-            raise ConfigError("MEDIA_ATTEMPT_MAX_AGE_HOURS must be a positive number") from None
+            raise ConfigError("BLOCK_DIMENSIONS_MM needs three positive numbers; MEDIA_ATTEMPT_MAX_AGE_HOURS must be positive") from None
+        meta_base = (env.get("META_API_BASE_URL") or "https://api.meta.ai").strip().rstrip("/")
+        if urlsplit(meta_base).scheme != "https" or not urlsplit(meta_base).hostname:
+            raise ConfigError("META_API_BASE_URL must be an https URL")
         # MongoDB's hosted Voyage models endpoint; accept either the VOYAGE_* or MONGO_DB_MODELS_ENDPOINT_* names.
         base = (env.get("MONGO_DB_MODELS_ENDPOINT_URL") or "https://ai.mongodb.com").strip().rstrip("/")
         if "://" not in base:
@@ -62,10 +72,12 @@ class Config:
                    env.get("MONGODB_COLLECTION", "attempts"),
                    machine_auth=machine_auth, setup_id=env.get("SETUP_ID", "mock"),
                    camera_resource=env.get("CAMERA_RESOURCE", "cam"), camera_serial=env.get("CAMERA_SERIAL", ""),
+                   meta_api_key=env.get("META_API_KEY", ""), meta_base_url=meta_base,
                    voyage_key=env.get("VOYAGE_API_KEY") or env.get("MONGO_DB_MODELS_ENDPOINT_KEY", ""),
                    voyage_base_url=base,
                    observations_collection=env.get("RGBD_OBSERVATIONS_COLLECTION", "observations"),
                    candidates_collection=env.get("RGBD_CANDIDATES_COLLECTION", "candidates"),
+                   block_dimensions_mm=dims, block_dimensions_verified=boolean(env, "BLOCK_DIMENSIONS_VERIFIED"),
                    media_attempt_max_age_hours=max_age)
 
     def require_cloud(self, explicit):
@@ -80,6 +92,10 @@ class Config:
             return
         if not all((self.address, self.key_id, self.key)):
             raise ConfigError("Set MACHINE_ADDRESS, API_KEY_ID and API_KEY locally")
+
+    def require_meta(self):
+        if not self.meta_api_key:
+            raise ConfigError("Set META_API_KEY locally")
 
     def require_voyage(self):
         if not self.voyage_key:
