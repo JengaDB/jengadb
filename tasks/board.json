@@ -3,8 +3,11 @@
     "id": "DATA-01",
     "role": "data",
     "title": "Episode recorder and replay",
-    "status": "ready",
-    "card": "tasks/DATA-01.md"
+    "status": "in_progress",
+    "card": "tasks/DATA-01.md",
+    "owner": "Kazy",
+    "evidence": "Local cache and artifact integrity checks pass 37 tests; saved-only mode ready. Earlier NUC demo used a real JPEG with synthetic processing. Full episode recorder remains pending.",
+    "updated_at": "2026-10-29T23:13:59.108537+00:00"
   },
   {
     "id": "VISION-01",
