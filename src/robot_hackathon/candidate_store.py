@@ -72,6 +72,28 @@ class CandidateLocalStore:
             atomic_write(self.path, "".join(rgbd.canonical_json(r) + "\n" for r in rows.values()))
             return len(rows)
 
+    def prune_stale(self, observation_id, keep_processing_version):
+        """Drop this observation's candidates from other processing versions, except ones already uploaded.
+
+        Their checkpoints and vectors remain under processing/<old_version>/ on disk; only the active list changes.
+        """
+        uploaded = set()
+        if self.directory.exists():
+            for path in self.directory.glob("acks-rgbd-*.json"):
+                uploaded |= set(json.loads(path.read_text()).get("candidates", []))
+        with self.lock():
+            rows = self.read()
+            kept, removed = [], 0
+            for r in rows:
+                stale = r["observation_id"] == observation_id and r["processing_version"] != keep_processing_version
+                if stale and r["candidate_id"] not in uploaded:
+                    removed += 1
+                    continue
+                kept.append(r)
+            if removed:
+                atomic_write(self.path, "".join(rgbd.canonical_json(r) + "\n" for r in kept))
+            return removed
+
 
 class Acks:
     def __init__(self, directory, target):
@@ -85,23 +107,153 @@ class Acks:
         atomic_write(self.path, json.dumps(self.data, sort_keys=True))
 
 
-def sync(data_dir, mode, remote, source_alias="laptop"):
-    """Media -> observation -> artifact_sync -> candidates, per observation. Stops at the first remote error.
+class Review:
+    """Operator curation per observation: which detections are ignored (never uploaded). Separate from the
+    immutable candidate records, so reprocessing stays deterministic and the decision is auditable."""
 
-    Returns a summary with per-artifact local/remote status. A timeout may have committed remotely; acks are
-    recorded only after verified presence or read-back, so the next run reconciles instead of duplicating.
+    def __init__(self, data_dir, mode):
+        self.root = Path(data_dir) / mode / "review"
+
+    def path(self, observation_id):
+        if not observation_id or "/" in observation_id or observation_id.startswith("."):
+            raise ValueError("Invalid observation_id")
+        return self.root / f"{observation_id}.json"
+
+    DEFAULT_PICKABILITY = "pickable"
+    PICKABILITY_LABELS = ("pickable", "not_pickable")
+
+    def load(self, observation_id):
+        p = self.path(observation_id)
+        doc = json.loads(p.read_text()) if p.exists() else {"observation_id": observation_id, "ignored": [], "reviewed_by": None, "updated_at": None}
+        doc.setdefault("labels", {})
+        return doc
+
+    def ignored(self, observation_id):
+        return set(self.load(observation_id)["ignored"])
+
+    def _write(self, doc):
+        doc["updated_at"] = rgbd.utc_now()
+        atomic_write(self.path(doc["observation_id"]), rgbd.canonical_json(doc))
+        return doc
+
+    def set_ignored(self, observation_id, candidate_ids, reviewed_by=None):
+        doc = self.load(observation_id)
+        doc["ignored"] = sorted(set(candidate_ids))
+        if reviewed_by:
+            doc["reviewed_by"] = reviewed_by
+        return self._write(doc)
+
+    def set_labels(self, observation_id, labels, reviewed_by=None):
+        """labels: {candidate_id: pickable|not_pickable}. Explicit human verdicts; unset ids use the default."""
+        for cid, status in labels.items():
+            if status not in self.PICKABILITY_LABELS:
+                raise ValueError(f"Invalid pickability label {status!r}")
+        doc = self.load(observation_id)
+        doc["labels"].update(labels)
+        if reviewed_by:
+            doc["reviewed_by"] = reviewed_by
+        return self._write(doc)
+
+    @staticmethod
+    def pickability_label(review_doc, candidate_id):
+        """Human pickability label with its provenance; the heuristic field on the record stays untouched."""
+        explicit = review_doc.get("labels", {}).get(candidate_id)
+        return {"status": explicit or Review.DEFAULT_PICKABILITY,
+                "label_source": "human" if explicit else "human_default",
+                "reviewed_by": review_doc.get("reviewed_by"), "reviewed_at": review_doc.get("updated_at")}
+
+    def remove(self, observation_id):
+        p = self.path(observation_id)
+        if p.exists():
+            p.unlink()
+
+
+def upload_state(data_dir, mode, observation_id):
+    """What any destination has acknowledged for this observation (observation, included candidates, media)."""
+    store = CandidateLocalStore(data_dir, mode)
+    obs_store = rgbd.ObservationStore(data_dir, mode)
+    try:
+        obs = obs_store.load(observation_id, verify=False)
+        shas = {a["sha256"] for a in obs["artifacts"]}
+    except (FileNotFoundError, ValueError):
+        shas = set()
+    ignored = Review(data_dir, mode).ignored(observation_id)
+    cand_ids = {c["candidate_id"] for c in store.read() if c["observation_id"] == observation_id} - ignored
+    state = {"observation": False, "candidates_acked": 0, "candidates_total": len(cand_ids), "media_acked": 0, "targets": []}
+    if store.directory.exists():
+        for path in store.directory.glob("acks-rgbd-*.json"):
+            d = json.loads(path.read_text())
+            hit = observation_id in d.get("observations", [])
+            c_ack = len(cand_ids & set(d.get("candidates", [])))
+            m_ack = len(shas & set(d.get("media", {})))
+            # Media is content-addressed and may be shared by identical bytes; only the observation record or its
+            # candidates tie this capture to a destination.
+            if hit or c_ack:
+                state["targets"].append(path.stem.replace("acks-rgbd-", ""))
+            state["observation"] |= hit
+            state["candidates_acked"] = max(state["candidates_acked"], c_ack)
+            state["media_acked"] = max(state["media_acked"], m_ack)
+    state["any"] = bool(state["targets"])
+    state["complete"] = state["observation"] and state["candidates_acked"] == state["candidates_total"] and state["media_acked"] == len(shas) and len(shas) > 0
+    return state
+
+
+def delete_observation(data_dir, mode, observation_id):
+    """Remove a never-uploaded capture and everything derived from it. Refuses once any part was acknowledged."""
+    import shutil
+    store = CandidateLocalStore(data_dir, mode)
+    obs_store = rgbd.ObservationStore(data_dir, mode)
+    directory = obs_store.directory(observation_id)
+    with store.lock():
+        state = upload_state(data_dir, mode, observation_id)
+        if state["any"]:
+            raise PermissionError(f"Observation {observation_id} was already uploaded to {state['targets']}; remote records are immutable")
+        rows = store.read()
+        kept = [r for r in rows if r["observation_id"] != observation_id]
+        if len(kept) != len(rows):
+            atomic_write(store.path, "".join(rgbd.canonical_json(r) + "\n" for r in kept))
+        existed = directory.exists()
+        if not existed and len(kept) == len(rows):
+            raise FileNotFoundError(f"No local capture {observation_id}")
+        if existed:
+            shutil.rmtree(directory)
+        Review(data_dir, mode).remove(observation_id)
+    return {"observation_id": observation_id, "removed_candidates": len(rows) - len(kept), "removed_directory": existed}
+
+
+def sync(data_dir, mode, remote, source_alias="laptop", observation_ids=None):
+    """Media -> observation -> artifact_sync -> candidates, for the selected observations only.
+
+    observation_ids is required to be explicit: nothing is uploaded unless named. Stops at the first remote error.
+    A timeout may have committed remotely; acks are recorded only after verified presence or read-back, so the
+    next run reconciles instead of duplicating.
     """
+    if not observation_ids:
+        raise ValueError("sync requires an explicit list of observation IDs to upload")
     obs_store = rgbd.ObservationStore(data_dir, mode)
     cand_store = CandidateLocalStore(data_dir, mode)
-    summary = {"media_uploaded": 0, "observations_sent": 0, "candidates_sent": 0, "artifacts": [], "error": None}
+    summary = {"media_uploaded": 0, "observations_sent": 0, "candidates_sent": 0, "artifacts": [], "error": None,
+               "observation_ids": list(observation_ids)}
+    review = Review(data_dir, mode)
     with cand_store.lock():
         acks = Acks(cand_store.directory, remote.target)
-        candidates = cand_store.read()
+        candidates = []
+        skipped = 0
+        for c in cand_store.read():
+            if c["observation_id"] not in set(observation_ids):
+                continue
+            if c["candidate_id"] in review.ignored(c["observation_id"]):
+                skipped += 1
+                continue
+            candidates.append(c)
+        summary["candidates_ignored"] = skipped
         by_obs = {}
         for c in candidates:
             by_obs.setdefault(c["observation_id"], []).append(c)
         try:
-            for obs_id in obs_store.list_ids():
+            for obs_id in observation_ids:
+                if not (obs_store.directory(obs_id) / "observation.json").exists():
+                    raise FileNotFoundError(obs_id)
                 obs = obs_store.load(obs_id, verify=False)
                 local = obs_store.local_artifact_status(obs)
                 obs_dir = obs_store.directory(obs_id)
@@ -109,6 +261,11 @@ def sync(data_dir, mode, remote, source_alias="laptop"):
                     sha = art["sha256"]
                     line = {"observation_id": obs_id, "kind": art["kind"], "sha256": sha, "local_status": local[art["kind"]]}
                     if sha in acks.data["media"]:
+                        # Media bytes may have been acknowledged before metadata
+                        # succeeded, or reused by another observation. Reconcile
+                        # each association even when no upload is necessary.
+                        remote.set_artifact_sync(sha, obs_id, "synced", acks.data["media"][sha], art["bytes"],
+                                                 {"source_alias": source_alias, "status": local[art["kind"]]})
                         line["remote_status"] = "synced"
                         if local[art["kind"]] != "present":
                             line["note"] = "local copy missing, remote verified"
@@ -135,10 +292,11 @@ def sync(data_dir, mode, remote, source_alias="laptop"):
                     acks.data["observations"].append(obs_id)
                     acks.save()
                     summary["observations_sent"] += 1
+                rev = review.load(obs_id)
                 for cand in by_obs.get(obs_id, []):
                     if cand["candidate_id"] in acks.data["candidates"]:
                         continue
-                    remote.upsert_candidate(remote_candidate(data_dir, cand))
+                    remote.upsert_candidate(remote_candidate(data_dir, cand, rev))
                     acks.data["candidates"].append(cand["candidate_id"])
                     acks.save()
                     summary["candidates_sent"] += 1
@@ -148,8 +306,14 @@ def sync(data_dir, mode, remote, source_alias="laptop"):
     return summary
 
 
-def remote_candidate(data_dir, cand):
+def remote_candidate(data_dir, cand, review_doc=None):
     doc = dict(cand)
+    review_doc = review_doc or {"labels": {}}
+    doc["review"] = {"status": "included", "reviewed_by": review_doc.get("reviewed_by"),
+                     "reviewed_at": review_doc.get("updated_at")}
+    # Human verdict, separate from the heuristic `pickability` (which stays unknown in this pipeline).
+    doc["pickability_label"] = Review.pickability_label(review_doc, cand["candidate_id"])
+    doc["pickable"] = doc["pickability_label"]["status"] == "pickable"
     doc["embedding"] = pipeline.load_embedding(data_dir, cand)
     for name in ("cutout_png", "context_png", "mask_png", "depth_crop_png"):
         doc[name] = pipeline.load_candidate_file(data_dir, cand, name)

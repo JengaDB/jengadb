@@ -18,43 +18,23 @@ def _intrinsics(props):
     return {k: getattr(intr, k, None) for k in ("width_px", "height_px", "focal_x_px", "focal_y_px", "center_x_px", "center_y_px")}
 
 
-async def capture_live(config, data_dir, episode_id=None, names=None):
-    """UNVERIFIED read-only scaffold: get_properties + get_images only. Alignment stays as recorded for the setup."""
+async def open_client(config):
+    """Read-only connection to the machine (robot address with API key, or local viam-server without one)."""
     config.require_viam()
-    if config.mode != "live":
-        raise ConfigError("Live capture requires MODE=live")
     from viam.robot.client import RobotClient
-    from viam.components.camera import Camera
-    registry = rgbd.CalibrationRegistry(data_dir, "live")
-    version = registry.current(config.setup_id)
-    if version is None:
-        raise ConfigError(f"No calibration recorded for setup {config.setup_id}; run rgbd-calibration record first")
-    cal = registry.load(config.setup_id, version)
     if config.machine_auth == "none":
         from viam.rpc.dial import DialOptions
         options = RobotClient.Options(dial_options=DialOptions(insecure=True, disable_webrtc=True))
     else:
         options = RobotClient.Options.with_api_key(api_key=config.key, api_key_id=config.key_id)
-    client = None
-    try:
-        client = await asyncio.wait_for(RobotClient.at_address(config.address, options), timeout=15)
-        camera = Camera.from_robot(client, config.camera_resource)
-        intrinsics = {"rgb": None, "depth": None}
-        try:
-            props = await asyncio.wait_for(camera.get_properties(), timeout=10)
-            intr = _intrinsics(props)
-            # The RealSense module registers depth to the colour frame (align_color_depth), so the reported colour
-            # intrinsics apply to both images. Recorded explicitly; the calibration record carries the operator verdict.
-            intrinsics = {"rgb": intr, "depth": intr,
-                          "note": "depth registered to colour by the camera module; colour intrinsics applied to depth"}
-        except Exception:  # noqa: BLE001 - properties are optional
-            pass
-        images, metadata = await asyncio.wait_for(camera.get_images(), timeout=15)
-        received_at = datetime.now(timezone.utc)
-    finally:
-        if client is not None:
-            await asyncio.wait_for(client.close(), timeout=5)
-    rgb = depth = None
+    return await asyncio.wait_for(RobotClient.at_address(config.address, options), timeout=15)
+
+
+async def read_frames(camera):
+    """One read-only get_images: returns (rgb array, depth array, jpeg_or_png bytes, sources, metadata, received_at)."""
+    images, metadata = await asyncio.wait_for(camera.get_images(), timeout=15)
+    received_at = datetime.now(timezone.utc)
+    rgb = depth = encoded = None
     sources = []
     for image in images:
         mime = str(image.mime_type)
@@ -63,8 +43,59 @@ async def capture_live(config, data_dir, episode_id=None, names=None):
             depth = rgbd.decode_viam_depth(image.data)
         elif rgb is None and ("jpeg" in mime or "png" in mime):
             rgb, kind = rgbd.decode_png(image.data)
+            encoded = image.data if kind == "rgb" else None
             if kind != "rgb":
                 rgb = None
+    return rgb, depth, encoded, sources, metadata, received_at
+
+
+async def capture_with_camera(config, data_dir, camera, episode_id=None):
+    """Save one observation from an already-connected camera. Read-only."""
+    if config.mode != "live":
+        raise ConfigError("Live capture requires MODE=live")
+    registry = rgbd.CalibrationRegistry(data_dir, "live")
+    version = registry.current(config.setup_id)
+    if version is None:
+        raise ConfigError(f"No calibration recorded for setup {config.setup_id}; run rgbd-calibration record first")
+    cal = registry.load(config.setup_id, version)
+    intrinsics = {"rgb": None, "depth": None}
+    try:
+        props = await asyncio.wait_for(camera.get_properties(), timeout=10)
+        intr = _intrinsics(props)
+        # The RealSense module registers depth to the colour frame (align_color_depth), so the reported colour
+        # intrinsics apply to both images. Recorded explicitly; the calibration record carries the operator verdict.
+        intrinsics = {"rgb": intr, "depth": intr,
+                      "note": "depth registered to colour by the camera module; colour intrinsics applied to depth"}
+    except Exception:  # noqa: BLE001 - properties are optional
+        pass
+    rgb, depth, _, sources, metadata, received_at = await read_frames(camera)
+    return _save(config, data_dir, rgb, depth, sources, metadata, received_at, intrinsics, cal, version, episode_id)
+
+
+async def capture_live(config, data_dir, episode_id=None):
+    """Connect, capture one observation, disconnect. Read-only; no motion or configuration calls."""
+    from viam.components.camera import Camera
+    client = await open_client(config)
+    try:
+        return await capture_with_camera(config, data_dir, Camera.from_robot(client, config.camera_resource), episode_id)
+    finally:
+        await asyncio.wait_for(client.close(), timeout=5)
+
+
+def colorize_depth(depth, near_mm=200, far_mm=1500):
+    """Preview-only false colour: near = warm, far = cool, invalid = black. Not stored."""
+    import numpy as np
+    d = depth.astype(np.float32)
+    t = np.clip((d - near_mm) / float(far_mm - near_mm), 0, 1)
+    out = np.zeros(depth.shape + (3,), dtype=np.uint8)
+    out[..., 0] = (255 * (1 - t)).astype(np.uint8)
+    out[..., 1] = (255 * (1 - np.abs(2 * t - 1))).astype(np.uint8)
+    out[..., 2] = (255 * t).astype(np.uint8)
+    out[depth == 0] = 0
+    return out
+
+
+def _save(config, data_dir, rgb, depth, sources, metadata, received_at, intrinsics, cal, version, episode_id):
     flags = []
     if rgb is None or depth is None:
         raise RuntimeError("Camera did not return both an RGB image and a depth map")

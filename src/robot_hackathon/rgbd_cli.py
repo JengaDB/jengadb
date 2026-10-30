@@ -10,7 +10,7 @@ from .local_store import atomic_write
 from . import rgbd
 
 COMMANDS = ("rgbd-capture", "rgbd-overlay", "rgbd-calibration", "rgbd-process", "rgbd-status", "rgbd-gallery",
-            "rgbd-index", "rgbd-flush", "rgbd-verify-segmentation", "rgbd-verify-embedding", "rgbd-search")
+            "rgbd-index", "rgbd-flush", "rgbd-verify-segmentation", "rgbd-verify-embedding", "rgbd-search", "rgbd-ui", "rgbd-delete")
 
 
 def add_arguments(parser):
@@ -30,6 +30,7 @@ def add_arguments(parser):
     parser.add_argument("--clean-orphans", action="store_true", help="rgbd-flush: delete orphaned upload attempts")
     parser.add_argument("--candidate", default=None, help="rgbd-search: candidate ID whose vector is the query")
     parser.add_argument("--limit", type=int, default=5)
+    parser.add_argument("--port", type=int, default=8765, help="rgbd-ui: local port (binds 127.0.0.1 only)")
     parser.add_argument("--image", default=None, help="rgbd-verify-segmentation: path to a real photo")
     parser.add_argument("--prompt", default=None, help="rgbd-verify-segmentation: noun phrase to segment")
 
@@ -71,6 +72,15 @@ def run(args, config):
         return 0
     if command == "rgbd-status":
         return _status(args, config)
+    if command == "rgbd-delete":
+        from .candidate_store import delete_observation
+        if not args.observation:
+            raise ConfigError("--observation ID is required")
+        try:
+            print(json.dumps(delete_observation(args.data_dir, mode, args.observation)))
+        except PermissionError as exc:
+            raise ConfigError(str(exc))
+        return 0
     if command == "rgbd-gallery":
         path = gallery(args.data_dir, mode, args.report or Path("reports") / f"rgbd-{mode}.html")
         print(f"Gallery: {path.resolve()}")
@@ -78,6 +88,10 @@ def run(args, config):
 
     config.require_cloud(args.allow_cloud)
     logging.disable(logging.CRITICAL)
+    if command == "rgbd-ui":
+        from .webapp import main as serve
+        serve(args.port)
+        return 0
     if command == "rgbd-capture":
         from .capture import capture_live
         obs = asyncio.run(capture_live(config, args.data_dir, args.episode))
@@ -114,6 +128,7 @@ def run(args, config):
         for observation_id in ids:
             result = pipe.process(observation_id)
             store.put_many(result["candidates"])
+            store.prune_stale(observation_id, result["processing_version"])
             counts = {}
             for c in result["candidates"]:
                 counts[c["exposure"]["status"]] = counts.get(c["exposure"]["status"], 0) + 1
@@ -139,7 +154,10 @@ def run(args, config):
             remote.require_indexes()
             if args.clean_orphans:
                 print(json.dumps({"orphans_removed": remote.media.clean_orphans()}))
-            result = sync(args.data_dir, mode, remote, source_alias=f"{config.setup_id}-laptop")
+            ids = rgbd.ObservationStore(args.data_dir, mode).list_ids() if args.all else ([args.observation] if args.observation else [])
+            if not ids:
+                raise ConfigError("rgbd-flush uploads only what you name: give --observation ID or --all")
+            result = sync(args.data_dir, mode, remote, source_alias=f"{config.setup_id}-laptop", observation_ids=ids)
             print(json.dumps(result))
             return 1 if result["error"] else 0
         if command == "rgbd-search":

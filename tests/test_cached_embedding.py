@@ -66,6 +66,21 @@ class CachedEmbeddingTests(unittest.TestCase):
         self.assertFalse(self.cached.last_cache_hit)
         self.assertEqual(self.provider.calls, 6)
 
+    def test_image_only_provider_forwards_uses_text_and_ignores_text_in_key(self):
+        self.provider.uses_text = False
+        cached = CachedEmbeddingProvider(self.provider, ResultCache(self.path))
+        self.assertFalse(cached.uses_text)
+        cached.embed("geometry", b"image")
+        cached.embed("different geometry", b"image")
+        self.assertTrue(cached.last_cache_hit)
+        self.assertEqual(self.provider.calls, 1)
+        # Flipping the contract changes the key: a text-aware provider never reads an image-only entry.
+        self.provider.uses_text = True
+        self.assertTrue(cached.uses_text)
+        cached.embed("geometry", b"image")
+        self.assertFalse(cached.last_cache_hit)
+        self.assertEqual(self.provider.calls, 2)
+
     def test_modes_do_not_share_cache(self):
         for mode in ("mock", "live"):
             cache = ResultCache(Path(self.tmp.name) / mode / "provider-cache" / "results.sqlite3")

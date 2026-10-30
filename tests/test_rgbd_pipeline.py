@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -70,8 +71,7 @@ class StubEmbedder(embeddings.EmbeddingProvider):
 
     def effective_settings(self):
         return {"provider": "stub", "model": "sha256", "dimension": self.dimension, "input_type": "document",
-                "text_template_id": self.template_id, "text_template_sha256": embeddings.template_sha256(self.template_id),
-                "image_preprocessing": {"resize_max_px": None, "format": "png"}}
+                "input_parts": ["text", "image"], "image_preprocessing": {"resize_max_px": None, "format": "png"}}
 
     def embed(self, text, image_png):
         self.calls += 1
@@ -191,6 +191,7 @@ class MemoryRemote:
         assert self.candidates[doc["candidate_id"]] == doc
 
     def set_artifact_sync(self, sha, obs_id, status, gid, size, local_check):
+        self._fail("artifact_sync_before")
         row = self.artifact_sync.setdefault(sha, {"remote_status": "pending", "observation_ids": set()})
         row["observation_ids"].add(obs_id)
         row["last_local_check"] = local_check
@@ -276,7 +277,7 @@ class ExposureAndCutoutTests(unittest.TestCase):
             self.assertIsNone(c["depth_crop_reason"])
             self.assertIsNotNone(c["files"]["depth_crop_png"])
         self.assertAlmostEqual(named["C"]["depth_stats"]["median_mm"], 650)
-        self.assertIn("mm", named["C"]["embedding_text"])
+        self.assertIn("mm", named["C"]["description_text"])
 
     def test_unverified_alignment_yields_unknown_and_no_depth_crop(self):
         make_observation(self.dir, alignment="unverified")
@@ -287,7 +288,7 @@ class ExposureAndCutoutTests(unittest.TestCase):
             self.assertEqual(c["exposure"]["status"], "unknown")
             self.assertEqual(c["depth_crop_reason"], "registration_not_verified")
             self.assertIsNone(c["files"]["depth_crop_png"])
-            self.assertIn("registration not verified", c["embedding_text"])
+            self.assertIn("registration not verified", c["description_text"])
 
     def test_calibration_mismatch_and_missing_intrinsics_gate_out(self):
         make_observation(self.dir, calibration="cal-v1")
@@ -404,16 +405,47 @@ class IdentityAndCheckpointTests(unittest.TestCase):
         store.put_many(first["candidates"] + second["candidates"])
         remote = MemoryRemote()
         remote.fail_once.add("candidate_after")
-        failed = candidate_store.sync(self.dir, "mock", remote)
+        failed = candidate_store.sync(self.dir, "mock", remote, observation_ids=["obs_test", "obs_other"])
         self.assertEqual(failed["error"], "TimeoutError")
-        retried = candidate_store.sync(self.dir, "mock", remote)
+        retried = candidate_store.sync(self.dir, "mock", remote, observation_ids=["obs_test", "obs_other"])
         self.assertIsNone(retried["error"])
         self.assertEqual(retried["pending_candidates"], 0)
         self.assertEqual((len(remote.observations), len(remote.candidates)), (2, 6))
         self.assertEqual(len(store.read()), 6)
-        repeated = candidate_store.sync(self.dir, "mock", remote)
+        repeated = candidate_store.sync(self.dir, "mock", remote, observation_ids=["obs_test", "obs_other"])
         self.assertEqual((repeated["media_uploaded"], repeated["observations_sent"], repeated["candidates_sent"]), (0, 0, 0))
         self.assertEqual(emb.calls, 3)
+
+    def test_checkpoint_repair_preserves_candidate_creation_time(self):
+        first = make_pipeline(self.dir).process("obs_test")
+        proc = self.dir / first["candidates"][0]["processing_dir"]
+        store = candidate_store.CandidateLocalStore(self.dir, "mock")
+        remote = MemoryRemote()
+        # Recover from the processing output before it is committed, then from
+        # the immutable store after the processing output itself is lost/corrupt.
+        for source in ("processing_output", "store_missing_output", "store_corrupt_output"):
+            with self.subTest(source=source):
+                if source != "processing_output":
+                    store.put_many(first["candidates"])
+                    candidate_store.sync(self.dir, "mock", remote, observation_ids=["obs_test"])
+                    if source == "store_missing_output":
+                        (proc / "candidates.json").unlink()
+                    else:
+                        (proc / "candidates.json").write_text("broken json")
+                (proc / first["candidates"][0]["embedding_ref"]).unlink()
+                with patch.object(rgbd, "utc_now", return_value="2099-01-01T00:00:00+00:00"):
+                    repaired = make_pipeline(self.dir).process("obs_test")
+                self.assertEqual(repaired["candidates"], first["candidates"])
+                store.put_many(repaired["candidates"])
+                # Remote insert-only readback must accept the repaired record too.
+                for c in repaired["candidates"]:
+                    remote.upsert_candidate(candidate_store.remote_candidate(self.dir, c, {}))
+
+    def test_image_only_contract_survives_pipeline_cache_wrapper(self):
+        provider = embeddings.VoyageMultimodalProvider(Config(voyage_key="k"), allow_cloud=True)
+        wrapped = make_pipeline(self.dir, emb=provider).emb
+        self.assertFalse(wrapped.uses_text)
+        self.assertIs(make_pipeline(self.dir, emb=wrapped).emb, wrapped)
 
     def test_embedding_cache_reuses_inputs_across_processing_versions(self):
         emb = StubEmbedder()
@@ -509,6 +541,29 @@ class ProviderParserTests(unittest.TestCase):
             embeddings.parse_voyage_response(fixture, 7)
         with self.assertRaises(ValueError):
             embeddings.parse_voyage_response({"data": []}, 1024)
+
+    @unittest.skipUnless(HAVE_DEPS, "numpy and Pillow required for image preparation")
+    def test_voyage_default_is_image_only_with_description_as_metadata(self):
+        cfg = Config(voyage_key="k")
+        img_only = embeddings.VoyageMultimodalProvider(cfg, allow_cloud=True)
+        fused = embeddings.VoyageMultimodalProvider(cfg, allow_cloud=True, input_parts=("text", "image"))
+        self.assertFalse(img_only.uses_text)
+        self.assertTrue(fused.uses_text)
+        self.assertNotEqual(img_only.encoder_version, fused.encoder_version)
+        self.assertNotEqual(img_only.effective_settings(), fused.effective_settings())
+        sent = {}
+        class Resp:
+            def __init__(self, body): self.body = body
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return json.dumps({"data": [{"embedding": [0.0] * 1024}]}).encode()
+        def opener(req, timeout=0):
+            sent["body"] = json.loads(req.data.decode()); return Resp(None)
+        img_only.opener = opener
+        img_only.embed("ignored text", rgbd.encode_rgb_png(np.zeros((4, 4, 3), dtype=np.uint8)) if HAVE_DEPS else b"")
+        parts = [p["type"] for p in sent["body"]["inputs"][0]["content"]]
+        self.assertEqual(parts, ["image_base64"])
+        self.assertTrue(sent["body"]["inputs"][0]["content"][0]["image_base64"].startswith("data:image/png;base64,"))
 
     def test_cloud_providers_refuse_without_allow_cloud(self):
         config = Config(meta_api_key="x", voyage_key="k")
@@ -648,10 +703,10 @@ class SyncTests(unittest.TestCase):
             candidate_store.validate_candidate(dict(rows[0], pickability={"status": "pickable"}))
 
     def test_flush_acks_are_separate_and_idempotent(self):
-        first = candidate_store.sync(self.dir, "mock", self.remote)
+        first = candidate_store.sync(self.dir, "mock", self.remote, observation_ids=["obs_test"])
         self.assertEqual((first["media_uploaded"], first["observations_sent"], first["candidates_sent"], first["error"]), (2, 1, 3, None))
         self.assertTrue(all(a["remote_status"] == "synced" for a in first["artifacts"]))
-        second = candidate_store.sync(self.dir, "mock", self.remote)
+        second = candidate_store.sync(self.dir, "mock", self.remote, observation_ids=["obs_test"])
         self.assertEqual((second["media_uploaded"], second["observations_sent"], second["candidates_sent"]), (0, 0, 0))
         self.assertEqual(len(self.remote.candidates), 3)
         doc = next(iter(self.remote.candidates.values()))
@@ -659,15 +714,100 @@ class SyncTests(unittest.TestCase):
         self.assertIsInstance(doc["cutout_png"], bytes)
         self.assertNotIn("embedding", self.store.read()[0])
 
+    def test_retry_repairs_artifact_metadata_after_media_ack(self):
+        self.remote.fail_once.add("artifact_sync_before")
+        failed = candidate_store.sync(self.dir, "mock", self.remote, observation_ids=["obs_test"])
+        self.assertEqual(failed["error"], "TimeoutError")
+        self.assertEqual(failed["media_uploaded"], 1)
+        self.assertEqual(len(self.remote.artifact_sync), 0)
+        retried = candidate_store.sync(self.dir, "mock", self.remote, observation_ids=["obs_test"])
+        self.assertIsNone(retried["error"])
+        self.assertEqual(retried["media_uploaded"], 1)
+        self.assertEqual(len(self.remote.artifact_sync), 2)
+        self.assertTrue(all(r["remote_status"] == "synced" for r in self.remote.artifact_sync.values()))
+
+    def test_shared_media_links_every_observation(self):
+        make_observation(self.dir, obs_id="obs_other", register=False)
+        self.store.put_many(make_pipeline(self.dir).process("obs_other")["candidates"])
+        for obs_id in ("obs_test", "obs_other"):
+            result = candidate_store.sync(self.dir, "mock", self.remote, observation_ids=[obs_id])
+            self.assertIsNone(result["error"])
+        self.assertEqual(result["media_uploaded"], 0)
+        self.assertEqual(len(self.remote.artifact_sync), 2)
+        for row in self.remote.artifact_sync.values():
+            self.assertEqual(row["observation_ids"], {"obs_test", "obs_other"})
+
+    def test_sync_requires_explicit_ids_and_delete_refuses_after_upload(self):
+        with self.assertRaises(ValueError):
+            candidate_store.sync(self.dir, "mock", self.remote)
+        make_observation(self.dir, obs_id="obs_other", register=False)
+        self.store.put_many(make_pipeline(self.dir).process("obs_other")["candidates"])
+        r = candidate_store.sync(self.dir, "mock", self.remote, observation_ids=["obs_test"])
+        self.assertEqual((r["observations_sent"], r["error"]), (1, None))
+        self.assertNotIn("obs_other", self.remote.observations)  # unselected capture never leaves the laptop
+        self.assertFalse(candidate_store.upload_state(self.dir, "mock", "obs_other")["any"])
+        self.assertTrue(candidate_store.upload_state(self.dir, "mock", "obs_test")["complete"])
+        with self.assertRaises(PermissionError):
+            candidate_store.delete_observation(self.dir, "mock", "obs_test")
+        out = candidate_store.delete_observation(self.dir, "mock", "obs_other")
+        self.assertEqual((out["removed_candidates"], out["removed_directory"]), (3, True))
+        self.assertNotIn("obs_other", rgbd.ObservationStore(self.dir, "mock").list_ids())
+        self.assertTrue(all(c["observation_id"] == "obs_test" for c in self.store.read()))
+
+    def test_prune_stale_keeps_uploaded_rows(self):
+        old_ids = {c["candidate_id"] for c in self.store.read()}
+        candidate_store.sync(self.dir, "mock", self.remote, observation_ids=["obs_test"])  # old version uploaded
+        new = make_pipeline(self.dir, emb=StubEmbedder(dimension=512)).process("obs_test")
+        self.store.put_many(new["candidates"])
+        self.assertEqual(self.store.prune_stale("obs_test", new["processing_version"]), 0)  # uploaded rows survive
+        self.assertEqual(len(self.store.read()), 6)
+        newer = make_pipeline(self.dir, emb=StubEmbedder(dimension=256)).process("obs_test")
+        self.store.put_many(newer["candidates"])
+        self.assertEqual(self.store.prune_stale("obs_test", newer["processing_version"]), 3)  # the un-uploaded 512 rows go
+        self.assertEqual({c["processing_version"] for c in self.store.read()}, {newer["processing_version"]} | {c["processing_version"] for c in self.store.read() if c["candidate_id"] in old_ids})
+
+    def test_pickability_label_defaults_and_overrides(self):
+        rows = self.store.read()
+        review = candidate_store.Review(self.dir, "mock")
+        review.set_labels("obs_test", {rows[0]["candidate_id"]: "not_pickable"}, reviewed_by="tester")
+        with self.assertRaises(ValueError):
+            review.set_labels("obs_test", {rows[1]["candidate_id"]: "maybe"})
+        review.set_ignored("obs_test", [rows[2]["candidate_id"]])  # labels survive an ignore update
+        candidate_store.sync(self.dir, "mock", self.remote, observation_ids=["obs_test"])
+        d0 = self.remote.candidates[rows[0]["candidate_id"]]
+        d1 = self.remote.candidates[rows[1]["candidate_id"]]
+        self.assertEqual((d0["pickability_label"]["status"], d0["pickability_label"]["label_source"], d0["pickable"]), ("not_pickable", "human", False))
+        self.assertEqual((d1["pickability_label"]["status"], d1["pickability_label"]["label_source"], d1["pickable"]), ("pickable", "human_default", True))
+        self.assertEqual(d0["pickability"]["status"], "unknown")  # heuristic field untouched
+        self.assertNotIn(rows[2]["candidate_id"], self.remote.candidates)
+
+    def test_ignored_candidates_are_never_uploaded(self):
+        rows = self.store.read()
+        review = candidate_store.Review(self.dir, "mock")
+        review.set_ignored("obs_test", [rows[0]["candidate_id"], rows[1]["candidate_id"]], reviewed_by="tester")
+        r = candidate_store.sync(self.dir, "mock", self.remote, observation_ids=["obs_test"])
+        self.assertEqual((r["candidates_sent"], r["candidates_ignored"], r["error"]), (1, 2, None))
+        self.assertEqual(set(self.remote.candidates), {rows[2]["candidate_id"]})
+        self.assertEqual(next(iter(self.remote.candidates.values()))["review"]["reviewed_by"], "tester")
+        state = candidate_store.upload_state(self.dir, "mock", "obs_test")
+        self.assertTrue(state["complete"])
+        self.assertEqual((state["candidates_acked"], state["candidates_total"]), (1, 1))
+        # un-ignoring later makes the capture incomplete again and a resume uploads only the newly included one
+        review.set_ignored("obs_test", [rows[0]["candidate_id"]])
+        self.assertFalse(candidate_store.upload_state(self.dir, "mock", "obs_test")["complete"])
+        r = candidate_store.sync(self.dir, "mock", self.remote, observation_ids=["obs_test"])
+        self.assertEqual((r["candidates_sent"], len(self.remote.candidates)), (1, 2))
+        self.assertNotIn(rows[0]["candidate_id"], self.remote.candidates)
+
     def test_timeout_after_commit_acks_only_after_readback(self):
         self.remote.fail_once.update({"observation_after", "candidate_after"})
-        r1 = candidate_store.sync(self.dir, "mock", self.remote)
+        r1 = candidate_store.sync(self.dir, "mock", self.remote, observation_ids=["obs_test"])
         self.assertEqual(r1["error"], "TimeoutError")
         self.assertEqual(r1["observations_sent"], 0)
-        r2 = candidate_store.sync(self.dir, "mock", self.remote)
+        r2 = candidate_store.sync(self.dir, "mock", self.remote, observation_ids=["obs_test"])
         self.assertEqual(r2["error"], "TimeoutError")
         self.assertEqual(r2["observations_sent"], 1)
-        r3 = candidate_store.sync(self.dir, "mock", self.remote)
+        r3 = candidate_store.sync(self.dir, "mock", self.remote, observation_ids=["obs_test"])
         self.assertEqual((r3["error"], r3["candidates_sent"], r3["pending_candidates"]), (None, 3, 0))
         self.assertEqual(len(self.remote.observations), 1)
 
@@ -675,7 +815,7 @@ class SyncTests(unittest.TestCase):
         obs_dir = rgbd.ObservationStore(self.dir, "mock").directory("obs_test")
         depth = (obs_dir / "depth.png").read_bytes()
         (obs_dir / "depth.png").unlink()
-        r1 = candidate_store.sync(self.dir, "mock", self.remote)
+        r1 = candidate_store.sync(self.dir, "mock", self.remote, observation_ids=["obs_test"])
         depth_line = next(a for a in r1["artifacts"] if a["kind"] == "depth")
         self.assertEqual((depth_line["local_status"], depth_line["remote_status"]), ("missing", "pending"))
         self.assertEqual(r1["observations_sent"], 1)  # observation metadata still uploaded; gap visible remotely
@@ -683,13 +823,13 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(self.remote.artifact_sync[sha]["remote_status"], "pending")
         obs_before = dict(self.remote.observations["obs_test"])
         (obs_dir / "depth.png").write_bytes(depth)
-        r2 = candidate_store.sync(self.dir, "mock", self.remote)
+        r2 = candidate_store.sync(self.dir, "mock", self.remote, observation_ids=["obs_test"])
         self.assertEqual(next(a for a in r2["artifacts"] if a["kind"] == "depth")["remote_status"], "synced")
         self.assertEqual(self.remote.artifact_sync[sha]["remote_status"], "synced")
         self.assertEqual(self.remote.observations["obs_test"], obs_before)
         # synced artifact whose local copy disappears stays synced
         (obs_dir / "depth.png").unlink()
-        r3 = candidate_store.sync(self.dir, "mock", self.remote)
+        r3 = candidate_store.sync(self.dir, "mock", self.remote, observation_ids=["obs_test"])
         line = next(a for a in r3["artifacts"] if a["kind"] == "depth")
         self.assertEqual((line["local_status"], line["remote_status"]), ("missing", "synced"))
         self.assertEqual(self.remote.artifact_sync[sha]["remote_status"], "synced")

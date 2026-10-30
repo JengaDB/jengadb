@@ -16,6 +16,11 @@ class CachedEmbeddingProvider(EmbeddingProvider):
     def dimension(self):
         return self.provider.dimension
 
+    @property
+    def uses_text(self):
+        # Forwarded so consumers see the wrapped provider's input contract, not the base-class default.
+        return getattr(self.provider, "uses_text", True)
+
     def effective_settings(self):
         # Caching changes execution, not the processing identity or output format.
         return self.provider.effective_settings()
@@ -30,9 +35,12 @@ class CachedEmbeddingProvider(EmbeddingProvider):
     def embed(self, text, image_png):
         self.last_cache_hit = None
         settings = {"provider_settings": self.effective_settings(), "dimension": self.dimension,
-                    "endpoint": getattr(self.provider, "url", None), "adapter_version": 1}
+                    "endpoint": getattr(self.provider, "url", None), "adapter_version": 1,
+                    "uses_text": self.uses_text}
+        # Image-only providers ignore the text, so it must not split the cache key.
+        inputs = [text.encode("utf-8"), image_png] if self.uses_text else [image_png]
         vector, hit, _ = self.cache.get_or_compute(
-            operation="vision.context-embedding", inputs=[text.encode("utf-8"), image_png],
+            operation="vision.context-embedding", inputs=inputs,
             model_version=self.encoder_version, settings=settings,
             compute=lambda: self._validate(self.provider.embed(text, image_png)),
         )
