@@ -28,7 +28,9 @@ PLACE_DROP_MM = 1.0
 PICK_LIFT_MM = 100.0
 CLAW_THICKNESS_MM = 8.0           # Sam's; closed claws are two claws thick
 PUSH_START_GAP_MM = 5.0           # gap between the closed claws and the last block before the push starts
-PUSH_TIPS_MM = 5.0                # claw tips above the table while pushing
+PUSH_TIPS_MM = 7.0                # claw tips above the table while pushing (5 was 2 mm too low: operator, 30 Oct 19:22)
+CENTRE_PUSH_ATTEMPTS = 1          # close-and-centre pushes per push phase; on 30 Oct the remaining 3-4 mm "gap" came from a
+                                  # block skewed 13 mm along its length, and five more pushes only slid the row 32 mm off
 PUSH_EXTRA_MM = 8.0               # shove past the point where the gaps have closed
 ADJACENT_CLEARANCE_MM = 1.5       # placing exactly one pitch away nudged the neighbour; leave this much and push later
 MAX_RESCANS = 2                   # consecutive re-captures without a placement before the flow gives up on the layer
@@ -732,6 +734,7 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 across = math.radians(target.layer0_long_side_deg + 90.0)
                 ax, ay = math.cos(across), math.sin(across)
                 w = calib.block.width_mm
+                centre_pushes = 0
                 for _round in range(ROW_PUSH_ROUNDS):
                     obs_m, scene_m = await scene_from_capture()
                     ctx_m = proposal.build_context(scene_m, tower_origin_xy_mm=tower_origin, filled_slots=filled, dry_run=True, tower_gap_mm=gap_mm)
@@ -750,9 +753,12 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                           f"ends {'aligned' if not misaligned else 'off by ' + ', '.join(format(o, '+.1f') for _, o in misaligned) + ' mm'}", flush=True)
                     if len(row) < 2:
                         break
-                    if gaps > PUSH_IF_GAPS_OVER_MM or shift > ROW_CENTRE_TOLERANCE_MM:
+                    if (gaps > PUSH_IF_GAPS_OVER_MM or shift > ROW_CENTRE_TOLERANCE_MM) and centre_pushes < CENTRE_PUSH_ATTEMPTS:
+                        centre_pushes += 1
                         await push_row(pts[-1], -ax, -ay, gaps + shift + PUSH_START_GAP_MM, "close_and_centre")
                         continue
+                    # After the one centre push the ends get their turn even if a few mm of gap remain (a skewed block
+                    # reads as gap; pushing the row again does not close it). Previously this step never ran.
                     if misaligned:
                         # Ends: push the block that sticks out the most back in line, one block per round, then re-measure.
                         i, off = misaligned[0]
