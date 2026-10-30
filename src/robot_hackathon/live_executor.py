@@ -31,6 +31,10 @@ PUSH_START_GAP_MM = 5.0           # gap between the closed claws and the last bl
 PUSH_TIPS_MM = 7.0                # claw tips above the table while pushing (5 was 2 mm too low: operator, 30 Oct 19:22)
 CENTRE_PUSH_ATTEMPTS = 1          # close-and-centre pushes per push phase; on 30 Oct the remaining 3-4 mm "gap" came from a
                                   # block skewed 13 mm along its length, and five more pushes only slid the row 32 mm off
+DROP_HEIGHT_MM = 25.0             # a block to be laid flat is released with its bottom about this far above the drop spot
+DROP_CLEAR_MM = 60.0              # nothing else may lie within this of the drop spot (a 75 mm block landing any way round)
+DROP_FIND_MM = 70.0               # after the drop, the block is looked for within this of the spot
+MAX_REORIENT_DROPS = 2            # drops per run before the flow stops and asks the operator to lay the block flat
 PUSH_EXTRA_MM = 8.0               # shove past the point where the gaps have closed
 ADJACENT_CLEARANCE_MM = 1.5       # placing exactly one pitch away nudged the neighbour; leave this much and push later
 MAX_RESCANS = 2                   # consecutive re-captures without a placement before the flow gives up on the layer
@@ -291,7 +295,7 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                    keep_out_xy=None, view_pose=None, direct_local=False, drop_unseen_filled=False,
                    place_spacing_mm=PLACE_SPACING_MM, grip_retries=1, references="none", approach_speed=DEFAULT_APPROACH_SPEED_DEG_S,
                    push_speed=DEFAULT_PUSH_SPEED_DEG_S, skip_if_complete=False, layers=2, disable_sessions=False,
-                   align_speed=DEFAULT_ALIGN_SPEED_DEG_S):
+                   align_speed=DEFAULT_ALIGN_SPEED_DEG_S, drop_spot_xy=None):
     """One connection, one capture: segment, rank, then place blocks back to back. The next slot is positioned from the
     previous block's *actual* release pose (plus one pitch along the row) rather than the nominal slot, so release
     nudges do not accumulate. Grasp per slot: ends when the slot touches a placed neighbour, else middle/side/ends.
@@ -312,7 +316,10 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
     the travel speed (arm_speed, else DEFAULT_ARM_SPEED_DEG_S) is restored afterwards. None disables the switch.
     skip_if_complete: when the first capture already shows the full layer on the pallet, return at once (no push
     rounds, no final capture) so the caller can go straight to stacking.
-    layers: how many layers this target may receive. A pallet is 1: blocks are never stacked on the pallet spot."""
+    layers: how many layers this target may receive. A pallet is 1: blocks are never stacked on the pallet spot.
+    drop_spot_xy: a clear table spot. A picked block whose top face is tilted more than REORIENT_TILT_DEG, or that
+    stands on its edge, is first released DROP_HEIGHT_MM above this spot so gravity lays it flat; a fresh capture then
+    checks it lies flat before it can go to the pallet (operator request, 30 Oct). None keeps the old behaviour."""
     from . import proposal, rgbd, segmentation, retrieval
     from . import grasp_geometry as geom
     from .capture import open_client, capture_with_camera
@@ -426,6 +433,41 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
         # middle/side grasps stay allowed and the row is not limited to the ends ("wide way") grasp.
         spaced_target = TowerTarget(tuple(tower_origin), calib.support_surface, calib.block, calib.finger, 0.0, layers=layers,
                                     gap_mm=gap_mm + place_spacing_mm)
+        if drop_spot_xy is not None:
+            clear = footprint_clearance_mm(target) + DROP_CLEAR_MM
+            for name, centre in (("pallet/tower", tower_origin), ("keep-out", keep_out_xy)):
+                if centre is not None and math.dist(drop_spot_xy, centre) < clear:
+                    ep.event("flow", phase="stop", reason="drop_spot_too_close", to=name, distance_mm=round(math.dist(drop_spot_xy, centre), 1),
+                             required_mm=round(clear, 1))
+                    print(f"--drop-spot is {math.dist(drop_spot_xy, centre):.0f} mm from the {name}; needs {clear:.0f} mm. Nothing moved.", flush=True)
+                    return 1
+
+        def scene_heights(scene_):
+            """Height above the table per pixel for this capture (same plane fit as build_context), computed once."""
+            if "height_map" not in scene_:
+                np_ = geom._np()
+                inv = scene_["observation"]["depth"]["invalid_value"]
+                exclude = np_.zeros(scene_["depth"].shape, dtype=bool)
+                for m in scene_["masks"]:
+                    exclude |= m["mask"]
+                plane = geom.fit_table_plane(scene_["depth"], invalid_value=inv,
+                                             exclude=geom.dilate(exclude, 8, step=4) if exclude.any() else None)
+                scene_["height_map"] = None if plane is None else plane.height_map(scene_["depth"], inv)
+            return scene_["height_map"]
+
+        def candidate_tilt(scene_, cand):
+            hm = scene_heights(scene_)
+            m = next((m for m in scene_["masks"] if m["candidate_id"] == cand["candidate_id"]), None)
+            if hm is None or m is None:
+                return None
+            return geom.top_face_tilt_deg(m["mask"], hm, cand["geometry"].get("mm_per_px"))
+
+        def drop_spot_blocked(context, exclude_id):
+            for c in context["candidates"]:
+                p = c["geometry"].get("base_point_mm")
+                if c["candidate_id"] != exclude_id and p and math.dist(p[:2], drop_spot_xy) < DROP_CLEAR_MM:
+                    return c["candidate_id"]
+            return None
 
         def build_queue(context, observation, scene_, label):
             """Ranked pickable candidates from a context, minus anything inside the keep-out circle. A heap is taken
@@ -515,7 +557,7 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 return 0
         async def pick_phase():
             """Place blocks until the layer is full, the placement budget is spent, or a hard stop."""
-            nonlocal filled, last_pose, obs, scene, ctx, queue, flow_stopped, rescans_without_progress, placed_at_last_scan
+            nonlocal filled, last_pose, obs, scene, ctx, queue, flow_stopped, rescans_without_progress, placed_at_last_scan, drops_used
             rescans_without_progress = 0
             placed_at_last_scan = 0
             while len(placed) < max_blocks:
@@ -566,6 +608,20 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 queue.remove(pick)
                 geo = pick["geometry"]
                 bx, by, bz = geo["base_point_mm"]
+                # Gravity reorientation: a tilted or on-edge block is laid flat on the drop spot before it goes to the pallet.
+                tilt = candidate_tilt(scene, pick)
+                reorient = geom.reorient_reasons(geo, tilt)
+                if reorient and drop_spot_xy is None:
+                    ep.event("flow", phase="misaligned_pick", candidate=pick["candidate_id"], reasons=reorient, tilt_deg=tilt,
+                             note="no --drop-spot: placed as is")
+                    print(f"{slot['slot_id']}: {pick['candidate_id']} is {', '.join(reorient)}; no --drop-spot, placing it as is", flush=True)
+                    reorient = []
+                if reorient:
+                    blocker = drop_spot_blocked(ctx, pick["candidate_id"])
+                    if blocker:
+                        ep.event("flow", phase="reorient_skipped", candidate=pick["candidate_id"], reasons=reorient, drop_spot_blocked_by=blocker)
+                        print(f"{slot['slot_id']}: {pick['candidate_id']} needs laying flat but the drop spot is occupied; skipping it", flush=True)
+                        continue
                 # Destination: nominal for the first block of a layer, shifted ROW_PRE_OFFSET_MM toward the open end of the
                 # row so the one-direction push afterwards can centre the closed row; otherwise previous release pose plus
                 # one pitch.
@@ -586,11 +642,13 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 ep.event("flow", phase="plan_block", slot=slot["slot_id"], candidate=pick["candidate_id"], grasp=grasp["style"], pick_xy=[round(bx, 1), round(by, 1)],
                          pick_long_deg=round(geo["base_long_side_deg"], 1), block_top_mm=round(geo["height_above_table_mm"], 1), resting_level_mm=resting,
                          dest_xy=[round(sx, 1), round(sy, 1)], dest_long_deg=slot["long_side_deg"],
-                         support_z=slot["support_z_mm"], tips_above_table_mm=round(tips, 1), tips_floor_mm=tips_floor, place_spacing_mm=place_spacing_mm)
+                         support_z=slot["support_z_mm"], tips_above_table_mm=round(tips, 1), tips_floor_mm=tips_floor, place_spacing_mm=place_spacing_mm,
+                         tilt_deg=None if tilt is None else round(tilt, 1), reorient=reorient)
                 print(f"{slot['slot_id']}: pick {pick['candidate_id']} at ({bx:.0f}, {by:.0f}), top {geo['height_above_table_mm']:.0f} mm"
                       f"{' resting on a block at ' + format(resting, '.0f') + ' mm' if resting else ' on the table'}, {grasp['style']} grasp, "
                       f"tips {tips:.1f} mm above the calibrated table{' (raised over a low neighbour)' if grasp.get('tips_raised_over_neighbour') else ''}"
-                      f" -> place at ({sx:.0f}, {sy:.0f}) long {slot['long_side_deg']:.0f} deg", flush=True)
+                      + (f" -> {', '.join(reorient)}: drop at ({drop_spot_xy[0]:.0f}, {drop_spot_xy[1]:.0f}) to lay it flat"
+                         if reorient else f" -> place at ({sx:.0f}, {sy:.0f}) long {slot['long_side_deg']:.0f} deg"), flush=True)
                 # --- pick, with the gripper's own report as the grip check and a bounded retry of the same movement
                 g0 = await bot.gripper_origin()
                 travel_z = g0[2]
@@ -631,6 +689,47 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
                 if stop_reason:
                     flow_stopped = True; ep.event("flow", phase="stop", reason=stop_reason, candidate=pick["candidate_id"], attempts=attempt); break
                 ok, _ = await bot.move_delta(dz=PICK_LIFT_MM, near_table=True)
+                if reorient:
+                    # --- drop: release a short height above the clear spot; the block falls onto its widest face
+                    g = await bot.gripper_origin()
+                    ok, _ = await bot.move_delta(dx=drop_spot_xy[0] - g[0], dy=drop_spot_xy[1] - g[1])
+                    if ok:
+                        ok = await bot.descend_to(table_z + DROP_HEIGHT_MM + (tips - resting) - TIP_ABOVE_GRIPPER_FRAME_MM, approach_speed, travel_speed)
+                    if not ok:
+                        await bot.set_speed(travel_speed)
+                        flow_stopped = True; ep.event("flow", phase="stop", reason="drop_refused", note="block still held; use live-step abort-up/open"); break
+                    await bot.gripper.open()
+                    await bot.set_speed(travel_speed)
+                    g = await bot.gripper_origin()
+                    await bot.move_delta(dz=travel_z - g[2], near_table=True)
+                    drops_used += 1
+                    ep.event("flow", phase="dropped", candidate=pick["candidate_id"], drop_xy=list(drop_spot_xy), drop_height_mm=DROP_HEIGHT_MM,
+                             reasons=reorient, drops_used=drops_used)
+                    ok, _ = await bot.move_to(*home)
+                    if not ok:
+                        flow_stopped = True; ep.event("flow", phase="stop", reason="view_pose_refused_after_drop"); break
+                    obs, scene = await scene_from_capture()
+                    ctx = await context_for(scene, filled)
+                    reconcile_pallet(ctx, "after_drop")
+                    queue = build_queue(ctx, obs, scene, "after_drop")
+                    near = [c for c in ctx["candidates"] if c["geometry"].get("base_point_mm")
+                            and math.dist(c["geometry"]["base_point_mm"][:2], drop_spot_xy) < DROP_FIND_MM]
+                    if not near:
+                        flat_reasons, found = ["not_found_near_drop_spot"], None
+                    else:
+                        found = min(near, key=lambda c: math.dist(c["geometry"]["base_point_mm"][:2], drop_spot_xy))
+                        found_tilt = candidate_tilt(scene, found)
+                        flat_reasons = geom.lying_flat_reasons(found["geometry"], found_tilt, calib.block)
+                    ep.event("flow", phase="reorient_check", observation_id=obs["observation_id"], candidate=found["candidate_id"] if found else None,
+                             flat=not flat_reasons, reasons=flat_reasons, drops_used=drops_used)
+                    print(f"{slot['slot_id']}: after the drop the block {'lies flat' if not flat_reasons else 'is NOT flat: ' + ', '.join(flat_reasons)}", flush=True)
+                    if flat_reasons and drops_used >= MAX_REORIENT_DROPS:
+                        flow_stopped = True
+                        ep.event("flow", phase="stop", reason="reorient_failed", drops_used=drops_used,
+                                 note="lay the block flat by hand, then rerun")
+                        print(f"{slot['slot_id']}: still not flat after {drops_used} drop(s); lay it flat by hand and rerun", flush=True)
+                        break
+                    continue   # the slot is still open; the next pick comes from this fresh capture
                 # --- place
                 g = await bot.gripper_origin()
                 ok, _ = await bot.move_delta(dx=sx - g[0], dy=sy - g[1])
@@ -768,6 +867,7 @@ async def run_flow(config, data_dir, operator, episode_id, tower_origin, filled,
             return pallet_count
 
         flow_stopped = False
+        drops_used = 0
         rescans_without_progress = 0
         placed_at_last_scan = 0
         pallet_count = len([s for s in filled if s.startswith('L0')])

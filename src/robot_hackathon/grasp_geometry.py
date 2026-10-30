@@ -619,6 +619,63 @@ def resting_level_mm(block_top_mm, block_thickness_mm):
     return max(0, round(block_top_mm / block_thickness_mm) - 1) * block_thickness_mm
 
 
+# ---------------------------------------------------------------- lying flat (gravity reorientation)
+
+REORIENT_TILT_DEG = 8.0   # a top face tilted more than this is re-laid by a drop (flat blocks measured <= 6.8 deg, 30 Oct)
+
+
+def top_face_tilt_deg(mask, height_map, mm_per_px, band_mm=6.0, trim_mm=3.0, min_pixels=30):
+    """Tilt of a block's visible top face against the table (deg), from the height map. SAM masks also cover side
+    faces, so the plane is seeded with the highest pixels only and refitted on every mask pixel within trim_mm of it.
+    None when there is too little valid depth to fit a face."""
+    np = _np()
+    if not mm_per_px:
+        return None
+    vs, us = np.nonzero(mask & ~np.isnan(height_map))
+    if len(us) < min_pixels:
+        return None
+    h = height_map[vs, us]
+    a = np.stack([us * mm_per_px, vs * mm_per_px, np.ones(len(us))], axis=1)
+    seed = h >= np.percentile(h, 75) - band_mm
+    if seed.sum() < min_pixels:
+        seed = np.ones(len(h), dtype=bool)
+    coef = np.linalg.lstsq(a[seed], h[seed], rcond=None)[0]
+    face = np.abs(a @ coef - h) <= trim_mm
+    if face.sum() >= min_pixels:
+        coef = np.linalg.lstsq(a[face], h[face], rcond=None)[0]
+    return math.degrees(math.atan(math.hypot(coef[0], coef[1])))
+
+
+def reorient_reasons(geometry, tilt_deg, max_tilt_deg=REORIENT_TILT_DEG):
+    """Why a pick candidate should be laid flat by a drop before it goes to the pallet: its top face is tilted, or it
+    stands on its long edge (narrow top, more than one block high). Empty when it already lies flat."""
+    reasons = []
+    if tilt_deg is not None and tilt_deg > max_tilt_deg:
+        reasons.append(f"tilted:{tilt_deg:.1f}deg")
+    if "possibly_on_edge" in (geometry.get("flags") or []):
+        reasons.append("on_edge")
+    return reasons
+
+
+def lying_flat_reasons(geometry, tilt_deg, dims, max_tilt_deg=REORIENT_TILT_DEG):
+    """Check a block after the drop: one block thick (not on its edge, 25 mm, or end, 75 mm), the full footprint
+    visible, top face level. Empty when it lies flat."""
+    reasons = []
+    h = geometry.get("height_above_table_mm")
+    if h is None or abs(h - dims.height_mm) > 0.3 * dims.height_mm:
+        reasons.append("height:unknown" if h is None else f"height:{h:.1f}mm_not_one_block")
+    if "possibly_on_edge" in (geometry.get("flags") or []):
+        reasons.append("on_edge")
+    length, width = geometry.get("length_mm"), geometry.get("width_mm")
+    if length is None or length < 0.85 * dims.length_mm:
+        reasons.append("length:unknown" if length is None else f"short:{length:.1f}mm")
+    if width is None or not (0.7 * dims.width_mm <= width <= 1.2 * dims.width_mm):
+        reasons.append("width:unknown" if width is None else f"width:{width:.1f}mm")
+    if tilt_deg is None or tilt_deg > max_tilt_deg:
+        reasons.append("tilt:unknown" if tilt_deg is None else f"tilt:{tilt_deg:.1f}deg")
+    return reasons
+
+
 def grip_tips_mm(block_height, claws_deg, params, block_thickness_mm=None):
     """How far above the table the claw tips go to grip a block whose top is block_height above the table (Sam's
     grip_tips_mm). The floor tips_min_mm is relative to the surface the block rests on, so a block on top of another

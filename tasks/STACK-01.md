@@ -194,6 +194,24 @@ local/layer-stack-data/live/episodes/):
   BLOCKS_PER_LAYER + 2 placements). Hard stops (planner refusal, grab failure after retries, no candidate after
   rescans) still end the stage.
 
+- 30 Oct 19:19-19:29 UTC, episode kazy-palletize-30oct (operator Kazy, Kazy's laptop, main @6aafee2, `--direct-local
+  --no-sessions --grip-lower-mm 15 --tips-floor-mm -3`; this laptop's calibration has table z 0, so -3 equals Kris's
+  -6 with z 3.0): FIRST VERIFIED PALLETIZE CYCLE. Assembly: three heap blocks picked (one off another block at raised
+  tips 16.7, one side and one ends grasp; one rescan), six close-and-centre pushes. Stacking: lift check 0 left
+  behind; verification centre error 1.4 mm, yaw error 1.24 deg -> success; tower 4 layers. 1 of the 3 required runs.
+  Operator notes on the push stage: the close-and-centre push repeated five times on a 3-4 mm residual gap that came
+  from a block skewed 13 mm along its length, sliding the row 31.9 mm off-centre; end alignment never ran; the claws
+  pushed 2 mm too low.
+- Changes on branch kazy/push-tuning (Kazy): one close-and-centre push per push phase (`CENTRE_PUSH_ATTEMPTS`), after
+  which end alignment runs even with a few mm of gap left; `PUSH_TIPS_MM` 5 -> 7. Gravity reorientation
+  (`--drop-spot x,y`, live-run and palletize): a pick whose top face tilts more than `REORIENT_TILT_DEG` 8 (height-map
+  plane fit seeded from the top band, so side faces do not bias it) or that stands on its edge is released
+  `DROP_HEIGHT_MM` 25 above the clear spot, re-captured and checked to lie flat (one block thick, full length, level)
+  before it can be placed; at most `MAX_REORIENT_DROPS` 2 per run, then stop. The spot must be clear and away from
+  the pallet and keep-out. Offline: tests/test_reorient.py (tilt within 1.5 deg at 0/5/12/25 deg with side faces);
+  a scratch simulation of a block leaning 12 deg measured 11.3 deg, dropped it, found it flat and finished the
+  pallet. Untested live.
+
 Limitations: the after-lift check cannot measure while the bundle fills the image (see run 4), so a full stack cannot
 complete until it is changed; table height and camera offset are unverified; `--grip-lower-mm 3` is a single-run fix,
 not a calibration; source and base must be reachable (x <= ~600 mm worked) and both visible from the view pose.
