@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>JengaDB · RGB-D collection</title>
+<style>
+:root{--bg:#101b25;--panel:#1c2d3b;--panel2:#172734;--fg:#eaf3f5;--muted:#b8c9d3;--acc:#75e2c3;--warn:#f2c94c;--bad:#f28b82;--line:#304451}
+*{box-sizing:border-box}body{margin:0;font:14px/1.45 system-ui;background:var(--bg);color:var(--fg)}
+header{display:flex;gap:18px;align-items:center;padding:12px 20px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+header h1{font-size:18px;margin:0}.tag{color:var(--acc);font-weight:700;letter-spacing:.08em;font-size:12px}
+.pill{background:var(--panel2);border:1px solid var(--line);border-radius:999px;padding:3px 10px;font-size:12px;color:var(--muted)}
+.pill b{color:var(--fg)}
+main{display:grid;grid-template-columns:minmax(380px,520px) 1fr;gap:16px;padding:16px 20px}
+section{background:var(--panel);border-radius:12px;padding:14px}
+h2{font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--acc);margin:0 0 10px}
+.preview{display:grid;grid-template-columns:1fr 1fr;gap:8px}.preview img{width:100%;background:#000;border-radius:8px;aspect-ratio:16/9;object-fit:cover}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px}
+input,select,textarea{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:7px 9px;font:inherit}
+input{min-width:0}
+button{background:var(--acc);color:#07211b;border:0;border-radius:8px;padding:8px 14px;font:inherit;font-weight:700;cursor:pointer}
+button.secondary{background:var(--panel2);color:var(--fg);border:1px solid var(--line)}button:disabled{opacity:.5;cursor:default}
+.muted{color:var(--muted)}.small{font-size:12px}
+.obs{display:flex;gap:10px;align-items:center;padding:8px;border-radius:8px;cursor:pointer;border:1px solid transparent}.obs input{margin:0 2px}
+.card.ignored{opacity:.5;filter:grayscale(.7);border-style:dashed}.card .head{display:flex;gap:8px;align-items:center;margin-bottom:8px;padding:6px 8px;border-radius:8px;background:#0f1b26;border:1px solid var(--line)}
+.card .head label{display:flex;gap:6px;align-items:center;font-weight:700;cursor:pointer;flex:1}.card .head input{width:18px;height:18px;accent-color:var(--acc);cursor:pointer}
+.card.ignored .head{border-color:#6a2a26}.card.ignored .head label{color:var(--bad)}.card .tools{display:flex;gap:6px;align-items:center;margin-top:6px;flex-wrap:wrap}
+.bulk button{padding:3px 8px;font-size:11px}
+.switch{display:inline-flex;border:1px solid var(--line);border-radius:999px;overflow:hidden;font-size:11px;font-weight:700}
+.switch button{border:0;border-radius:0;padding:4px 10px;background:var(--panel2);color:var(--muted)}.switch button.on.pick{background:#1f5c4c;color:#9df0d7}.switch button.on.nopick{background:#6a2a26;color:#ffb4ad}
+.src{font-size:10px;color:var(--muted);margin-left:6px}
+.obs:hover,.obs.sel{background:var(--panel2);border-color:var(--line)}.obs img{width:88px;aspect-ratio:16/9;object-fit:cover;border-radius:6px;background:#000}
+.badge{display:inline-block;border-radius:6px;padding:1px 7px;font-size:11px;font-weight:700;margin-right:4px}
+.exposed{background:#1f5c4c;color:#9df0d7}.occluded{background:#6a2a26;color:#ffb4ad}.unknown{background:#5c4a12;color:#ffe08a}
+.verified{background:#1f5c4c;color:#9df0d7}.unverified{background:#6a2a26;color:#ffb4ad}.uploaded{background:#24405a;color:#a8d4ff}.local{background:#2b3a47;color:#cfd9e0}
+.detail img.big{width:100%;border-radius:8px;background:#000}
+.tabs{display:flex;gap:6px;margin-bottom:8px}.tabs button{padding:5px 10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px;margin-top:10px}
+.card{background:var(--panel2);border-radius:10px;padding:10px;border-left:5px solid #555}
+.card.exposed{border-color:#75e2c3}.card.occluded{border-color:#f28b82}.card.unknown{border-color:#f2c94c}
+.card .imgs{display:flex;gap:6px}.card .imgs img{width:50%;aspect-ratio:1;object-fit:contain;background:#000;border-radius:6px;image-rendering:pixelated}
+.card p{margin:6px 0 0;font-size:12px;color:var(--muted);word-break:break-word}
+#log{font:12px ui-monospace,monospace;background:#0b141c;border-radius:8px;padding:10px;max-height:160px;overflow:auto;white-space:pre-wrap;color:var(--muted)}
+details summary{cursor:pointer;color:var(--muted)}
+</style>
+<header>
+  <div><span class="tag">LIVE · RGB-D COLLECTION</span><h1>JengaDB</h1></div>
+  <span class="pill">setup <b id="s-setup">…</b></span>
+  <span class="pill">camera <b id="s-cam">…</b></span>
+  <span class="pill">calibration <b id="s-cal">…</b></span>
+  <span class="pill">observations <b id="s-obs">0</b></span>
+  <span class="pill">candidates <b id="s-cand">0</b></span>
+  <span class="pill">job <b id="s-busy">idle</b></span>
+  <span style="flex:1"></span>
+  <span class="pill" title="Nothing is uploaded automatically">uploads <b>per capture, on request</b></span>
+</header>
+<main>
+  <div style="display:flex;flex-direction:column;gap:16px">
+    <section>
+      <h2>Live preview</h2>
+      <div class="preview"><img id="prev-rgb" alt="rgb"><img id="prev-depth" alt="depth"></div>
+      <div class="row">
+        <label class="small muted">episode</label><input id="episode" placeholder="ep_desk_1" style="flex:1">
+        <button id="btn-capture">Capture</button>
+        <label class="small muted"><input type="checkbox" id="live" checked> live</label>
+      </div>
+      <p class="small muted" style="margin:8px 0 0">Read-only <code>get_images</code>. Depth preview is false colour: red near, blue far, black invalid.</p>
+    </section>
+    <section>
+      <h2>Calibration verdict · <span id="cal-setup"></span></h2>
+      <div id="cal-current" class="small muted">…</div>
+      <div class="row">
+        <input id="cal-version" placeholder="calibration version" style="width:150px">
+        <select id="cal-align"><option value="verified">verified</option><option value="unverified">unverified</option><option value="unknown">unknown</option></select>
+        <select id="cal-pose"><option value="unknown">pose: unknown</option><option value="top_down">pose: top_down</option><option value="oblique">pose: oblique</option></select>
+      </div>
+      <div class="row">
+        <input id="cal-method" placeholder="method (e.g. align_color_depth + overlay inspection)" style="flex:1">
+        <input id="cal-by" placeholder="checked by" style="width:120px">
+        <button class="secondary" id="btn-cal">Record</button>
+      </div>
+      <p class="small muted" style="margin:8px 0 0">Exposure is only classified when the observation's calibration is <b>verified</b> and matches the current version. Recording a new version changes the processing identity for new runs.</p>
+    </section>
+    <section>
+      <h2>Observations</h2>
+      <div class="row" style="margin:0 0 8px">
+        <label class="small muted"><input type="checkbox" id="sel-all"> select all local-only</label>
+        <span class="small muted" id="sel-count"></span>
+        <span style="flex:1"></span>
+        <button class="secondary" id="btn-bulk-delete" style="color:var(--bad)" disabled>Delete selected</button>
+      </div>
+      <div id="obs-list"></div>
+    </section>
+    <section><h2>Log</h2><div id="log"></div></section>
+  </div>
+  <div style="display:flex;flex-direction:column;gap:16px">
+    <section class="detail" id="detail" style="display:none">
+      <h2>Observation <span id="d-id"></span></h2>
+      <div class="row small muted" id="d-meta"></div>
+      <div class="tabs">
+        <button class="secondary" data-tab="rgb.png">RGB</button>
+        <button class="secondary" data-tab="depth-preview.png">Depth</button>
+        <button class="secondary" data-tab="overlay.png">Overlay</button>
+        <span style="flex:1"></span>
+        <button id="btn-process">Process (SAM 3.1 → exposure → Voyage)</button>
+        <button id="btn-upload" title="Upload this capture only: media, observation, candidates with embeddings">Upload to Atlas</button>
+        <button class="secondary" id="btn-delete" style="color:var(--bad)" title="Remove this capture and its candidates locally">Delete capture</button>
+      </div>
+      <div class="row small muted" id="d-upload"></div>
+      <img class="big" id="d-img" alt="">
+      <div class="row small muted" id="d-stages"></div>
+      <h2 style="margin-top:14px">Candidates <span id="d-counts" class="muted"></span></h2>
+      <div class="row small muted bulk" id="cand-tools" style="margin:0">
+        <span>Tick <b>include</b> on each finding you want in Atlas; unticked ones never leave this laptop.</span>
+        <span style="flex:1"></span>
+        <span>bulk:</span>
+        <button class="secondary" id="btn-keep-all">include all</button>
+        <button class="secondary" id="btn-ignore-all">exclude all</button>
+        <button class="secondary" id="btn-ignore-unknown">exclude 'unknown'</button>
+        <span>· label:</span>
+        <button class="secondary" id="btn-all-pick">all pickable</button>
+        <button class="secondary" id="btn-all-nopick">all not pickable</button>
+      </div>
+      <div class="grid" id="cands"></div>
+    </section>
+    <section id="empty"><p class="muted">Capture an observation or select one on the left.</p></section>
+  </div>
+</main>
+<script>
+const $=s=>document.querySelector(s); let selected=null, tab="rgb.png", obsCache=[], picked=new Set(), candCache=[];
+function updatePick(){ for(const id of [...picked]) if(!obsCache.some(o=>o.observation_id===id&&!(o.upload&&o.upload.any))) picked.delete(id); $("#sel-count").textContent=picked.size?`${picked.size} selected`:""; $("#btn-bulk-delete").disabled=!picked.size; }
+const log=(m)=>{const el=$("#log"); el.textContent=`[${new Date().toLocaleTimeString()}] ${typeof m==="string"?m:JSON.stringify(m)}\n`+el.textContent;};
+async function api(path,opts){const r=await fetch(path,opts); let j=null; try{j=await r.json();}catch{} if(!r.ok){throw new Error((j&&j.detail)||r.statusText);} return j;}
+function badge(s){return `<span class="badge ${s}">${s}</span>`;}
+
+async function refreshStatus(){
+  try{const s=await api("/api/status");
+    $("#s-setup").textContent=s.setup_id; $("#cal-setup").textContent=s.setup_id;
+    $("#s-cam").textContent=s.camera_connected?"connected":(s.camera_error||"idle");
+    const c=s.calibration; $("#s-cal").innerHTML=c.current?`${c.current} ${badge(c.entry.alignment.status)}`:"none";
+    $("#cal-current").innerHTML=c.current?`current <b>${c.current}</b> ${badge(c.entry.alignment.status)} · ${c.entry.alignment.method} · by ${c.entry.alignment.checked_by} · pose ${c.entry.viewing_pose}`:"No calibration recorded for this setup; record one before capturing.";
+    if(!$("#cal-version").value) $("#cal-version").value=c.current||"";
+    $("#s-obs").textContent=s.observations; $("#s-cand").textContent=s.candidates; $("#s-busy").textContent=s.busy||"idle";
+    document.querySelectorAll("button").forEach(b=>{ if(b.id!=="btn-cal") b.disabled=!!s.busy; });
+    if(!s.busy && selected) renderDetail();
+  }catch(e){log("status: "+e.message);}
+}
+function tick(){ if($("#live").checked){const t=Date.now(); $("#prev-rgb").src="/api/preview.jpg?t="+t; $("#prev-depth").src="/api/preview-depth.png?t="+t;} }
+setInterval(tick,700); setInterval(refreshStatus,3000);
+
+async function refreshObs(){
+  try{obsCache=await api("/api/observations");}catch(e){log("observations: "+e.message);return;}
+  $("#obs-list").innerHTML=obsCache.map(o=>o.error?`<div class="obs">${o.observation_id} <span class="badge unknown">${o.error}</span></div>`:
+    `<div class="obs ${o.observation_id===selected?"sel":""}" data-id="${o.observation_id}">
+      <input type="checkbox" class="pick" data-id="${o.observation_id}" ${o.upload&&o.upload.any?"disabled title='already uploaded'":""} ${picked.has(o.observation_id)?"checked":""} onclick="event.stopPropagation()">
+      <img src="/api/observations/${o.observation_id}/rgb.png">
+      <div><div><b>${o.observation_id}</b> <span class="small muted">${o.episode_id}</span></div>
+      <div class="small muted">${(o.captured_at||"").replace("T"," ").slice(0,19)} · ${o.calibration_version} ${badge(o.alignment)}</div>
+      <div class="small">${o.upload&&o.upload.any?`<span class="badge uploaded">${o.upload.complete?"uploaded":"partially uploaded"}</span>`:'<span class="badge local">local only</span>'}${o.candidates?`${o.candidates-o.candidates_ignored}/${o.candidates} cand · `:""}${["exposed","occluded","unknown"].filter(k=>o.exposure[k]).map(k=>`<span class="badge ${k}">${o.exposure[k]}</span>`).join("")}${o.stages.cutouts?"":'<span class="muted">unprocessed</span>'}</div></div></div>`).join("");
+  document.querySelectorAll(".obs[data-id]").forEach(el=>el.onclick=()=>select(el.dataset.id));
+  document.querySelectorAll(".pick").forEach(cb=>cb.onchange=()=>{cb.checked?picked.add(cb.dataset.id):picked.delete(cb.dataset.id); updatePick();});
+  updatePick();
+  if(selected) renderDetail();
+}
+async function select(id){selected=id; tab="rgb.png"; await refreshObs();}
+async function renderDetail(){
+  const o=obsCache.find(x=>x.observation_id===selected); if(!o) return;
+  $("#detail").style.display="block"; $("#empty").style.display="none";
+  $("#d-id").textContent=o.observation_id;
+  $("#d-meta").innerHTML=`<span>episode ${o.episode_id}</span><span>captured ${o.captured_at}</span><span>cal ${o.calibration_version} ${badge(o.alignment)}</span><span>skew ${o.timing.capture_to_local_receive_ms} ms</span><span>flags ${o.flags.join(", ")||"none"}</span>`;
+  $("#d-img").src=`/api/observations/${o.observation_id}/${tab}?t=${Date.now()}`;
+  const u=o.upload||{}; $("#d-upload").innerHTML=u.any?`<span class="badge uploaded">${u.complete?"uploaded":"partially uploaded"}</span><span>observation ${u.observation?"✓":"–"} · candidates ${u.candidates_acked}/${u.candidates_total} · media ${u.media_acked}/2 · target ${u.targets.join(", ")}</span>`:`<span class="badge local">local only</span><span>not uploaded; Delete is available</span>`;
+  $("#btn-delete").disabled=!!u.any; $("#btn-upload").textContent=u.complete?"Uploaded":(u.any?"Resume upload":"Upload to Atlas"); $("#btn-upload").disabled=!!u.complete||!o.stages.cutouts;
+  $("#d-stages").innerHTML=`<span>processing ${o.processing_version}</span>`+Object.entries(o.stages).map(([k,v])=>`<span>${k}: ${v?"✓":"–"}</span>`).join("")+`<span>media: ${Object.entries(o.local_artifacts).map(([k,v])=>k+"="+v).join(" ")}</span>`;
+  document.querySelectorAll(".tabs [data-tab]").forEach(b=>{b.onclick=()=>{tab=b.dataset.tab; renderDetail();}; b.style.outline=b.dataset.tab===tab?"2px solid var(--acc)":"none";});
+  const cands=await api(`/api/candidates?observation=${o.observation_id}`); candCache=cands;
+  const kept=cands.filter(c=>!c.ignored).length;
+  $("#d-counts").textContent=cands.length?`${kept} of ${cands.length} selected for upload`:"none yet";
+  $("#cand-tools").style.display=cands.length?"flex":"none";
+  $("#btn-upload").textContent=u.complete?"Uploaded":(u.any?"Resume upload":`Upload ${kept} candidate${kept===1?"":"s"}`);
+  $("#cands").innerHTML=cands.map(c=>`<div class="card ${c.exposure.status} ${c.ignored?"ignored":""}" data-cid="${c.candidate_id}">
+    <div class="head"><label><input type="checkbox" data-toggle="${c.candidate_id}" ${c.ignored?"":"checked"} ${c.uploaded?"disabled":""}> ${c.ignored?"excluded":(c.uploaded?"uploaded":"include in upload")}</label><span class="small muted">#${c.mask_index}</span>${c.uploaded?'<span class="badge uploaded">in Atlas</span>':""}</div>
+    <div class="imgs"><img src="/api/candidates/${c.candidate_id}/context.png" title="context"><img src="/api/candidates/${c.candidate_id}/cutout.png" title="cutout"></div>
+    <div class="tools"><span class="switch" data-label="${c.candidate_id}"><button class="pick ${c.pickability_label.status==="pickable"?"on":""}" data-value="pickable" ${c.uploaded?"disabled":""}>pickable</button><button class="nopick ${c.pickability_label.status==="not_pickable"?"on":""}" data-value="not_pickable" ${c.uploaded?"disabled":""}>not pickable</button></span><span class="src" title="human = you set it; human_default = untouched default">${c.pickability_label.label_source==="human"?"set by you":"default"}</span></div>
+    <div class="tools">${badge(c.exposure.status)}<span class="badge" style="background:#2b3a47;color:#cfd9e0" title="geometric grasp eligibility is not evaluated by this pipeline (SKY-87)">heuristic ${c.pickability.status}</span>${c.segmentation_score!=null?`<span class="small muted">conf ${c.segmentation_score.toFixed(2)}</span>`:""}</div>
+    <p>bbox ${c.bbox.join(",")} · ${c.area_px}px${c.depth_stats&&c.depth_stats.median_mm?` · ${Math.round(c.depth_stats.median_mm)} mm (valid ${c.depth_stats.valid_fraction.toFixed(2)})`:""}<br>${(c.exposure.reasons||[]).join(", ")}${c.depth_crop_reason?`<br>depth crop: ${c.depth_crop_reason}`:""}</p>
+    <details><summary>description (metadata, not in the vector)</summary><p>${c.description_text}</p></details></div>`).join("");
+  document.querySelectorAll("[data-toggle]").forEach(b=>b.onchange=()=>toggleIgnore(b.dataset.toggle));
+  document.querySelectorAll(".switch[data-label] button").forEach(b=>b.onclick=(ev)=>{ev.stopPropagation(); saveLabels({[b.parentElement.dataset.label]: b.dataset.value});});
+  document.querySelectorAll(".card[data-cid] .imgs").forEach(el=>el.onclick=()=>{const cb=el.parentElement.querySelector("[data-toggle]"); if(!cb.disabled) toggleIgnore(el.parentElement.dataset.cid);});
+}
+async function saveLabels(labels){ try{ await api(`/api/review/${selected}`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({labels,reviewed_by:$("#cal-by").value||null})}); }catch(e){log("label: "+e.message);} await refreshObs(); }
+$("#btn-all-pick").onclick=()=>saveLabels(Object.fromEntries(candCache.filter(c=>!c.uploaded).map(c=>[c.candidate_id,"pickable"])));
+$("#btn-all-nopick").onclick=()=>saveLabels(Object.fromEntries(candCache.filter(c=>!c.uploaded).map(c=>[c.candidate_id,"not_pickable"])));
+async function saveReview(ignoredIds){ try{ await api(`/api/review/${selected}`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({ignored:ignoredIds,reviewed_by:$("#cal-by").value||null})}); }catch(e){log("review: "+e.message);} await refreshObs(); }
+function toggleIgnore(cid){ const ig=new Set(candCache.filter(c=>c.ignored).map(c=>c.candidate_id)); ig.has(cid)?ig.delete(cid):ig.add(cid); saveReview([...ig]); }
+$("#btn-keep-all").onclick=()=>saveReview([]);
+$("#btn-ignore-all").onclick=()=>saveReview(candCache.map(c=>c.candidate_id));
+$("#btn-ignore-unknown").onclick=()=>saveReview(candCache.filter(c=>c.ignored||c.exposure.status==="unknown").map(c=>c.candidate_id));
+$("#sel-all").onchange=()=>{picked.clear(); if($("#sel-all").checked) obsCache.filter(o=>!(o.upload&&o.upload.any)&&!o.error).forEach(o=>picked.add(o.observation_id)); refreshObs();};
+$("#btn-bulk-delete").onclick=async()=>{const ids=[...picked]; if(!ids.length) return; if(!confirm(`Delete ${ids.length} capture(s) and their candidates from this laptop?`)) return; try{const r=await api("/api/delete",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({observation_ids:ids})}); log(r.map(x=>`${x.observation_id}: ${x.ok?"deleted":x.error}`).join("\n")); if(ids.includes(selected)){selected=null; $("#detail").style.display="none"; $("#empty").style.display="block";}}catch(e){log("delete: "+e.message);} picked.clear(); $("#sel-all").checked=false; refreshStatus(); refreshObs();};
+$("#btn-capture").onclick=async()=>{try{const o=await api("/api/capture",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({episode_id:$("#episode").value||null})}); log(`captured ${o.observation_id}`); await select(o.observation_id);}catch(e){log("capture: "+e.message);} refreshStatus();};
+$("#btn-cal").onclick=async()=>{try{const e=await api("/api/calibration",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({calibration_version:$("#cal-version").value,alignment:$("#cal-align").value,method:$("#cal-method").value,checked_by:$("#cal-by").value,viewing_pose:$("#cal-pose").value})}); log(`calibration ${e.calibration_version} recorded as ${e.alignment.status}`);}catch(e){log("calibration: "+e.message);} refreshStatus(); refreshObs();};
+$("#btn-process").onclick=async()=>{if(!selected) return; log(`processing ${selected} …`); refreshStatus(); try{const r=await api(`/api/process/${selected}`,{method:"POST"}); log(r);}catch(e){log("process: "+e.message);} refreshStatus(); refreshObs();};
+$("#btn-upload").onclick=async()=>{if(!selected) return; const kept=candCache.filter(c=>!c.ignored).length; if(!confirm(`Upload ${selected} to Atlas: media, observation and ${kept} selected candidate(s) with embeddings? Ignored detections stay local.`)) return; log(`uploading ${selected} …`); refreshStatus(); try{const r=await api(`/api/upload/${selected}`,{method:"POST"}); log({media:r.media_uploaded,observations:r.observations_sent,candidates:r.candidates_sent,ignored:r.candidates_ignored,error:r.error,pending_candidates:r.pending_candidates});}catch(e){log("upload: "+e.message);} refreshStatus(); refreshObs();};
+$("#btn-delete").onclick=async()=>{if(!selected) return; if(!confirm(`Delete capture ${selected} and its candidates from this laptop? (only possible before upload)`)) return; try{const r=await api(`/api/observations/${selected}`,{method:"DELETE"}); log(r); selected=null; $("#detail").style.display="none"; $("#empty").style.display="block";}catch(e){log("delete: "+e.message);} refreshStatus(); refreshObs();};
+refreshStatus(); refreshObs(); tick();
+</script>
+</html>

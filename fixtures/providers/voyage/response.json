@@ -1,0 +1,28 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "object": "embedding",
+      "embedding": [
+        -0.018003214,
+        0.010559776,
+        -0.018652286,
+        -0.055395626,
+        0.034729023,
+        0.015597253,
+        -0.012426317,
+        0.028263923
+      ],
+      "index": 0,
+      "text": null
+    }
+  ],
+  "model": "voyage-multimodal-3.5",
+  "usage": {
+    "text_tokens": 4,
+    "image_pixels": 0,
+    "video_pixels": 0,
+    "total_tokens": 4
+  },
+  "_note": "Captured 2026-10-29 from POST https://ai.mongodb.com/v1/multimodalembeddings with a text-only input (no image). Embedding truncated to 8 of 1024 values. No credentials included."
+}

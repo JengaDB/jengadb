@@ -26,5 +26,25 @@
     "title": "Connect the existing Atlas database",
     "status": "ready",
     "card": "tasks/DATA-02.md"
+  },
+  {
+    "id": "SKY-66",
+    "role": "data",
+    "title": "RGB-D records, candidate embeddings and Atlas indexes",
+    "status": "in_progress",
+    "card": "tasks/SKY-66.md",
+    "owner": "Kris",
+    "evidence": "Offline pipeline + tests; Atlas indexes READY; scratch flush round trip verified; SAM 3.1 and Voyage endpoints verified; local Viam capture pending",
+    "updated_at": "2026-10-29T22:45:00+00:00"
+  },
+  {
+    "id": "CACHE-01",
+    "role": "data",
+    "title": "Integrate exact-result cache with SKY-66",
+    "status": "in_progress",
+    "card": "tasks/CACHE-01.md",
+    "owner": "Kazy",
+    "evidence": "73 offline tests pass including cache reuse and existing sync retry; pipeline-owner review and live validation pending.",
+    "updated_at": "2026-10-29T23:27:30.587221+00:00"
   }
 ]
