@@ -119,6 +119,45 @@ class SplitAndPlan(unittest.TestCase):
         self.assertEqual(ls.tower_layers(three), 3)
         self.assertEqual(ls.tower_layers(three, block_height_mm=14.5), 3)
 
+    @staticmethod
+    def measured(rows):
+        """Blocks as the stack's `measured` events log them: (x, y, long_deg, height)."""
+        return [{"base_point_mm": (x, y, 0.0), "base_long_side_deg": a, "height_above_table_mm": h} for x, y, a, h in rows]
+
+    def test_tower_top_is_three_blocks_whatever_the_detections(self):
+        # 30 Oct run 11 (21:01): three blocks on the 90 mm tower top plus the nearest one's side face at 87.6 mm, seen at an
+        # angle from the overview; the run stopped with "expected 3 measured blocks in the layer, saw 4". Operator: the
+        # tower top is three blocks every time, so the count is not a check.
+        overview = self.measured([(572.8, -2.6, -88.5, 90.4), (539.7, 30.3, 3.5, 65.7), (550.2, -7.5, -85.3, 90.3),
+                                  (524.0, -8.7, -82.9, 89.3), (509.0, -11.0, -82.5, 87.6), (437.3, 184.5, 0.4, 13.9),
+                                  (436.6, 209.3, 0.9, 12.2), (434.6, 160.0, 2.5, 12.9), (417.6, -147.1, 48.3, 18.1)])
+        outside, top, look, why = ls.overview_base(overview, (550.0, 0.0), 102.5)
+        self.assertEqual((look, why, len(top)), (None, None, 4))                   # four detections, no stop, no extra look
+        self.assertEqual(sum(1 for b in outside if math.dist(b["base_point_mm"][:2], (440, 195)) < 102.5), 3)   # the pallet stays
+        base = ls.base_layer(top)
+        self.assertEqual(sorted(round(p[0], 1) for p in base.block_centers), [524.0, 550.2, 572.8])   # the side face is left out
+        self.assertAlmostEqual(base.center_xy[0], (572.8 + 550.2 + 524.0) / 3, places=6)
+        self.assertEqual(base.level, 5)
+        # two detections ~50 mm apart are the outer blocks: the centre is between them
+        outer = ls.base_layer(self.measured([(550.0, -25.0, 0.0, 90.0), (550.0, 25.0, 0.0, 90.0)]))
+        self.assertAlmostEqual(outer.center_xy[1], 0.0)
+        # one detection, or two side by side: the centre could be half a block either way
+        with self.assertRaisesRegex(ls.LayerCheckError, "unknown by half a block"):
+            ls.base_layer(self.measured([(550.0, -12.5, 0.0, 90.0), (550.0, 12.5, 0.0, 90.0)]))
+        # four detections with no regular three among them: measured again from above
+        scattered = self.measured([(550.0, -60.0, 0.0, 90.0), (550.0, 0.0, 0.0, 90.0), (550.0, 60.0, 0.0, 90.0), (500.0, 0.0, 40.0, 90.0)])
+        self.assertEqual(ls.overview_base(scattered, (550.0, 0.0), 102.5)[2], "unclear")
+        # run 9 (20:43): the 75 mm top read as one layer, with a lower block's end beside it -> no extra look
+        run9 = self.measured([(555.3, -29.6, 1.8, 75.3), (552.2, -5.5, 4.0, 75.5), (548.8, 19.6, 2.9, 75.6),
+                              (554.5, 32.1, 0.9, 23.8), (435.6, 226.1, 2.2, 11.4)])
+        outside, top, look, why = ls.overview_base(run9, (550.0, 0.0), 102.5)
+        self.assertEqual((look, why, len(top), len(outside)), (None, None, 3, 1))
+        # a detection above the top layer between heights: also measured again, not a stop
+        tilted = self.measured([(550.0, -25.0, 0.0, 75.0), (550.0, 0.0, 0.0, 75.0), (550.0, 25.0, 0.0, 75.0), (560.0, 0.0, 0.0, 82.0)])
+        self.assertEqual(ls.overview_base(tilted, (550.0, 0.0), 102.5)[2], "unclear")
+        with self.assertRaises(ls.NoBaseLayer):
+            ls.overview_base(self.measured([(440.0, 201.0, 2.0, 15.0)]), (700.0, 200.0), 115.0)
+
     def test_plan_rotates_ninety_and_centres(self):
         src = ls.summarize_layer(layer((300, 100), -6.5))
         base = ls.summarize_layer(layer((435, 203), 2.0))
@@ -151,6 +190,75 @@ class SplitAndPlan(unittest.TestCase):
         lower = ls.plan_stack(src, base, params=ls.GraspParams(grasp_depth_mm=23.0, tips_min_mm=-3.0))
         self.assertAlmostEqual(lower.pick_tips_above_table_mm, -3.0)   # operator lowered the floor
         self.assertAlmostEqual(lower.release_tips_above_table_mm, 15 + 15 - 18.0 + 1)
+
+    def test_pallet_pick_goes_deeper_and_the_release_follows(self):
+        # 30 Oct run 8: the robot-built layer slid out of the claws on the lift with the tips at the 0 mm floor.
+        src = ls.summarize_layer(layer((300, 100), 0))
+        base = ls.summarize_layer(layer((435, 203), 0))
+        floor = ls.GraspParams(grasp_depth_mm=23.0, tips_min_mm=0.0)
+        a = ls.plan_stack(src, base, params=floor)
+        b = ls.plan_stack(src, base, params=floor, pick_deeper_mm=ls.PALLET_PICK_DEEPER_MM)
+        self.assertAlmostEqual(b.pick_tips_above_table_mm, -2.0)
+        self.assertAlmostEqual(b.grip_below_top_mm - a.grip_below_top_mm, 2.0)
+        self.assertAlmostEqual(a.release_tips_above_table_mm - b.release_tips_above_table_mm, 2.0)   # still 1 mm above the base
+        self.assertAlmostEqual(b.to_dict()["pick_deeper_mm"], 2.0)
+        with self.assertRaisesRegex(ls.LayerCheckError, "below the -6.0 mm limit"):
+            ls.plan_stack(src, base, params=ls.GraspParams(grasp_depth_mm=23.0, tips_min_mm=-5.0), pick_deeper_mm=2.0)
+
+    def test_palletize_picks_the_bundle_deeper_than_the_floor(self):
+        from unittest import mock
+        from robot_hackathon import live_executor
+        seen = {}
+
+        async def flow(config_, data_dir, operator, episode_id, *args, **kw):
+            ep = live_executor.Episode(data_dir, episode_id, operator)
+            ep.state.update(filled=["L0S0", "L0S1", "L0S2"], pallet_count=3)
+            ep.save()
+            return 0
+
+        async def stack(*args, **kw):
+            seen.update(kw)
+            return 1
+
+        config = Config.from_env({"MODE": "live", "ENABLE_MOTION": "true"})
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(live_executor, "run_flow", flow), \
+                mock.patch.object(ls, "run_layer_stack", stack):
+            rc = asyncio.run(ls.run_palletize(config, Path(d), "Kris", "ep1", (550, 0), (440, 195), None, tips_floor_mm=0.0))
+        self.assertEqual(rc, 1)                                      # the fake stack added no layer
+        self.assertEqual(seen["pick_deeper_mm"], ls.PALLET_PICK_DEEPER_MM)
+        self.assertEqual(seen["tips_floor_mm"], 0.0)                 # the floor itself is unchanged
+
+    def test_palletize_cycles_build_and_stack_back_to_back(self):
+        # operator, 30 Oct: after stacking one layer, build another on the pallet and stack it, with no Enter (--no-pause)
+        from unittest import mock
+        from robot_hackathon import live_executor
+        calls = []
+
+        async def flow(config_, data_dir, operator, episode_id, *args, **kw):
+            ep = live_executor.Episode(data_dir, episode_id, operator)
+            ep.state.update(filled=["L0S0", "L0S1", "L0S2"], pallet_count=3)
+            ep.save()
+            calls.append("build")
+            return 0
+
+        async def stack(config_, data_dir, operator, episode_id, *args, confirm=input, **kw):
+            confirm("Press Enter to pick and stack ")
+            ep = live_executor.Episode(data_dir, episode_id, operator)
+            ep.state["layers_stacked"] = ep.state.get("layers_stacked", 0) + 1
+            ep.state["tower_layers"] = 6 + ep.state["layers_stacked"]
+            ep.save()
+            calls.append("stack")
+            return 0
+
+        prompts = []
+        config = Config.from_env({"MODE": "live", "ENABLE_MOTION": "true"})
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(live_executor, "run_flow", flow), \
+                mock.patch.object(ls, "run_layer_stack", stack):
+            rc = asyncio.run(ls.run_palletize(config, Path(d), "Kris", "ep1", (550, 0), (440, 195), None, cycles=2,
+                                              expected_layers=6, confirm=prompts.append))
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, ["build", "stack", "build", "stack"])
+        self.assertEqual(len(prompts), 2)                                            # each one handed to the --no-pause stand-in
 
     def test_palletize_gates_on_motion_and_cycles(self):
         with self.assertRaises(ConfigError):
@@ -223,23 +331,90 @@ class LiftCheck(unittest.TestCase):
         self.assertEqual(ls.blocks_left_behind(src, held), 0)
 
 
-class RowPush(unittest.TestCase):
-    def test_single_direction_push_closes_gaps_and_centres_in_one_stroke(self):
-        from robot_hackathon.live_executor import row_push_plan
-        # Row along +y, (ax, ay) = (0, 1). Nominal anchor for a 3 x 25 mm row centred on y 195 is 170; it was released
-        # 8 mm past that toward the open end (178) and the next two 39 mm apart (14 mm release spacing).
-        pts = [(440, 178), (440, 217), (440, 256)]          # 14 mm release spacing: pitch 39
-        plan = row_push_plan(pts, (440, 195), 0.0, 1.0, 25.0)
-        self.assertAlmostEqual(plan["gaps_mm"], 28.0)
-        # closed row centre = anchor + 25 = 203 -> must move 8 mm toward the anchor (-a): pushable
-        self.assertAlmostEqual(plan["shift_mm"], 8.0)
-        self.assertAlmostEqual(plan["unpushable_mm"], 0.0)
-        # a row whose anchor sits short of nominal cannot be fixed by pushing toward the anchor
-        plan = row_push_plan([(440, 160), (440, 185), (440, 210)], (440, 195), 0.0, 1.0, 25.0)
-        self.assertAlmostEqual(plan["gaps_mm"], 0.0)
-        self.assertAlmostEqual(plan["shift_mm"], 0.0)
-        self.assertAlmostEqual(plan["unpushable_mm"], 10.0)
-        self.assertEqual(row_push_plan([], (440, 195), 0.0, 1.0, 25.0)["gaps_mm"], 0.0)
+class NearTableSpeed(unittest.TestCase):
+    """Robot.move_delta / set_speed with the near-table zone (operator, 30 Oct run 8: at most 20 deg/s within 300 mm)."""
+
+    def robot(self, tips_mm, refuse=False):
+        from robot_hackathon import live_executor as le
+        log = []
+
+        class Arm:
+            async def do_command(self, cmd):
+                log.append(("speed", cmd["set_speed"]))
+                return {}
+
+        class Bot(le.Robot):
+            def __init__(self):   # no viam resources: the gripper origin is a number, moves only shift it
+                self.arm, self.z = Arm(), tips_mm - le.TIP_ABOVE_GRIPPER_FRAME_MM
+
+            async def gripper_origin(self):
+                return (0.0, 0.0, self.z)
+
+            async def _planned_move(self, dx, dy, dz, rotate, near_table):
+                if refuse:
+                    return False, None
+                self.z += dz
+                log.append(("move", round(dz, 1), round(dx, 1)))
+                return True, None
+
+        return Bot(), log
+
+    def test_descent_lift_carry_and_rise_switch_speed_at_the_bands(self):
+        # operator, 30 Oct: 180 deg/s from 100 mm up, 60 between 40 and 100 mm (20 below 40, as held the bundle on run 9)
+        bot, log = self.robot(tips_mm=388.0)   # flange at the 560 mm view height
+
+        async def run():
+            bot.set_near_table_zone(0.0, 180.0)
+            await bot.move_delta(dz=-388.0, near_table=True)   # travel height down to the table
+            await bot.set_speed(40.0)                          # approach speed: capped at 20 below 40 mm
+            await bot.set_speed(180.0)                         # the flow restores travel speed before the lift
+            await bot.move_delta(dz=100.0, near_table=True)    # lift: 20 up to 40 mm, 60 up to 100 mm
+            await bot.move_delta(dx=200.0)                     # carry to the pallet 100 mm up: full speed (run 11: 20)
+            await bot.move_delta(dz=288.0, near_table=True)    # rise back to travel height
+        asyncio.run(run())
+        self.assertEqual(log, [("speed", 180.0), ("move", -288.0, 0.0), ("speed", 60.0), ("move", -60.0, 0.0),
+                               ("speed", 20.0), ("move", -40.0, 0.0), ("move", 40.0, 0.0), ("speed", 60.0), ("move", 60.0, 0.0),
+                               ("speed", 180.0), ("move", 0.0, 200.0), ("move", 288.0, 0.0)])
+
+    def test_slower_request_is_kept_and_no_zone_sends_at_once(self):
+        bot, log = self.robot(tips_mm=20.0)
+
+        async def run():
+            await bot.set_speed(30.0)                          # no zone yet: sent immediately, as before
+            bot.set_near_table_zone(0.0, 180.0)
+            await bot.set_speed(10.0)                          # recorded; the next move applies it
+            await bot.move_delta(dx=-20.0, near_table=True)
+        asyncio.run(run())
+        self.assertEqual(log, [("speed", 30.0), ("speed", 10.0), ("move", 0.0, -20.0)])
+
+    def test_turning_in_place_and_sweeps_are_not_capped(self):
+        # operator, 30 Oct: the gripper turns at 90 deg/s at any height; sweeps (empty claws) are sped up
+        bot, log = self.robot(tips_mm=30.0)                    # push stage: claws 30 mm above the table
+
+        async def run():
+            bot.set_near_table_zone(0.0, 180.0)
+            await bot.set_speed(90.0)                          # align_claws asks for the align speed
+            await bot.move_delta(rotate=45.0)                  # turning in place: 90, not 20
+            await bot.move_delta(dx=10.0, near_table=True)     # moving low: 20
+            bot.cap_paused = True                              # sweep_stroke
+            await bot.set_speed(30.0)
+            await bot.move_delta(dx=10.0, near_table=True)     # the stroke at the push speed
+            bot.cap_paused = False
+            await bot.move_delta(dx=10.0, near_table=True)     # capped again afterwards
+        asyncio.run(run())
+        self.assertEqual([e for e in log if e[0] == "speed"], [("speed", 90.0), ("speed", 20.0), ("speed", 30.0), ("speed", 20.0)])
+
+    def test_crossing_move_splits_on_its_line_and_stops_when_refused(self):
+        async def run(bot):
+            bot.set_near_table_zone(0.0, 180.0)
+            return await bot.move_delta(dx=100.0, dz=-100.0, near_table=True)
+        bot, log = self.robot(tips_mm=150.0)                   # 150 -> 50 mm crosses the 100 mm band edge halfway
+        asyncio.run(run(bot))
+        self.assertEqual([e for e in log if e[0] == "move"], [("move", -50.0, 50.0), ("move", -50.0, 50.0)])
+        bot, log = self.robot(tips_mm=150.0, refuse=True)
+        ok, _ = asyncio.run(run(bot))
+        self.assertFalse(ok)
+        self.assertEqual(log, [("speed", 180.0)])              # the low part is never sent
 
 
 class ReleaseSpacing(unittest.TestCase):
@@ -253,21 +428,138 @@ class ReleaseSpacing(unittest.TestCase):
         self.assertAlmostEqual(release_spacing_mm("ends", finger, 25.0, 14.0), 14.0)
 
 
-class RowAlign(unittest.TestCase):
-    def test_blocks_sticking_out_along_their_length_are_listed_largest_first(self):
-        from robot_hackathon.live_executor import row_align_plan
-        # row along +y, blocks' long sides along +x (long_deg 0); the middle block sits 7 mm further along +x
-        pts = [(440, 170), (447, 195), (438, 220)]
-        plan = row_align_plan(pts, 0.0, 5.0)
-        self.assertEqual([(i, round(o, 1)) for i, o in plan], [(1, 7.0)])
-        self.assertEqual(row_align_plan([(440, 170), (443, 195), (438, 220)], 0.0, 5.0), [])   # within 5 mm
-        # long sides along +y (row runs along x): offsets measured along y
-        plan = row_align_plan([(440, 195), (465, 195), (490, 232)], 90.0, 5.0)
-        self.assertEqual([(i, round(o, 1)) for i, o in plan], [(2, 37.0)])
-        # the photo of 11:33: three blocks each shifted ~18 mm further along their length than the previous one
-        plan = row_align_plan([(440, 170), (458, 195), (476, 220)], 0.0, 5.0)
-        self.assertEqual([(i, round(o, 1)) for i, o in plan], [(0, -18.0), (2, 18.0)])
-        self.assertEqual(row_align_plan([(440, 170)], 0.0, 5.0), [])
+class PalletPushPlan(unittest.TestCase):
+    """Sam's pallet procedure (30 Oct spec): one look, push together, line up the ends against the last block."""
+    dims = None
+
+    def plan(self, pts, tol=2.0):
+        from robot_hackathon.grasp_geometry import BlockDimensions
+        from robot_hackathon.live_executor import pallet_push_plan
+        return pallet_push_plan(pts, 0.0, BlockDimensions(), tol)   # long sides along +x, row along +y
+
+    def test_push_together_starts_beside_the_last_block_and_covers_gaps_plus_ten(self):
+        from robot_hackathon.live_executor import PUSH_START_GAP_MM, CLAW_THICKNESS_MM
+        # kazy-palletize-30oct 19:40:35: released 77 mm apart, gaps 105.7 mm
+        plan = self.plan([(436.0, 175.7), (427.6, 252.6), (438.5, 330.2)])
+        self.assertAlmostEqual(plan["gaps_mm"], 105.7, delta=0.3)
+        self.assertEqual(plan["push"]["direction"][1], -1.0)                       # toward the first block
+        self.assertAlmostEqual(plan["push"]["start_xy"][1], 330.2 + 12.5 + CLAW_THICKNESS_MM + PUSH_START_GAP_MM)
+        self.assertAlmostEqual(plan["push"]["distance_mm"], plan["gaps_mm"] + 10.0)
+        self.assertIsNone(self.plan([(440, 170), (440, 195.5), (440, 220.5)])["push"])   # gaps under 2 mm: no push
+
+    def test_ends_line_up_with_the_last_block_furthest_first(self):
+        # second cycle, after the push: ends at x 436.3 / 430.4 / 441.8; reference = the last block (441.8)
+        plan = self.plan([(436.3, 167.7), (430.4, 192.5), (441.8, 217.5)])
+        self.assertEqual([round(o, 1) for o in plan["offsets_mm"]], [-5.5, -11.4])
+        first = plan["ends"][0]
+        self.assertEqual(first["index"], 1)                                         # furthest first
+        self.assertAlmostEqual(first["distance_mm"], 11.4 + 10.0, places=1)                # overhang + the 10 mm start gap
+        self.assertEqual(first["direction"], (1.0, 0.0))                            # pushed toward +x, back to the line
+        self.assertAlmostEqual(first["start_xy"][0], 430.4 - (37.5 + 10.0 + 8.0))    # end + 10 mm gap (operator: 5 more) + 8 to the claws' middle
+        self.assertEqual(first["also_lines_up"], [0])                               # its neighbour sticks out the same way, less
+        # 2.97 mm of gaps between centres call for a closing push first, so the reference is predicted at 212.7;
+        # the face stays 2 mm off it
+        self.assertAlmostEqual(first["start_xy"][1], (167.7 - 5.0 + 50.0) - 12.5 - 2.0 - 22.5)
+        self.assertEqual(len(plan["ends"]), 1)
+
+    def test_within_two_mm_is_never_touched_and_opposite_sides_are_separate(self):
+        self.assertEqual(self.plan([(441.0, 170), (439.5, 195), (440.0, 220)])["ends"], [])
+        plan = self.plan([(446.0, 170), (433.0, 195), (440.0, 220)])                  # +6 and -7 vs the last block
+        self.assertEqual([e["index"] for e in plan["ends"]], [1, 0])
+        self.assertEqual([e["also_lines_up"] for e in plan["ends"]], [[], []])
+        self.assertEqual([e["direction"][0] for e in plan["ends"]], [1.0, -1.0])
+        # predicted positions after the closing push: blocks touch and the row has moved on by the 5 mm overshoot
+        # (block 1 at 190); the face is held off the reference block, so it sits 12 mm toward the first block
+        plan = self.plan([(446.0, 170), (433.0, 250), (440.0, 330)])
+        self.assertAlmostEqual(plan["ends"][0]["start_xy"][1], 178.0)
+        self.assertAlmostEqual(plan["ends"][0]["face_off_block_mm"], -12.0)
+        self.assertEqual(self.plan([(440, 170)])["ends"], [])
+
+    def test_end_push_face_never_reaches_the_reference_block(self):
+        # run 9 (20:43): the face was centred on block 1's predicted place, overlapped the last block by 18 mm and moved it
+        from robot_hackathon.live_executor import PUSH_FACE_CLEAR_MM
+        for pts in ([(436.3, 167.7), (430.4, 192.5), (441.8, 217.5)], [(436.1, 233.8), (439.4, 308.4), (428.9, 353.5)],
+                    [(424.0, 170.0), (446.0, 195.0), (440.0, 220.0)]):
+            plan = self.plan(pts)
+            ref_y = (pts[-1][1] if plan["push"] is None else pts[0][1] - 5.0 + 50.0)
+            for e in plan["ends"]:
+                self.assertLessEqual(e["start_xy"][1] + 22.5, ref_y - 12.5 - PUSH_FACE_CLEAR_MM + 1e-9)   # face edge vs reference
+                block_y = (pts[e["index"]][1] if plan["push"] is None else pts[0][1] - 5.0 + 25.0 * e["index"])
+                self.assertGreaterEqual(min(e["start_xy"][1] + 22.5, block_y + 12.5) - max(e["start_xy"][1] - 22.5, block_y - 12.5), 20.0)
+
+class PickRefine(unittest.TestCase):
+    """Measuring a block again from above before the pick (operator, 30 Oct: blocks far to one side slightly missed)."""
+
+    def test_camera_view_centre_on_the_table(self):
+        from robot_hackathon.live_executor import table_point_under_camera
+        down = [[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]]          # camera z straight down
+        self.assertEqual(table_point_under_camera(down, [416.0, 182.0, 546.0], 0.0), (416.0, 182.0))
+        s = math.sin(math.radians(10.0))
+        tilted = [[1.0, 0.0, s], [0.0, -1.0, 0.0], [0.0, 0.0, -math.cos(math.radians(10.0))]]
+        x, y = table_point_under_camera(tilted, [400.0, 0.0, 500.0], 0.0)
+        self.assertAlmostEqual(x, 400.0 + 500.0 * math.tan(math.radians(10.0)), places=6)
+        self.assertIsNone(table_point_under_camera([[1, 0, 1], [0, 1, 0], [0, 0, 0]], [0, 0, 500], 0.0))   # looking sideways
+
+    def test_same_block_is_the_nearest_with_matching_height_and_angle(self):
+        from robot_hackathon.live_executor import match_block
+        planned = {"base_point_mm": (332.1, 344.7, 0.0), "height_above_table_mm": 16.5, "base_long_side_deg": 65.8}
+
+        def cand(x, y, h=16.0, a=66.0):
+            return {"geometry": {"base_point_mm": (x, y, 0.0), "height_above_table_mm": h, "base_long_side_deg": a}}
+        near, far = cand(336.0, 348.0), cand(352.0, 344.0)
+        self.assertIs(match_block(planned, [far, near]), near)
+        self.assertIsNone(match_block(planned, [cand(336.0, 348.0, h=30.0)]))             # a block on top of it
+        self.assertIsNone(match_block(planned, [cand(336.0, 348.0, a=-20.0)]))            # a block across it
+        self.assertIsNone(match_block(planned, [cand(360.0, 344.0)]))                     # 28 mm away
+        flipped = cand(336.0, 348.0, a=65.8 - 180.0)
+        self.assertIs(match_block(planned, [flipped]), flipped)                          # same long side, measured the other way
+
+
+class PalletAudit(unittest.TestCase):
+    """Whole and square (operator, 30 Oct): double picks happen; check the pallet after every placement and fix it."""
+    LINE = (440.0, 170.0)      # first slot centre; the row runs along +y, block long sides along x (0 deg)
+
+    def audit(self, rows):
+        from robot_hackathon.live_executor import pallet_audit
+        return pallet_audit([{"xy": (x, y), "long_deg": a, "flat_reasons": f} for x, y, a, f in rows], 0.0, self.LINE)
+
+    def test_square_row_needs_nothing(self):
+        a = self.audit([(441.0, 170.0, 0.5, []), (438.0, 195.0, -1.0, []), (440.0, 220.0, 2.0, [])])
+        self.assertTrue(a["square"])
+        self.assertEqual((a["extra"], a["fix"]), ([], []))
+
+    def test_double_pick_leaves_the_outermost_block_extra(self):
+        a = self.audit([(440.0, 170.0, 0.0, []), (440.0, 247.5, 0.0, []), (440.0, 325.0, 0.0, []), (440.0, 350.0, 0.0, [])])
+        self.assertEqual(a["extra"], [3])                                          # the one furthest from the first slot
+        self.assertFalse(a["square"])
+
+    def test_turned_off_line_and_not_flat_blocks_are_fixed(self):
+        # run 13 (21:28): a block 37.7 mm off the row's line; and one turned 6 deg, one resting on a neighbour
+        a = self.audit([(441.4, 166.6, 0.4, []), (477.7, 231.9, 1.0, []), (434.5, 255.8, 6.0, [])])
+        fixes = dict(a["fix"])
+        self.assertEqual(sorted(fixes), [1, 2])
+        self.assertTrue(fixes[1][0].startswith("off_line:+38"))
+        self.assertTrue(fixes[2][0].startswith("rotated:+6"))
+        a = self.audit([(440.0, 170.0, 0.0, []), (440.0, 195.0, 0.0, ["height:29.7mm_not_one_block"]), (440.0, 220.0, 0.0, []),
+                        (440.0, 245.0, 0.0, [])])
+        self.assertEqual(a["extra"], [1])                                          # with one too many, the bad one goes
+        self.assertEqual(a["fix"], [])
+
+
+class MissedPicks(unittest.TestCase):
+    def test_a_block_still_where_it_was_picked_from_was_missed(self):
+        from robot_hackathon.live_executor import missed_attempts
+        # 30 Oct 20:15:33: ends pick at (315.7, 0.3), top 27.6; the next capture still had a block at (315.8, -1.6), 28.9
+        attempts = [{"xy": (315.7, 0.3), "top": 27.6, "long_deg": 84.0, "style": "ends", "observation_id": "obs_1"}]
+        same = {"base_point_mm": (315.8, -1.6, 30.0), "height_above_table_mm": 28.9, "base_long_side_deg": 86.0}
+        self.assertEqual(len(missed_attempts(same, attempts, "obs_2")), 1)
+        self.assertEqual(missed_attempts(same, attempts, "obs_1"), [])            # the capture the pick came from
+        under = dict(same, height_above_table_mm=14.0)                           # the block it was lying on
+        self.assertEqual(missed_attempts(under, attempts, "obs_2"), [])
+        turned = dict(same, base_long_side_deg=40.0)                             # moved: a different block now
+        self.assertEqual(missed_attempts(turned, attempts, "obs_2"), [])
+        away = dict(same, base_point_mm=(340.0, 20.0, 30.0))
+        self.assertEqual(missed_attempts(away, attempts, "obs_2"), [])
 
 
 class GripReport(unittest.TestCase):

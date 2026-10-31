@@ -15,7 +15,7 @@ def main(argv=None):
     parser.add_argument("--cycles", type=int, default=1, help="palletize: how many layers to build and stack in one go")
     parser.add_argument("--place-spacing-mm", type=float, default=14.0, help="live-run/palletize: extra pitch between consecutive pallet blocks at release; the single-direction push closes it")
     parser.add_argument("--no-sessions", action="store_true", help="live-run/layer-stack/palletize: disable Viam sessions (a missed heartbeat ended runs with SESSION_EXPIRED); a dropped connection then no longer stops a move already executing: the e-stop does")
-    parser.add_argument("--align-speed", type=float, default=45.0, help="live-run/layer-stack/palletize: joint speed (deg/s) for the wrist rotations that align the claws")
+    parser.add_argument("--align-speed", type=float, default=90.0, help="live-run/layer-stack/palletize: joint speed (deg/s) for the wrist rotations that align the claws")
     parser.add_argument("--approach-speed", type=float, default=40.0, help="live-run/palletize: joint speed (deg/s) for the last 40 mm of every descent to the table")
     parser.add_argument("--push-speed", type=float, default=30.0, help="live-run/palletize: joint speed (deg/s) while pushing the pallet row together")
     parser.add_argument("--grip-retries", type=int, default=1, help="live-run/layer-stack/palletize: repeat the pick movement this many times when the gripper reports an empty grip (grab false, not holding, or opening <= 0.5 mm)")
@@ -29,8 +29,13 @@ def main(argv=None):
     parser.add_argument("--push-distance", type=float, default=None, help="live-step push: override the computed slide distance (mm)")
     parser.add_argument("--direct-local", action="store_true", help="layer-stack/live-run: dial viam-server on the LAN (gRPC, no cloud relay); sessions stay on")
     parser.add_argument("--view", default=None, help="layer-stack/live-run: 'x,y,z' flange pose (mm, world) for the overview capture (live-run: moves there first and returns there; default is the current pose and HOME); layer-stack default 300,150,460 (sees ~x 200-545, y -130..490); raise z or shift x,y to cover more table")
-    parser.add_argument("--no-pause", action="store_true", help="layer-stack: do not wait for Enter; every check still stops the run. Someone stays at the e-stop")
+    parser.add_argument("--no-pause", action="store_true", help="layer-stack/palletize: do not wait for Enter before picking up and stacking the layer; every check still stops the run. With palletize --cycles N the robot builds and stacks N layers back to back. Someone stays at the e-stop")
     parser.add_argument("--grip-lower-mm", type=float, default=0.0, help="layer-stack/live-run: grip this much deeper than the default 8 mm below the block top (limited by the tips floor)")
+    parser.add_argument("--drop-spot", default=None, help="live-run/palletize: 'x,y' mm (world) of a clear table spot; a tilted or on-edge heap block is dropped there from a short height to lie flat before it is placed")
+    parser.add_argument("--knock-over", action="store_true", help="live-run/palletize: sweep upright blocks over so they lie flat: one on its edge on the table where it lies (instead of dropping it), one that lands on its edge at the drop spot, and one standing on its end when nothing else can be picked")
+    parser.add_argument("--flatten-sweeps", type=int, default=0, help="live-run/palletize: after the first look from home, up to this many random sweeps through the heap with the closed claws (tips 18 mm above the table) to knock blocks on their edge, on end or on another block flat; each aims at a heap block taller than that, keeps clear of the pallet, tower and drop spot, and is planned from a new capture")
+    parser.add_argument("--x-sweeps", type=int, default=0, help="live-run/palletize: when two looks in a row find no block with room for the claws (a packed heap), sweep its bottom layer in an X (two crossing strokes through the heap centre, claw tips 7 mm above the table, clear of the pallet, tower and drop spot) and look again; up to this many times per run")
+    parser.add_argument("--push-outs", type=int, default=0, help="live-run/palletize: when two looks in a row find no block with room for the claws and 3 or more flat blocks lie side by side, slide the middle ones out 55 mm along their length (claws turned edge-on into their ends) before any X sweep; up to this many rows per run")
     parser.add_argument("--keep-out", default=None, help="live-run: 'x,y' mm (world) of a tower that must not be picked from; blocks within the footprint clearance of it are skipped")
     parser.add_argument("--layers", type=int, default=None, help="layer-stack: layers already on the tower; the measured count (top height / block height) must agree")
     parser.add_argument("--tips-floor-mm", type=float, default=None, help="layer-stack/live-run: lowest claw-tip height above the calibrated table for the pick (default 1.0; down to -6.0 when the calibrated table z is known to sit above the real surface)")
@@ -89,7 +94,10 @@ def main(argv=None):
                                                      apply_offset=args.apply_offset, arm_speed=args.arm_speed, arm_accel=args.arm_accel,
                                                      place_spacing_mm=args.place_spacing_mm, grip_retries=args.grip_retries,
                                                      references=args.references or "none", approach_speed=args.approach_speed,
-                                                     push_speed=args.push_speed, disable_sessions=args.no_sessions, align_speed=args.align_speed))
+                                                     push_speed=args.push_speed, disable_sessions=args.no_sessions, align_speed=args.align_speed,
+                                                     drop_spot_xy=_parse_xy(args.drop_spot) if args.drop_spot else None,
+                                                     knock_over=args.knock_over, flatten_sweeps=args.flatten_sweeps, x_sweeps=args.x_sweeps,
+                                                     push_outs=args.push_outs))
                 return asyncio.run(run_layer_stack(config, args.data_dir, args.operator, args.episode, origin,
                                                    MetaSam3Provider(config, allow_cloud=True), direct_local=args.direct_local,
                                                    apply_offset=args.apply_offset, plan_only=args.plan_only, grip_lower_mm=args.grip_lower_mm,
@@ -125,7 +133,10 @@ def main(argv=None):
                                                 direct_local=args.direct_local, place_spacing_mm=args.place_spacing_mm,
                                                 grip_retries=args.grip_retries, references=args.references or "none",
                                                 approach_speed=args.approach_speed, push_speed=args.push_speed,
-                                                disable_sessions=args.no_sessions, align_speed=args.align_speed))
+                                                disable_sessions=args.no_sessions, align_speed=args.align_speed,
+                                                drop_spot_xy=_parse_xy(args.drop_spot) if args.drop_spot else None,
+                                                knock_over=args.knock_over, flatten_sweeps=args.flatten_sweeps, x_sweeps=args.x_sweeps,
+                                                push_outs=args.push_outs))
                 return asyncio.run(run_step(config, args.data_dir, args.step, args.operator, args.episode, args.decision, args.table_z,
                                             args.push_distance))
             except ConfigError:

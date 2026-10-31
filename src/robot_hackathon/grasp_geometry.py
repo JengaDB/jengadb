@@ -610,21 +610,143 @@ MIN_GRIP_DEPTH_MM = 8.0           # the claws must reach at least this far below
 OBSTRUCTION_CLEARANCE_MM = 2.0    # tips stop this far above a low neighbour they would otherwise land on
 
 
-def resting_level_mm(block_top_mm, block_thickness_mm):
+ON_EDGE_TOP_MARGIN_MM = 6.0       # a top up to one block width + this is taken as resting on the table (on its edge) ...
+ON_EDGE_MAX_TOP_WIDTH = 0.9       # ... when its visible top is narrow: at most this fraction of the block width, or flagged on
+                                  # edge (on edge 11-20 mm on 30 Oct; flat tops 22.9-23.8). A full-width top at ~30 mm is a flat
+                                  # block on another and keeps that level, so an aligned pair is not gripped together.
+
+
+def narrow_top(flags, width_mm, dims):
+    """The visible top is a block's narrow side (it lies on its edge): flagged on edge, or measured no wider than
+    ON_EDGE_MAX_TOP_WIDTH of the block width."""
+    return "possibly_on_edge" in (flags or []) or (width_mm is not None and width_mm <= ON_EDGE_MAX_TOP_WIDTH * dims.width_mm)
+
+
+def resting_level_mm(block_top_mm, block_thickness_mm, block_width_mm=None):
     """Height of the surface a block rests on: 0 for the table, one thickness for a block lying on another, ... The
     level is the rounded count of thicknesses under the top, so a block on a tilted or edge-resting one is treated as
-    resting on the nearest whole level below it."""
+    resting on the nearest whole level below it. block_width_mm is passed only for a block whose top is narrow
+    (narrow_top: it lies on its edge); then a top no higher than one block width + ON_EDGE_TOP_MARGIN_MM rests on the
+    table: a block on its edge (25 mm tall, Jenga logo up) read 22-29 mm, which rounds to "on a block at 15 mm", and
+    the claws stopped 15 mm too high and missed it (30 Oct 20:15-20:21, six picks). A lower block that is really there
+    shows in the claw strips, and claw_obstruction raises the tips over it."""
     if not block_thickness_mm or block_top_mm is None:
+        return 0.0
+    if block_width_mm and block_top_mm <= block_width_mm + ON_EDGE_TOP_MARGIN_MM:
         return 0.0
     return max(0, round(block_top_mm / block_thickness_mm) - 1) * block_thickness_mm
 
 
-def grip_tips_mm(block_height, claws_deg, params, block_thickness_mm=None):
+# ---------------------------------------------------------------- lying flat (gravity reorientation)
+
+REORIENT_TILT_DEG = 8.0   # a top face tilted more than this is re-laid by a drop (flat blocks measured <= 6.8 deg, 30 Oct)
+
+
+def top_face_tilt_deg(mask, height_map, mm_per_px, band_mm=6.0, trim_mm=3.0, min_pixels=30):
+    """Tilt of a block's visible top face against the table (deg), from the height map. SAM masks also cover side
+    faces, so the plane is seeded with the highest pixels only and refitted on every mask pixel within trim_mm of it.
+    None when there is too little valid depth to fit a face."""
+    np = _np()
+    if not mm_per_px:
+        return None
+    vs, us = np.nonzero(mask & ~np.isnan(height_map))
+    if len(us) < min_pixels:
+        return None
+    h = height_map[vs, us]
+    a = np.stack([us * mm_per_px, vs * mm_per_px, np.ones(len(us))], axis=1)
+    seed = h >= np.percentile(h, 75) - band_mm
+    if seed.sum() < min_pixels:
+        seed = np.ones(len(h), dtype=bool)
+    coef = np.linalg.lstsq(a[seed], h[seed], rcond=None)[0]
+    face = np.abs(a @ coef - h) <= trim_mm
+    if face.sum() >= min_pixels:
+        coef = np.linalg.lstsq(a[face], h[face], rcond=None)[0]
+    return math.degrees(math.atan(math.hypot(coef[0], coef[1])))
+
+
+def reorient_reasons(geometry, tilt_deg, max_tilt_deg=REORIENT_TILT_DEG):
+    """Why a pick candidate should be laid flat by a drop before it goes to the pallet: its top face is tilted, or it
+    stands on its long edge (narrow top, more than one block high). Empty when it already lies flat."""
+    reasons = []
+    if tilt_deg is not None and tilt_deg > max_tilt_deg:
+        reasons.append(f"tilted:{tilt_deg:.1f}deg")
+    if "possibly_on_edge" in (geometry.get("flags") or []):
+        reasons.append("on_edge")
+    return reasons
+
+
+def lying_flat_reasons(geometry, tilt_deg, dims, max_tilt_deg=REORIENT_TILT_DEG):
+    """Check a block after the drop: no thicker than one block (not on its edge, 25 mm, or end, 75 mm), the full
+    footprint visible, top face level. Empty when it lies flat."""
+    reasons = []
+    h = geometry.get("height_above_table_mm")
+    # Only too high counts: on its edge reads ~25 mm, on end ~75. Low readings are depth bias, not an orientation
+    # (30 Oct: a block that had landed flat read 10.4 mm; flat pallet blocks read 11.9-14.7).
+    if h is None or h > 1.3 * dims.height_mm:
+        reasons.append("height:unknown" if h is None else f"height:{h:.1f}mm_not_one_block")
+    if "possibly_on_edge" in (geometry.get("flags") or []):
+        reasons.append("on_edge")
+    length, width = geometry.get("length_mm"), geometry.get("width_mm")
+    if length is None or length < 0.85 * dims.length_mm:
+        reasons.append("length:unknown" if length is None else f"short:{length:.1f}mm")
+    if width is None or not (0.7 * dims.width_mm <= width <= 1.2 * dims.width_mm):
+        reasons.append("width:unknown" if width is None else f"width:{width:.1f}mm")
+    if tilt_deg is None or tilt_deg > max_tilt_deg:
+        reasons.append("tilt:unknown" if tilt_deg is None else f"tilt:{tilt_deg:.1f}deg")
+    return reasons
+
+
+def standing_on_end(geometry, dims):
+    """A block standing upright on its end: about one block length tall, with only its small end face (25 x 15 mm)
+    visible from above. Such a block is rejected for picking (implausible height and length); it is knocked over."""
+    h, length, width = geometry.get("height_above_table_mm"), geometry.get("length_mm"), geometry.get("width_mm")
+    return (h is not None and 0.7 * dims.length_mm <= h <= 1.2 * dims.length_mm and length is not None
+            and length <= 0.6 * dims.length_mm and (width is None or width <= 1.3 * dims.width_mm))
+
+
+def on_edge_on_table(geometry, dims):
+    """A block lying on its long narrow side directly on the table: about one block width tall (25 mm) with its 15 mm
+    side on top (estimate_block flags it possibly_on_edge). resting_level_mm reads its 25 mm as resting on a block;
+    it is not (30 Oct, kazy-palletize-30oct: two drops left such a block on its edge both times)."""
+    h = geometry.get("height_above_table_mm")
+    return "possibly_on_edge" in (geometry.get("flags") or []) and h is not None and 1.3 * dims.height_mm < h <= dims.width_mm + 6.0
+
+
+def upright_kind(geometry, dims):
+    """'standing' (on its end, ~75 mm), 'on_edge' (on its narrow side on the table, ~25 mm) or None. Both are swept
+    over across their thin side so they fall onto their wide face."""
+    if standing_on_end(geometry, dims):
+        return "standing"
+    if on_edge_on_table(geometry, dims):
+        return "on_edge"
+    return None
+
+
+PALLET_YAW_TOLERANCE_DEG = 10.0   # a pallet block turned further than this from the row's long side is taken off (pushes cannot turn it)
+PALLET_TILT_DEG = 15.0            # tilt alone takes a pallet block off only above this: touching blocks read 8.2-8.3 deg at a normal
+                                  # 13 mm height (30 Oct 20:11/20:13, a good block taken off twice); resting on a neighbour shows in height
+
+
+def misplaced_on_pallet_reasons(geometry, tilt_deg, dims, max_tilt_deg=PALLET_TILT_DEG, row_long_deg=None,
+                                max_yaw_deg=PALLET_YAW_TOLERANCE_DEG):
+    """A pallet block that must be taken off and laid flat again: not one block thick (on a neighbour, on its edge),
+    standing on its edge, tilted, or (given row_long_deg) turned off the row's long side, e.g. rotated 90 deg or lying
+    diagonally. Only positive evidence counts here: pallet blocks touch, so their masks can be trimmed, and a short
+    footprint or an unmeasurable face is not a reason to disturb a good row."""
+    reasons = [r for r in lying_flat_reasons(geometry, tilt_deg, dims, max_tilt_deg)
+               if r == "on_edge" or (r.startswith("height:") and r != "height:unknown") or (r.startswith("tilt:") and r != "tilt:unknown")]
+    long_deg = geometry.get("base_long_side_deg")
+    if row_long_deg is not None and long_deg is not None and abs(wrap_90(long_deg - row_long_deg)) > max_yaw_deg:
+        reasons.append(f"rotated:{wrap_90(long_deg - row_long_deg):+.0f}deg")
+    return reasons
+
+
+def grip_tips_mm(block_height, claws_deg, params, block_thickness_mm=None, block_width_mm=None):
     """How far above the table the claw tips go to grip a block whose top is block_height above the table (Sam's
     grip_tips_mm). The floor tips_min_mm is relative to the surface the block rests on, so a block on top of another
     in a heap is gripped with the same depth as one on the table, never with claws driven into the block below."""
     depth = params.grasp_depth_mm + (params.ends_extra_depth_mm if claws_deg == ALONG else 0.0)
-    return max(block_height - depth, resting_level_mm(block_height, block_thickness_mm) + params.tips_min_mm)
+    return max(block_height - depth, resting_level_mm(block_height, block_thickness_mm, block_width_mm) + params.tips_min_mm)
 
 
 def grip_points(params):
@@ -647,7 +769,8 @@ def claw_obstruction(height_map, est, shift_mm, claws_deg, calib, step_px=2):
     face_u, face_v = -close_v, close_u            # across each claw's face
     # Anything in the claw strips above where the tips will stop is an obstruction: for a block resting on another,
     # that includes the lower block if it lies under the strips.
-    limit = max(grip_tips_mm(est.height_above_table_mm, claws_deg, params, dims.height_mm), params.obstruction_min_mm)
+    edge_width = dims.width_mm if narrow_top(est.flags, est.width_mm, dims) else None
+    limit = max(grip_tips_mm(est.height_above_table_mm, claws_deg, params, dims.height_mm, edge_width), params.obstruction_min_mm)
     # Hard limit: the claws may stop on top of a lower neighbour as long as MIN_GRIP_DEPTH_MM of the block remains
     # below the tips (heap: a block lying across two others). Anything higher than that is a real obstruction.
     hard_limit = max(est.height_above_table_mm - MIN_GRIP_DEPTH_MM, limit)
@@ -706,8 +829,9 @@ def evaluate_grasps(est, height_map, calib, styles=("middle", "side", "ends")):
             if est.pixel_center is None or est.mm_per_px is None or est.height_above_table_mm is None:
                 opt["reasons"].append("geometry_unavailable")
             if not opt["reasons"]:
-                opt["tips_above_table_mm"] = grip_tips_mm(est.height_above_table_mm, claws_deg, params, dims.height_mm)
-                opt["resting_level_mm"] = resting_level_mm(est.height_above_table_mm, dims.height_mm)
+                edge_width = dims.width_mm if narrow_top(est.flags, est.width_mm, dims) else None
+                opt["tips_above_table_mm"] = grip_tips_mm(est.height_above_table_mm, claws_deg, params, dims.height_mm, edge_width)
+                opt["resting_level_mm"] = resting_level_mm(est.height_above_table_mm, dims.height_mm, edge_width)
                 clearance = claw_obstruction(height_map, est, shift, claws_deg, calib)
                 opt["clearance"] = clearance
                 if clearance["status"] != "clear":
@@ -718,5 +842,12 @@ def evaluate_grasps(est, height_map, calib, styles=("middle", "side", "ends")):
             opt["eligible"] = not opt["reasons"]
             if est.base_long_side_deg is not None and opt["eligible"]:
                 opt["claws_close_direction_deg_in_base"] = wrap_90(est.base_long_side_deg + claws_deg)
+            if (est.base_point_mm is not None and est.pixel_center is not None and est.mm_per_px and est.depth_mm is not None
+                    and est.image_angle_deg is not None and calib.extrinsics is not None):
+                # Where the gripper centre goes down: the block centre moved shift mm along the same image axis the claw
+                # strips were checked on (base_long_side_deg is wrapped to +-90 and can point the other way).
+                a, d = math.radians(est.image_angle_deg), shift / est.mm_per_px
+                opt["grip_point_mm"] = [round(v, 2) for v in pixel_to_base(est.pixel_center[0] + d * math.cos(a), est.pixel_center[1] + d * math.sin(a),
+                                                                          est.depth_mm, calib.intrinsics, calib.extrinsics)]
             options.append(opt)
     return options

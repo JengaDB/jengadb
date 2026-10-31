@@ -292,6 +292,23 @@ class GeometryTests(unittest.TestCase):
                                         calib.block, True, "v", "s", calib.workspace)
         self.assertIn("gripper_too_narrow_for_ends", geom.evaluate_grasps(free, hm, narrow)[3]["reasons"])
 
+    def test_side_grips_come_down_15_mm_along_the_block(self):
+        # 30 Oct: run_flow brought the claws down at the block centre for a side grip too, where the strips had been
+        # found blocked; each grasp now carries the point its strips were checked at.
+        depth, masks, truth, calib, plane, hm = self.scene("blocked")
+        a = {t["name"]: i for i, t in enumerate(truth)}["A"]
+        est = geom.estimate_block(masks[a], depth, hm, calib, a)
+        grasps = geom.evaluate_grasps(est, hm, calib)
+        p = est.base_point_mm
+        middle, plus, minus, ends = (g["grip_point_mm"] for g in grasps)
+        for g in (middle, ends):
+            self.assertLess(math.dist(g[:2], p[:2]), 0.01)
+        for g in (plus, minus):
+            self.assertAlmostEqual(math.dist(g[:2], p[:2]), 15.0, delta=0.5)
+        along = math.degrees(math.atan2(plus[1] - minus[1], plus[0] - minus[0]))
+        self.assertLess(abs(geom.wrap_90(along - est.base_long_side_deg)), 1.0)            # along the long side, opposite ends
+        self.assertAlmostEqual(math.dist(plus[:2], minus[:2]), 30.0, delta=1.0)
+
     def test_grip_tips_floor_follows_the_block_resting_level(self):
         # Heap with blocks on blocks (30 Oct): the operator's deep grip (depth 28, floor -6) must not drive the claws
         # through the block underneath. The floor is relative to the surface the block rests on.
