@@ -2,6 +2,8 @@
 
 A robot that sets up Jenga so humans can play. Each placement becomes a recorded experiment: observations, planned and measured motion, and the observed result.
 
+[![Watch the demo](https://img.youtube.com/vi/5L310rz_KnE/hqdefault.jpg)](https://www.youtube.com/shorts/5L310rz_KnE)
+
 ## First milestone
 
 Build two alternating layers (six blocks) from a prepared pickup area and replay the placement records. Full-tower construction and variable pickup are later milestones.
